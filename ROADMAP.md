@@ -161,6 +161,24 @@ One defect that admission had been hiding remains open:
   per producer at the ICD's own ~1200/s ceiling; QueueFull retries while `umd12`
   holds vkd3d's queue mutex), which is why those risks were written down before the
   code was.
+  **Isolated the same session, without a rollback**: D3D11 and Vulkan smoke on the
+  SAME `.282` install both pass in under a second (`d3d11-smoke.exe` exit 0, 806 ms,
+  527 pixels match; `vulkan-smoke.exe` exit 0, 588 ms, Venus on RADV NAVI23). D3D11
+  never builds a `HeliosD3D12SubmitCmd`, so the install, the host, the ICD and the
+  D3D12-less paths are all healthy and the failure is inside the D3D12 fence path
+  this change added. Two more facts from the hung run: the probe process survived
+  two `Stop-Process -Force` attempts (a wedge inside a GPU wait, not a busy loop),
+  and a clean reboot does not change it — a single allocator run still failed to
+  complete in 240 s on a fresh boot (`TIMEOUT-NOT-A-DATUM`), against ~1.6–2.1 s for
+  the same probe on `.281`.
+  ⚠ Leading hypothesis to test first, because it explains a HANG rather than mere
+  slowness: the escape is issued while `vkd3d_acquire_vk_queue` holds vkd3d's queue
+  mutex, which is the exact exposure `PENDING.md` A3 records — the Venus worker that
+  must retire the fence can be blocked behind the lock the caller holds, so the
+  packet never completes and the app's fence wait never returns. Rate-limiting alone
+  would then only make the wedge rarer, not absent; the mint may have to move to a
+  point that does not hold that lock (or into the engine's own submission path,
+  where the ordering is already correct).
   ⇒ **Next step is a rate limiter, not more measurement**: mint at most one boundary
   per queue per frame (or per short interval) and REUSE the last fence for every
   packet in between — reuse is safe because wire ids are monotonic, so an older
