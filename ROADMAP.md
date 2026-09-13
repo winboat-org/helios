@@ -113,6 +113,12 @@ case exactly.
     present (`pattern(e,0) = 0x9e3779b9*(e+1)` names the observed epoch).
   * The probe wrappers refuse a changed source against a captured receipt; rebuild with
     `-Mode Build` before `-Mode Run`.
+  * Two inference rules from this defect are in `docs/dx12/KMD_IMPACT.md` §14a.2 item 6
+    because they are what actually redirected the search: **stale-but-COHERENT data means a
+    wait on an already-retired value (a cache), not a race** — a race would read torn or
+    arbitrary bytes, and the two have disjoint fixes; and **a zero that could have been
+    nonzero outranks any count of nonzero counters** (that is `WfBReb=0` killing the
+    retire-domain hypothesis, above).
   * Evidence: the run JSONs are pulled into `tmp/uv1-20260913/evidence3/`
     (`fix288-run.json` 30/30, `fix288b-run.json` 25+25, `suite288-run.json`, the residual
     `stream-output` failure's stderr, and the `.283` deadlock stall log

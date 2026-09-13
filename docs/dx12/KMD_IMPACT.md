@@ -990,6 +990,20 @@ buffered stdout, so diagnostics belong in a FILE (stdout can also *block* the pr
 2/20 untouched), so write only on the failure path; and the probe wrappers refuse a
 changed source against their captured receipt, so rebuild with `-Mode Build`.
 
+**6. Two inference rules this defect taught — they generalise past it.**
+* ⭐ **Stale-but-COHERENT data says "cache", not "race".** The readback held a *complete
+  previous epoch*, so this was never a torn read: it means a wait **on an already-retired
+  value**, i.e. a recorded number that outlived the work it named. Torn, interleaved or
+  arbitrary bytes would have meant a genuine race between the copy and the read. Those two
+  have disjoint fixes — a race is fixed by ordering the operations, a cache by *submitting
+  a fresh value to wait on* — so classify before theorising. Nothing else in the day's
+  evidence narrowed the search this much, and it is one line of probe output.
+* ⭐ **A zero that COULD have been nonzero is stronger evidence than any count of nonzero
+  ones.** The retire-domain hypothesis was killed by `WfBReb=0`: that counter is
+  `WfBStrm`'s rebase escape, so under the hypothesis it *had* to move. When a hypothesis
+  blames layer X, find the counter in X that would move if X were guilty and check that it
+  is zero — do not argue X's innocence from the counters that moved elsewhere.
+
 
 | # | Item | Where | Size | Class |
 |---|---|---|---|---|
