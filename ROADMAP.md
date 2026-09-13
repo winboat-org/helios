@@ -134,6 +134,30 @@ One defect that admission had been hiding remains open:
   packet) **and `umd12/src/forward12/tiles.rs` (tile mappings)** — the last one is
   the sparse path this stage already fixed, it was missed by a grep scoped to
   queue.rs, and the slave build caught it as an E0061.
+  **Piece (2) design settled (investigated 2026-09-13, not yet written).** The
+  producer goes in the **UMD12**, not the engine, and the reasons are checked, not
+  assumed:
+  * `vkd3d_acquire_vk_queue(ID3D12CommandQueue *) -> VkQueue` is already **public**
+    (`vkd3d-proton-helios/include/vkd3d.h:126`), so the UMD12 can obtain the
+    `VkQueue` the ICD export needs without reaching into `vkd3d_private.h`. The
+    engine-side alternative would have to convert `ID3D12CommandQueue*` with
+    `impl_from_ID3D12CommandQueue` and grow a new ICD-resolution mechanism inside
+    the fork — more surface for no gain.
+  * The ICD export is `bool helios_venus_queue_gpu_fence(VkQueue, uint64_t *)`
+    (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:728` decl, `:2071` def); it
+    returns 0 on every refusal, which is why `D12Fnc`/`D12Fn0` exist.
+  * Resolving it by NAME is the established discipline and the name is the ABI, not
+    the DLL: `umd/bridge/bridge_icd_exports.cpp` already does exactly this for the
+    D3D11 UMD (`GetProcAddress` over a `TH32CS_SNAPMODULE` snapshot, cached, with
+    the module pinned so the ICD cannot unload under a cached pointer), and
+    `dxvk-helios/src/dxvk/dxvk_helios_scanout_acquire.cpp:90-113` is the same scan
+    written out in full. ⛔ The UMD12 cannot share that file: it has its own cxx
+    bridge (`umd12/bridge/vkd3d_bridge.cpp` + `src/bridge12.rs`), so the resolver is
+    a self-contained ~60-line addition there, mirroring the discipline.
+  * Touch points: the resolver + `queue_gpu_fence(queue) -> u64` in the bridge, one
+    `extern` in `bridge12.rs`, and the three producers
+    (`queue.rs` ×2, `tiles.rs`) passing it instead of `0`. Rate-limit per the risk
+    list below (one boundary per frame) and count nonzero fences.
   (2) the producer: call `helios_venus_queue_gpu_fence` per submission and get the wire
   fence back to whoever fills the D3D12 record. The ICD export exists and is
   uncalled; the caller must hold a `VkQueue`, so this lands in the engine
