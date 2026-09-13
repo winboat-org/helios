@@ -971,4 +971,6 @@ first and then withdrawn. `CORE_0109` has 26 `CalcPrivate*` slots, and those blo
 | `docs/dx12/SUBSTRATE.md` | vkd3d-proton + venus: build, requirements, measured gap, knobs, licensing |
 | `docs/dx12/GATES.md` | `D12-G0 … D12-G11`, exact commands and pass criteria |
 | `docs/dx12/SPECS.md` | the DirectX-Specs corpus triaged (90 docs) + the 235-finding register, pinned at `2bd58ca5` |
+| `docs/dx12/ACCELERATION_STRUCTURE_CURRENT_SIZE.md` | the D3D12 `CURRENT_SIZE` contract vs the host size query (`.280` fix) |
+| `docs/dx12/SPARSE_SUBMIT_TIMELINE.md` | the D3D12 tile map → `vkQueueBindSparse` → ICD feedback path, and the crash it caused (`.281` fix) |
 | `docs/dx12/research/R1..R12` | the raw evidence dossiers |

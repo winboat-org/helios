@@ -35,7 +35,19 @@ admission had exposed — the `raytracing` size disagreement — and is installe
 the guest as `oem27.inf`, Code 0, DWM on the hardware stack. Suites on `.280`:
 `raytracing` PASS, every other case unchanged from `.279`.
 
-Two defects that admission had been hiding remain open:
+Package 22.22.281.0 (`7bd1231`) fixed the second — the `tiled` `tiling-buffer`
+crash — and is installed on the guest as `oem28.inf`, Code 0, DWM on the hardware
+stack, with no reboot needed. `tiling-buffer` now completes
+(`PASS,tiled,tiling-buffer,case-completed`) in both independent `tiled` passes, and
+the probe runs on past it (`tiling-2d`, `mappings`, `copy-mappings`,
+`copy-tiles-2d` PASS; `tiling-3d` and the two debug-layer cases BLOCKED). The rest
+of the suite is unchanged: `adapter`, `indirect`, `indirect-ia`,
+`root-signature`, `raytracing`, `sync` and `draw` PASS throughout;
+`copy-tiles-predicated` and `copy-tiles-msaa4x` failed in one pass each with
+content mismatches (below), and the diagnostic build used to localise the crash
+reproduces the crash case exactly.
+
+One defect that admission had been hiding remains open:
 - `stream-output`: **the D3D12 `ExecuteCommandLists` path retires its WDDM DMA
   packet on Venus *worker* completion, not on host GPU completion.** A raw stride
   dump shows a correct 32-byte stride with gap and padding intact on a passing
@@ -44,7 +56,17 @@ Two defects that admission had been hiding remain open:
   wait on a queue fence before `Map` — so the fence is advancing early. Measured:
   3 of 11 runs fail without help; with `HELIOS_SO_DIAG_DELAY_MS=500` between the
   fence wait and the readback, 11 of 11 pass (delay hook is a local diagnostic
-  build only, not committed).
+  build only, not committed). The same hazard now has a second, content-oracle
+  reproducer: over the `.281` session the `allocator` probe failed 4 of 10 runs
+  with `FAIL,GPU epoch pattern` — its 256-epoch reuse loop maps a readback after a
+  fence wait and found a previous epoch's pattern — while `stream-output` failed 5
+  of 10 with its usual varying text (`counter32 guard changed`, `NULL SO
+  padding/tail overwritten`, `32-bit counter guards overwritten`). The rate is
+  batch-dependent, not case-dependent: one 12-run batch of
+  `allocator`/`stream-output`/`raytracing` had zero failures and the next had six,
+  which is what an early fence looks like from the outside. `allocator`'s oracle
+  (exact content, known epoch, one second per run) is the sharper of the two and
+  is worth keeping for the K-F verification.
   Cause, located: `kmd_render/src/ddi/submit_command.rs:688` derives
   `gpu_completion_fence` **only from the Present BLT marker**
   (`present_packet.rs`'s `gpu_fence_id`). For D3D12 the KMD receives only
@@ -91,22 +113,36 @@ Two defects that admission had been hiding remain open:
   (`acceleration_structure.c:459`). The guest ICD translated that query correctly
   and forwarded it (`vn_query_pool.c:103`), which is what the host-side probe then
   confirmed: the disagreement is in the host's answer, not in the translation.
-- `tiled` `tiling-buffer` now runs (`TiledResourcesTier` reports 2, not 1) and
-  crashes with 0xC0000005. **Localised with a WER mini dump** (dumps enabled for
-  `d3d12_tiled_probe.exe`, captured, then removed): the fault is a read at
-  address `0x18` inside the **guest Venus ICD**, `vulkan_virtio.dll` RVA
-  `0x379205` = `vn_queue_submission_prepare + 0x325` (`icd/mesa`; the shipped DLL
-  still carries its symbol table, so the function resolves without a PDB). The
-  faulting instruction is `mov 0x18(%rax,%r12,1),%r11` reached from
-  `jne vn_queue_submission_prepare+0x320` at `+0x181`: a cold block that loads
-  `submit->batches` (`vn_queue_submission.batches` is at `+0x18`) and then reads
-  a pointer field at `+0x38` of a batch, dereferencing that pointer at `+0x18`.
-  `+0x38` in `VkSubmitInfo2` is `pSignalSemaphoreInfos`, so the read is a
-  signal-semaphore field through a NULL semaphore-info array — a submit whose
-  signal count is non-zero with no array behind it. The engine's submits all use
-  a live stack array (`command.c`'s `signal_semaphore_infos`, `transition_semaphore`),
-  so the next step is an ICD rebuild with debug info (or a defensive check at the
-  site) to name the exact submit; that is a ~15-20 min build per iteration.
+- ~~`tiled` `tiling-buffer` FAIL with 0xC0000005~~ — **FIXED in 22.22.281.0
+  (`7bd1231`), Mesa fork `913491b0394`; design record
+  `docs/dx12/SPARSE_SUBMIT_TIMELINE.md`.** It was never a D3D12 admission problem
+  and never a KMD problem. `tiling-buffer` maps tiles, so vkd3d reaches the host
+  through `vkQueueBindSparse` (`d3d12_command_queue_flush_bind_sparse`, one wait
+  and one signal, both the queue's own timeline), and the guest ICD prepared that
+  sparse submission through the semaphore-feedback path. The two timeline
+  **counter** accessors had cases for `VkSubmitInfo`/`VkSubmitInfo2` only, so the
+  sparse batch fell into `default: UNREACHABLE("unexpected batch type")` — which
+  in a release build is `__builtin_unreachable()`, not an error return, so the
+  sparse batch got whatever the optimizer laid out. That is the WER-minidump read
+  at `0x18` in `vulkan_virtio.dll` RVA `0x379205` =
+  `vn_queue_submission_prepare + 0x325`. The fix is the two missing
+  `VK_STRUCTURE_TYPE_BIND_SPARSE_INFO` cases (17 lines), the same shape current
+  upstream Mesa carries; the neighbouring count and handle accessors already had
+  it, and only the counter accessors — added later by the feedback work — did not.
+  The probe that faulted now reports `PASS,tiled,tiling-buffer,case-completed`
+  (`TILING,total,4`) both from the diagnostic build and from the shipped `.281`
+  package, and `tiling-2d`, `mappings`, `copy-mappings` and `copy-tiles-2d` pass
+  after it.
+- `tiled` `copy-tiles-predicated` / `copy-tiles-msaa4x` FAIL with content
+  mismatches (`CopyTiles input differs from independent CopyTextureRegion
+  witness`; `MSAA CopyTiles sample roundtrip mismatch`) are **newly reachable, not
+  new**: the probe stops at the first failing case, so neither had ever run.
+  They are also intermittent — pass 1 failed `copy-tiles-predicated` (the
+  diagnostic build did too), pass 2 passed it and failed `copy-tiles-msaa4x`
+  instead — and both are content read back after a fence wait, i.e. the shape of
+  the open defect below. This work does not attribute them: recorded so the next
+  pass does not read them as a regression, and `SPARSE_COMPATIBILITY.md` remains
+  the governing record for what tiled behaviour is claimed.
 
 `no-output-msaa` and `tiled-format-caps` stay BLOCKED on this guest by the absent
 D3D12 debug layer (Graphics Tools FoD, `0x887a002d`); DISM is denied in this
@@ -118,12 +154,15 @@ documented boundary, not an implementation error.
 
 Evidence: `tmp/integration-20260912/` (`verify-loaded279.json`, `results279.txt`,
 `nooutput-task.out`, `driver279-build.log`, `assemble279.log`) for `.279`, and
-`tmp/rtas-size-20260913/` for the `.280` CURRENT_SIZE fix
-(`helios-windows-x64-22.22.280.0-ef9c6586.zip` sha256
+`tmp/rtas-size-20260913/` for the `.280` CURRENT_SIZE fix and the `.281` sparse
+fix (`helios-windows-x64-22.22.280.0-ef9c6586.zip` sha256
 `ef77e4cf0ab16e43fcefa47c5f891e8527d8a3439c6b37b066270e5282eb7f5e`,
-`evidence/verify-loaded280.out`, `evidence/raytracing/`,
-`evidence/verdict-*.txt`, `evidence/recover280.log`, `build280c.log`,
-`assemble280b.log`; host-side attribution output and the probe source are
+`helios-windows-x64-22.22.281.0-7bd12310.zip` sha256
+`922b9f0f3c64719066b44731ddcf5f8240647652790d2c7b09fe69a6e66c3a72`,
+`evidence/verify-loaded280.out`, `evidence/verify-loaded281.out`,
+`evidence/verdicts281.txt`, `evidence/raytracing/`, `evidence/verdict-*.txt`,
+`evidence/recover280.log`, `build280c.log`, `assemble280b.log`, `build281c.log`,
+`assemble281.log`; host-side attribution output and the probe source are
 `tools/host_as_size_probe.c`).
 
 The `.280` install is the same package flow as `.279`, with one wrinkle worth
@@ -133,6 +172,13 @@ event during the display-driver swap), which left `install-state.json` written
 but incomplete. Recovery is the documented path — `Uninstall-Helios.ps1
 -KeepDriver`, then `Install-Helios.ps1` — run as `SYSTEM` in session 0 so no
 console event can interrupt it (`tmp/rtas-size-20260913/recover280.ps1`).
+
+`.281` installed with that same `Uninstall -KeepDriver` → `Install` sequence run
+as `SYSTEM` in session 0 (`tmp/rtas-size-20260913/upgrade281.ps1`) and completed
+first try with `3010`; the device restarted into the new driver inside the same
+install, no guest reboot, `oem28.inf`, five driver images verified against the
+manifest and DWM reloaded on the new `helios_umd.dll` and the new ICD
+(`evidence/verify-loaded281.out`).
 
 ## Combined DX12/WoW64 integration, 2026-09-12
 
