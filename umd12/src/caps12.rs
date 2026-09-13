@@ -1572,8 +1572,11 @@ unsafe fn options_0110(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
 ///
 /// DDI0102+ at FL11_1+ requires no-output sample counts 1,4,8,16. The native
 /// runtime rejected the old count1 answer on 2026-09-09 (Direct3D12 ETW).
-/// Count2 is also implemented. Device creation checks the engine's mask;
-/// the native no-output-msaa probe checks pixel/sample frequency and replay.
+/// Count2 is also implemented. This mask is a driver-declared contract, not host
+/// MSAA support: the engine declares the same floor and backs any count the host
+/// Vulkan driver does not expose by clamping the Vulkan rasterization sample
+/// count. See `docs/dx12/NO_OUTPUT_SAMPLES.md`. The native no-output-msaa probe
+/// checks pixel/sample frequency and replay.
 ///
 /// # Safety
 /// As [`get_caps`].

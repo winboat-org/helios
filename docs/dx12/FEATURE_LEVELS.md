@@ -1,5 +1,14 @@
 # Native DX12 feature-level contract
 
+**No-output sample counts, 2026-09-13:** the no-output sample-count mask is no
+longer treated as host MSAA evidence. `SupportedSampleCountsWithNoOutputs` is the
+DDI0102 *driver contract* (1/4/8/16 above FL11_0, retail-rejected otherwise); the
+engine now reports the host Vulkan mask unioned with that floor and backs any
+excess by clamping Vulkan's `rasterizationSamples` while the shader keeps the
+count the application asked for. This unblocks native FL12_0/12_1 on AMD/RADV
+hosts, whose Vulkan MSAA mask stops at 8x. See
+[NO_OUTPUT_SAMPLES.md](NO_OUTPUT_SAMPLES.md).
+
 **Owner scope, 2026-09-12:** prioritize readiness for general native FL12_0/12_1
 and DXR1.0 application testing. Tools-visualization output, extreme DXR limit
 audits and physical non-RT hardware validation are deferred unless a concrete
