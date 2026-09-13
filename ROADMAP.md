@@ -137,6 +137,25 @@ One defect that admission had been hiding remains open:
   varying. ⛔ Gate the whole thing on a nonzero `gpu_wire_fence` actually reaching
   the KMD (count it) — an inert wire is the fake-success shape this defect already
   punished once.
+  **Risks the reviews attached to this plan — address them as the pieces land, not
+  after.** (a) *Escape rate*: the export is one SUBMIT_VENUS escape + one wire
+  fence per call with no cache, and the ICD's own header states the ceiling
+  (`vn_renderer_helios.c:2058-2065`: 3 queues × 2 ECLs × 200 fps ⇒ ~1200
+  in-flight-until-GPU-completion fences/s), so the caller should rate-limit to one
+  boundary per frame unless a *differenced* `EscSubRing` (it also counts venus
+  external-semaphore batches) says per-submission is affordable. (b)
+  *Backpressure*: 64 control descriptors at ≥2 per chain ⇒ ~32 concurrent, every
+  QGF fence stays in flight until host GPU completion, and the enqueue retries for
+  `ENQUEUE_RETRY_MAX_MS = 5000` (`ctrl.rs:100`) while `umd12` holds vkd3d's queue
+  mutex across the escape on the shipping default arm (`PENDING.md` A3) — so
+  `QfRet` must stay 0 on the acceptance run, and this escape wants its own smaller
+  retry bound, not the shared 5 s budget. (c) *Inert wire*: refusals return 0 for
+  the caller to absorb and the ICD's refusal counters are process-local, so the
+  nonzero-fence counter must land in the same commit as the plumbing and
+  `D12Zero`/`D12Clr`/`GpuFncClamp` must not move. (d) *The intended cost is real*:
+  the D3D12 WDDM fence then retires at host GPU completion (producer floor ~3.7
+  ms/frame per WS2 above) instead of ~1 µs — land with a `gpu_wire_fence == 0`
+  control arm and require `WfBWire` not to climb on a healthy session.
 - ~~`raytracing` FAIL "uncompacted current/prebuild size agreement"~~ — **FIXED in
   22.22.280.0 (`ef9c6586`); design record `docs/dx12/ACCELERATION_STRUCTURE_CURRENT_SIZE.md`.**
   It was never a D3D12 admission problem: `CURRENT_SIZE` was answered with
