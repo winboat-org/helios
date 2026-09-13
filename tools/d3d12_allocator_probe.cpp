@@ -1,3 +1,6 @@
+// The probe builds with /W4 /WX; `fopen` is used for the file-backed diagnostic
+// sink (stdout deadlocks the wrapper's undrained pipe, see `tracef`).
+#define _CRT_SECURE_NO_WARNINGS
 // Native D3D12/runtime fence acceptance. Run in the interactive guest session.
 // Build: cl /EHsc /std:c++17 d3d12_sync_probe.cpp d3d12.lib dxgi.lib
 // Each case requires both fence ordering and an exact GPU readback pattern.
@@ -9,6 +12,7 @@
 #include <wrl/client.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstdarg>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -33,6 +37,23 @@ struct Event {
 };
 
 static void native_modules(bool admitted);
+
+// ⛔ DIAGNOSTICS GO TO A FILE, NEVER TO STDOUT. The wrapper drains the probe's
+// stdout only when the process exits, so more than one pipe buffer of output
+// BLOCKS the probe: adding ~1k lines of per-epoch output turned a 1.8 s run into
+// a 90 s timeout (measured 2026-09-13, twice - first unbuffered, then buffered).
+// A file has no such limit, costs no scheduling perturbation, and survives the
+// abort path below because that path flushes it.
+static FILE *g_trace = nullptr;
+static long long g_last_wait_us = -1;
+static unsigned g_epoch = 0, g_type = 0;
+static void tracef(const char *fmt, ...) {
+    if (!g_trace) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(g_trace, fmt, ap);
+    va_end(ap);
+}
 static ComPtr<ID3D12Device> device() {
     ComPtr<IDXGIFactory4> factory;
     check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "factory");
@@ -142,7 +163,21 @@ static void native_modules(bool admitted)
 static void wait_done(ID3D12Device *dev, ID3D12Fence *done, UINT64 value) {
     Event event;
     check(done->SetEventOnCompletion(value, event.handle), "completion event");
+    // ⛔ The wait DURATION is the datum that separates the two candidate causes of
+    // `FAIL,GPU epoch pattern`: a wait that returns in microseconds while the GPU
+    // copy takes milliseconds means the fence advanced at submission; a wait that
+    // tracks the GPU means the fence is truthful and the readback path is at fault.
+    // (Same question the UMD's `Umd12FenceSignalDelayUs` doc poses; that arm is
+    // unobservable because the runtime never enters the fence DDIs.)
+    LARGE_INTEGER freq, t0, t1;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
     event.wait();
+    QueryPerformanceCounter(&t1);
+    // ⛔ NO PER-EPOCH I/O: writing a line per epoch perturbs the very race under
+    // test (24/24 passes with per-epoch tracing against ~1-in-6 failures without).
+    // The value is kept in memory and reported only from the failure path.
+    g_last_wait_us = (long long)((t1.QuadPart - t0.QuadPart) * 1000000 / freq.QuadPart);
     require(done->GetCompletedValue() == value, "exact authenticated completion");
     check(dev->GetDeviceRemovedReason(), "device health");
 }
@@ -157,9 +192,33 @@ static void verify(ID3D12Resource *readback, UINT epoch) {
     void *data = nullptr;
     D3D12_RANGE range{0, bytes}, empty{};
     check(readback->Map(0, &range, &data), "map readback");
-    for (UINT i = 0; i < words; ++i)
-        require(static_cast<uint32_t *>(data)[i] == pattern(epoch, i), "GPU epoch pattern");
+    uint32_t *w = static_cast<uint32_t *>(data);
+    UINT bad = 0, first = 0;
+    for (UINT i = 0; i < words; ++i) {
+        if (w[i] != pattern(epoch, i)) { if (!bad) first = i; ++bad; }
+    }
+    if (bad) {
+        // ⛔ WHICH EPOCH'S DATA IS ACTUALLY THERE, and does it arrive late?
+        // `pattern(e,0) = 0x9e3779b9 * (e+1)` carries the epoch in its first word,
+        // so the observed content can be NAMED instead of merely called wrong:
+        // "one epoch behind" is a CPU/GPU reuse race on the shared upload buffer,
+        // garbage is a copy/binding fault, and a correct re-read after a delay is
+        // "the GPU had not finished" - three different fixes.
+        const uint32_t got0 = w[0];
+        const long long observed = static_cast<long long>(got0 / 0x9e3779b9u) - 1;
+        tracef("MISMATCH,type=%u,epoch=%u,bad=%u,first=%u,got0=0x%08x,want0=0x%08x,observed_epoch=%lld,exact=%d,last_wait_us=%lld\n",
+               g_type, epoch, bad, first, got0, pattern(epoch, 0), observed,
+               (got0 % 0x9e3779b9u) == 0 ? 1 : 0, g_last_wait_us);
+        Sleep(100);
+        UINT bad_after = 0;
+        for (UINT i = 0; i < words; ++i)
+            if (w[i] != pattern(epoch, i)) ++bad_after;
+        tracef("REREAD,epoch=%u,bad_after_100ms=%u,got0_after=0x%08x,observed_after=%lld\n",
+               epoch, bad_after, w[0], static_cast<long long>(w[0] / 0x9e3779b9u) - 1);
+        std::fflush(g_trace);
+    }
     readback->Unmap(0, &empty);
+    require(!bad, "GPU epoch pattern");
 }
 static void run_reuse(ID3D12Device *dev, D3D12_COMMAND_LIST_TYPE type) {
     Queue q(dev, type);
@@ -178,6 +237,8 @@ static void run_reuse(ID3D12Device *dev, D3D12_COMMAND_LIST_TYPE type) {
         q.list->CopyBufferRegion(readback.Get(), 0, gpu.Get(), 0, bytes);
         std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
         q.list->ResourceBarrier(1, &b);
+        g_epoch = epoch;
+        g_type = unsigned(type);
         q.submit();
         check(q.queue->Signal(done.Get(), epoch), "queue completion");
         wait_done(dev, done.Get(), epoch);
@@ -246,8 +307,14 @@ static void run_pending_list_lifetime(ID3D12Device *dev) {
     std::puts("PASS,pending_list_reset_allocator_release");
 }
 int main() {
+    // ⛔ STDOUT STAYS BUFFERED (an unbuffered `WAIT` per epoch perturbs the very
+    // race under test: measured 2026-09-13, 1.8 s -> 11.7 s and three 90 s
+    // timeouts), but the abort path FLUSHES first. `std::_Exit` does not, which is
+    // why the failing run's own `stdout.txt` was 0 bytes and its per-type PASS
+    // lines and timings were unrecoverable.
+    g_trace = std::fopen("allocator-timing.log", "w");
     // No exception may unwind submitted resource owners before completion.
-    std::set_terminate([] { std::_Exit(125); });
+    std::set_terminate([] { if (g_trace) std::fflush(g_trace); std::fflush(stdout); std::_Exit(125); });
     auto dev = device();
     run_reuse(dev.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     run_reuse(dev.Get(), D3D12_COMMAND_LIST_TYPE_COMPUTE);
