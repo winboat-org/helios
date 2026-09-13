@@ -12,6 +12,45 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Native FL12_1 admission on AMD/RADV, 2026-09-13
+
+Native FL12 was refused on every AMD host because admission required the host
+Vulkan mask `framebufferNoAttachmentsSampleCounts` to contain 16x. That limit is
+host MSAA support; the D3D12 `SupportedSampleCountsWithNoOutputs` field is a
+driver-declared sample-frequency contract that DDI0102 requires at 1/4/8/16 above
+FL11_0. RADV caps MSAA at 8x, so the check admitted native FL12 on NVIDIA and
+never on AMD. The engine now declares the host mask unioned with the DDI floor
+and backs the excess by clamping only Vulkan's `rasterizationSamples`, keeping
+the requested count in the shader; clamps are counted and reported at device
+destruction. Admission no longer reads the mask as host evidence. Design record:
+`docs/dx12/NO_OUTPUT_SAMPLES.md`.
+
+Package 22.22.279.0 (`59595da2`) is installed on the WinBoat guest: five driver
+images verified, `oem26.inf`, Code 0, DWM on the hardware stack. The native D3D12
+suite moved `adapter` and `allocator` from FAIL to PASS and unblocked
+`raytracing`, which now reports `CAP,NativeFL12_1Admission,00000000`.
+
+Three defects that admission had been hiding are now open:
+- `stream-output` FAIL "32-bit counter guards overwritten". Both filled-size
+  values are correct, so the guard words are clobbered by something writing more
+  than four bytes at the counter address. It failed earlier at "SO overflow or
+  tail overwritten" on .278.
+- `raytracing` FAIL "uncompacted current/prebuild size agreement", after four
+  passing stages.
+- `tiled` `tiling-buffer` now runs (`TiledResourcesTier` reports 2, not 1) and
+  crashes with 0xC0000005 after its first tile-mapping submission.
+
+`no-output-msaa` and `tiled-format-caps` stay BLOCKED on this guest by the absent
+D3D12 debug layer (Graphics Tools FoD, `0x887a002d`); DISM is denied in this
+environment. A diagnostic build with the debug-layer gate relaxed measured the
+approximation directly: 15 cases / 8,640 words, 320 mismatches, all on the
+16-sample case (`got 000000ff, want 0000ffff`). RADV cannot rasterize 16 samples,
+so a 16x no-output PSO is accepted but produces 8-sample coverage. That is the
+documented boundary, not an implementation error.
+
+Evidence: `tmp/integration-20260912/` (`verify-loaded279.json`, `results279.txt`,
+`nooutput-task.out`, `driver279-build.log`, `assemble279.log`).
+
 ## Combined DX12/WoW64 integration, 2026-09-12
 
 The owner requested merging the published native FL12/DXR work with the tested

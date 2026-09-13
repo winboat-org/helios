@@ -79,3 +79,29 @@ frequency invocation, coverage and guard regions) is the behavioural gate, plus
 the native D3D12 suite: adapter/dependency-level caps must report FL12_1, and
 allocator, stream-output, raytracing and tiled cases must no longer be blocked by
 "native FL12_1 admission unavailable".
+
+## Result, 2026-09-13 (.279, `59595da2`)
+
+Admission is fixed and measured: the `adapter` probe passes, `allocator` passes,
+and `raytracing` reports `CAP,NativeFL12_1Admission,00000000` where it was
+previously blocked.
+
+The behavioural gate **fails on this host, and cannot pass**. `no-output-msaa` is
+normally BLOCKED because the guest has no D3D12 debug layer (Graphics Tools FoD,
+`0x887a002d`) and DISM is denied here. A diagnostic build with the debug-layer
+gate relaxed ran the case: 15 cases, 8,640 words, **320 mismatches, every one on
+the 16-sample case** (`got 000000ff, want 0000ffff`). The mask is correct
+(`CAP,NoOutputSampleCounts,0000001f`) and the PSO is accepted, but the clamp
+rasterizes it at 8 samples, so the observable coverage is 8 bits wide.
+
+That is the ceiling, not a bug in the clamp: RADV exposes no 16-sample
+rasterization, and Vulkan will not create a pipeline with
+`rasterizationSamples = 16`, so no implementation on this host can produce true
+16x no-output shading. The `0x1f` report is therefore an over-report for the 16x
+entry specifically; the alternative is not claiming FL12_1 at all.
+
+Consequences for the charter: the native suite's other three failures
+(`stream-output` "32-bit counter guards overwritten", `raytracing` "uncompacted
+current/prebuild size agreement", and the `tiling-buffer` 0xC0000005 crash) were
+previously unreachable behind the admission block and are now open defects.
+
