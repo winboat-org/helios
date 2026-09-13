@@ -26,6 +26,9 @@ use rmcp::{
 use serde::Deserialize;
 use tokio::process::Command;
 
+mod cli;
+mod host;
+
 /// Shared project root on the Windows side (the Z: drive maps the Linux tree).
 const PROJECT_DRIVE: &str = "Z:\\";
 /// The same tree on the Linux side (where this server runs). Used by tools that
@@ -177,22 +180,23 @@ pub struct WinHost {
     tool_router: ToolRouter<WinHost>,
 }
 
-struct ExecOutput {
-    stdout: String,
-    stderr: String,
-    code: Option<i32>,
-    timed_out: bool,
+#[derive(Debug, Clone)]
+pub(crate) struct ExecOutput {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) code: Option<i32>,
+    pub(crate) timed_out: bool,
 }
 
 /// Encode a PowerShell script as base64 of its UTF-16LE bytes, the input format
 /// for `powershell -EncodedCommand`. This avoids all shell quoting concerns.
-fn encode_powershell(script: &str) -> String {
+pub(crate) fn encode_powershell(script: &str) -> String {
     let utf16le: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     base64::engine::general_purpose::STANDARD.encode(utf16le)
 }
 
 /// Escape a string for a PowerShell single-quoted literal (double the quotes).
-fn ps_single_quote(s: &str) -> String {
+pub(crate) fn ps_single_quote(s: &str) -> String {
     s.replace('\'', "''")
 }
 
@@ -210,7 +214,7 @@ fn tail(s: &str, max: usize) -> String {
 
 /// Drop SSH-client banners (the post-quantum warning) and any stray CLIXML
 /// artifacts so build errors aren't buried in noise.
-fn clean_stderr(s: &str) -> String {
+pub(crate) fn clean_stderr(s: &str) -> String {
     s.lines()
         .filter(|l| {
             let t = l.trim_start();
@@ -224,6 +228,18 @@ fn clean_stderr(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Parse repeated `K=V` tool arguments.
+fn parse_env(raw: &Option<Vec<String>>) -> Result<HashMap<String, String>> {
+    let mut out = HashMap::new();
+    for kv in raw.iter().flatten() {
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("env entry '{kv}' is not K=V"))?;
+        out.insert(k.to_string(), v.to_string());
+    }
+    Ok(out)
 }
 
 fn format_output(o: &ExecOutput) -> String {
@@ -803,6 +819,104 @@ fn ps_join_path(root: &str, rel: &str) -> String {
     }
 }
 
+// ── generic multi-host tool arguments ───────────────────────────────────────
+//
+// These are the transport-agnostic layer: `host` selects which machine, and
+// `purpose` selects the session/privilege rules (see `host::Purpose`). The
+// domain tools above stay VM/Z:-specific; anything that has to work on the build
+// slave as well goes through these.
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct HostOnlyArgs {
+    /// Which host: "vm" (win11 dev VM) or "slave" (firstheberg2-win build slave).
+    host: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct HostRunArgs {
+    /// Which host: "vm" or "slave".
+    host: String,
+    /// PowerShell to run on that host.
+    command: String,
+    /// Working directory. Defaults to the host's workspace (C:\Users\Tibix on the
+    /// VM, C:\src on the slave).
+    cwd: Option<String>,
+    /// Session/privilege rules: build | install | desktop | system. Defaults to
+    /// "desktop" on the VM and "build" on the slave. "desktop" runs as the
+    /// interactive user and REFUSES to run in session 0, because a GPU probe
+    /// started there reports plausible but fake results.
+    purpose: Option<String>,
+    /// Extra environment variables as K=V. Repeatable.
+    env: Option<Vec<String>>,
+    /// ssh timeout in seconds (default 600).
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct HostRunScriptArgs {
+    /// Which host: "vm" or "slave".
+    host: String,
+    /// Path to a .ps1 ON THE LINUX SIDE. It is pushed to the host's staging dir
+    /// with a verified sha256 and then run there — so no quoting of the script
+    /// body is involved anywhere.
+    script: String,
+    /// Arguments passed to the script.
+    args: Option<Vec<String>>,
+    /// Session/privilege rules: build | install | desktop | system.
+    purpose: Option<String>,
+    /// Start it DETACHED as a scheduled task with this name instead of blocking
+    /// on ssh. Required for anything longer than a couple of minutes: an ssh
+    /// keepalive drop kills a synchronous remote process.
+    task: Option<String>,
+    /// Log path for a detached task. Defaults to <staging>\<task>.log.
+    log: Option<String>,
+    /// ssh timeout in seconds for the synchronous case (default 600).
+    timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct HostTaskArgs {
+    /// Which host: "vm" or "slave".
+    host: String,
+    /// start | status | kill.
+    action: String,
+    /// Scheduled task name. Use a stable Helios-prefixed name so the next agent
+    /// can find it.
+    name: String,
+    /// For action=start: remote path of the .ps1 to run. Use win_host_push or
+    /// win_host_run_script (with task=) to get it there.
+    script: Option<String>,
+    /// For action=start: arguments for the script.
+    args: Option<Vec<String>>,
+    /// For action=start: build | install | desktop | system.
+    purpose: Option<String>,
+    /// Log path the task writes to (defaults to <staging>\<name>.log). Pass the
+    /// same value back to action=status to read it.
+    log: Option<String>,
+    /// For action=status: how many log lines back to return (default 40).
+    tail_lines: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct HostPushArgs {
+    /// Which host: "vm" or "slave".
+    host: String,
+    /// Local (Linux) file to send.
+    local: String,
+    /// Destination path on the host, e.g. C:\src\out\pkg.zip.
+    remote: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct HostPullArgs {
+    /// Which host: "vm" or "slave".
+    host: String,
+    /// Remote (Windows) file to fetch.
+    remote: String,
+    /// Local (Linux) destination path.
+    local: String,
+}
+
 #[tool_router]
 impl WinHost {
     fn new() -> Self {
@@ -1306,20 +1420,216 @@ impl WinHost {
         }
         out
     }
-}
 
-#[tool_handler]
-impl ServerHandler for WinHost {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Runs commands and cargo/cargo-make builds on the Helios win11 dev VM. \
-                 The project source is shared at Z:\\ (identical to the Linux tree), so \
-                 edit files on Linux and build here."
-                    .to_string(),
+    // ── generic multi-host tools ────────────────────────────────────────────
+    //
+    // Why these exist next to the domain tools: the domain tools encode the VM's
+    // Z:\ share model, which the build slave does not have, and none of them can
+    // start detached work or report where a log went. Everything learned the hard
+    // way about principals, sessions, detached tasks and verified transfers lives
+    // in `host.rs` and is reached through these.
+
+    #[tool(
+        description = "One-shot status of the Helios stack on a host, as JSON. Use this FIRST in a session instead of hand-writing probes: it answers what package is installed and whether it is the loaded one (install-state, PnP status/problem, KMD service image + hash, every driver image hash, the registered Vulkan manifest, DWM's loaded graphics modules with hashes, pending-reboot flags, evidence dirs, free space, and any Helios scheduled tasks). On the slave it reports the tree HEAD and submodule pins, warm build dirs, staged artifacts with package zip hashes, recent logs and running build processes."
+    )]
+    async fn win_host_status(&self, Parameters(a): Parameters<HostOnlyArgs>) -> String {
+        match host::host_spec(&a.host) {
+            Ok(spec) => match host::status(spec).await {
+                Ok(json) => json,
+                Err(e) => format!("error: {e:#}"),
+            },
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
+    #[tool(
+        description = "Preflight a host before starting work: are git/python/ninja/meson/cmake/cargo/clang-cl/MSVC present and where, is PowerShell 7 installed, is MSYS2 complete, do the expected workspaces exist, is the repo HEAD readable under THIS account (with the safe.directory setting), how much disk is free, and which Helios tasks are registered. Answers in one call what otherwise gets discovered eight minutes into a build. Returns JSON."
+    )]
+    async fn win_host_preflight(&self, Parameters(a): Parameters<HostOnlyArgs>) -> String {
+        match host::host_spec(&a.host) {
+            Ok(spec) => match host::preflight(spec).await {
+                Ok(json) => json,
+                Err(e) => format!("error: {e:#}"),
+            },
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
+    #[tool(
+        description = "Identity and session facts for a host: hostname, account, session id, admin, PowerShell version, OS build, which interactive sessions exist, whether explorer/dwm are running there, and free space. Cheap, and worth calling whenever a result looks wrong — a probe in session 0 does not fail, it lies."
+    )]
+    async fn win_host_info(&self, Parameters(a): Parameters<HostOnlyArgs>) -> String {
+        match host::host_spec(&a.host) {
+            Ok(spec) => match host::hostinfo(spec).await {
+                Ok(json) => json,
+                Err(e) => format!("error: {e:#}"),
+            },
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
+    #[tool(
+        description = "Run an ad-hoc PowerShell snippet on either host (vm or slave) with the session rules made explicit via purpose: build (SYSTEM + safe.directory + a PATH that cannot pick up MSYS2's git), install (SYSTEM), desktop (the interactive user, refusing session 0), system. Use win_exec for the Z:\\-share VM work you already have commands for; use this when the target may be the build slave or when the principal matters."
+    )]
+    async fn win_host_run(&self, Parameters(a): Parameters<HostRunArgs>) -> String {
+        let spec = match host::host_spec(&a.host) {
+            Ok(s) => s,
+            Err(e) => return format!("error: {e:#}"),
+        };
+        let purpose = match a.purpose.as_deref().map(host::Purpose::parse).transpose() {
+            Ok(p) => p.unwrap_or(spec.default_purpose),
+            Err(e) => return format!("error: {e:#}"),
+        };
+        let env: Vec<(String, String)> = match parse_env(&a.env) {
+            Ok(v) => v.into_iter().collect(),
+            Err(e) => return format!("error: {e:#}"),
+        };
+        match host::run_command(
+            spec,
+            &a.command,
+            a.cwd.as_deref(),
+            &env,
+            purpose,
+            a.timeout_secs.unwrap_or(600),
+        )
+        .await
+        {
+            Ok(o) => format!("purpose={} {}", purpose.as_str(), format_output(&o)),
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
+    #[tool(
+        description = "Push a local (Linux) .ps1 to a host and run it there — same content, both hosts, no shell quoting anywhere. Pass task=<name> to start it DETACHED as a scheduled task and get the log path back (use this for anything long: an ssh keepalive drop kills a synchronous remote process, which is how a build silently dies). The push is sha256-verified on both ends."
+    )]
+    async fn win_host_run_script(&self, Parameters(a): Parameters<HostRunScriptArgs>) -> String {
+        let spec = match host::host_spec(&a.host) {
+            Ok(s) => s,
+            Err(e) => return format!("error: {e:#}"),
+        };
+        let purpose = match a.purpose.as_deref().map(host::Purpose::parse).transpose() {
+            Ok(p) => p.unwrap_or(spec.default_purpose),
+            Err(e) => return format!("error: {e:#}"),
+        };
+        let args = a.args.clone().unwrap_or_default();
+        match host::run_script(
+            spec,
+            std::path::Path::new(&a.script),
+            &args,
+            purpose,
+            a.task.as_deref(),
+            a.log.as_deref(),
+            a.timeout_secs.unwrap_or(600),
+        )
+        .await
+        {
+            Ok(host::ScriptRun::Sync { transfer, remote, output }) => format!(
+                "pushed {} bytes to {remote} (sha256 {}), purpose={}\n{}",
+                transfer.size,
+                transfer.sha256,
+                purpose.as_str(),
+                format_output(&output)
             ),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
+            Ok(host::ScriptRun::Task { transfer, task }) => format!(
+                "pushed {} bytes (sha256 {}); task {} state={} purpose={}\nlog: {}\npoll with win_host_task action=status name={} log={}",
+                transfer.size,
+                transfer.sha256,
+                task.name,
+                task.state,
+                purpose.as_str(),
+                task.log,
+                task.name,
+                task.log
+            ),
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
+    #[tool(
+        description = "Detached-task lifecycle: action=start (name + script, plus optional args/purpose/log), action=status (name + optional log/tail_lines: returns state, LastTaskResult, whether the log exists, its tail, and the WINRUN_EXIT marker the wrapper appends), action=kill. Long work belongs here rather than in a synchronous ssh call."
+    )]
+    async fn win_host_task(&self, Parameters(a): Parameters<HostTaskArgs>) -> String {
+        let spec = match host::host_spec(&a.host) {
+            Ok(s) => s,
+            Err(e) => return format!("error: {e:#}"),
+        };
+        let log = a
+            .log
+            .clone()
+            .unwrap_or_else(|| format!("{}\\{}.log", spec.staging, a.name));
+        match a.action.as_str() {
+            "start" => {
+                let Some(script) = a.script.as_deref() else {
+                    return "error: action=start needs script (a remote .ps1 path)".to_string();
+                };
+                let purpose = match a.purpose.as_deref().map(host::Purpose::parse).transpose() {
+                    Ok(p) => p.unwrap_or(spec.default_purpose),
+                    Err(e) => return format!("error: {e:#}"),
+                };
+                let args = a.args.clone().unwrap_or_default();
+                match host::task_start(spec, &a.name, script, &args, purpose, Some(&log)).await {
+                    Ok(t) => format!(
+                        "task={} state={} purpose={} log={}",
+                        t.name,
+                        t.state,
+                        purpose.as_str(),
+                        t.log
+                    ),
+                    Err(e) => format!("error: {e:#}"),
+                }
+            }
+            "status" => {
+                match host::task_status(spec, &a.name, &log, a.tail_lines.unwrap_or(40)).await {
+                    Ok(st) => format!(
+                        "task={} exists={} state={} last_result={} log_exists={} exit_marker={}\n--- log tail ({log}) ---\n{}",
+                        a.name,
+                        st.exists,
+                        st.state,
+                        st.last_result.map(|v| v.to_string()).unwrap_or("-".into()),
+                        st.log_exists,
+                        st.exit_marker.map(|v| v.to_string()).unwrap_or("-".into()),
+                        st.log_tail
+                    ),
+                    Err(e) => format!("error: {e:#}"),
+                }
+            }
+            "kill" => match host::task_kill(spec, &a.name).await {
+                Ok(()) => format!("killed task {}", a.name),
+                Err(e) => format!("error: {e:#}"),
+            },
+            other => format!("error: unknown action '{other}' (start|status|kill)"),
+        }
+    }
+
+    #[tool(
+        description = "Copy a local file to a host with the sha256 verified on BOTH ends (size too). Use it instead of raw scp for packages and artifacts: an unchecked transfer that silently truncates is the expensive kind of failure."
+    )]
+    async fn win_host_push(&self, Parameters(a): Parameters<HostPushArgs>) -> String {
+        match host::host_spec(&a.host) {
+            Ok(spec) => match host::push(spec, std::path::Path::new(&a.local), &a.remote).await {
+                Ok(t) => format!(
+                    "{} -> {}  {} bytes  sha256={}  verified={}",
+                    t.local, t.remote, t.size, t.sha256, t.verified
+                ),
+                Err(e) => format!("error: {e:#}"),
+            },
+            Err(e) => format!("error: {e:#}"),
+        }
+    }
+
+    #[tool(
+        description = "Copy a file from a host to Linux with the sha256 verified on BOTH ends. Use it for evidence and logs (task stdout, probe archives, WER dumps)."
+    )]
+    async fn win_host_pull(&self, Parameters(a): Parameters<HostPullArgs>) -> String {
+        match host::host_spec(&a.host) {
+            Ok(spec) => match host::pull(spec, &a.remote, std::path::Path::new(&a.local)).await {
+                Ok(t) => format!(
+                    "{} -> {}  {} bytes  sha256={}  verified={}",
+                    t.remote, t.local, t.size, t.sha256, t.verified
+                ),
+                Err(e) => format!("error: {e:#}"),
+            },
+            Err(e) => format!("error: {e:#}"),
         }
     }
 }
@@ -1511,7 +1821,10 @@ mod tests {
         std::fs::create_dir_all(&kmd).unwrap();
         for f in ["driver-version.env", "build.rs", "Cargo.make.toml"] {
             std::fs::copy(
-                format!("{}/kmd_render/{f}", super::linux_project_root()),
+                // The checkout this test was compiled from, not the deployment
+                // constant: the test's subject is the bump logic, and the tree it
+                // runs from must exist wherever the suite is run.
+                format!("{}/../../kmd_render/{f}", env!("CARGO_MANIFEST_DIR")),
                 kmd.join(f),
             )
             .unwrap();
@@ -1588,6 +1901,20 @@ mod tests {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // One ssh-config decision per process, before anything connects: on a host
+    // whose system ssh_config is unreadable, plain `ssh host` exits 255 and
+    // `ssh -F ~/.ssh/config host` works. Cached here so the CLI and the server
+    // make the same choice.
+    host::init_ssh_config();
+
+    // CLI mode: the same primitives the MCP tools expose, driven from a shell so
+    // CI scripts, humans and shell-only agents can use them too.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(|a| a == "--cli").unwrap_or(false) {
+        let code = cli::run(argv[1..].to_vec()).await;
+        std::process::exit(code);
+    }
+
     // Drop any stale SSH ControlMaster so the first build picks up the current
     // machine environment (PATH/vars updated by recent toolchain installs).
     let _ = Command::new("ssh")
@@ -1600,4 +1927,21 @@ async fn main() -> Result<()> {
         .await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[tool_handler]
+impl ServerHandler for WinHost {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            instructions: Some(
+                "Runs commands and cargo/cargo-make builds on the Helios win11 dev VM. \
+                 The project source is shared at Z:\\ (identical to the Linux tree), so \
+                 edit files on Linux and build here."
+                    .to_string(),
+            ),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            ..Default::default()
+        }
+    }
+
 }

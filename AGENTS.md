@@ -107,7 +107,26 @@ suppressing them is exactly the fake success rule 2 forbids, in the component th
 at `bindgen ^0.71`, so the wdk crates are **pinned to an upstream git rev** that already carries
 0.72.1. Return them to crates.io the day a `wdk-build > 0.5.1` ships.
 
-**Driving the VM:** prefer the **`win` MCP server** — `win_exec`, `win_cargo` (mirrors `Z:\` to
+**Driving either Windows host:** `tools/win-mcp` is both the **`win` MCP server**
+(`win_exec`, `win_cargo`, `win_vkd3d`, `win_meson`, `win_build_kmd`,
+`win_install_kmd`, `win_install_umd`, `win_looking_glass*`) and a CLI over the
+same code — `win-mcp --cli <command>`. The CLI exists for CI, humans and
+shell-only agents, and the generic `win_host_*` tools/commands work on **both**
+the dev VM and the `firstheberg2-win` build slave: `status` (one-shot "what is
+actually running", which is what to run first in a session), `preflight`,
+`hostinfo`, `run`, `run-script`, `task` (detached work), and verified `push` /
+`pull`. `purpose` (`build` / `install` / `desktop` / `system`) selects the
+session and privilege rules and is part of correctness: `desktop` refuses session
+0 because a GPU probe there reports plausible but fake results, `build` runs as
+SYSTEM with `safe.directory` and a PATH that cannot pick up MSYS2's git, and
+`install` runs as SYSTEM so a console control event cannot interrupt a display
+driver swap. Read `tools/win-mcp/README.md` before writing another ssh/task
+wrapper — long work belongs in `run-script --task NAME` (an ssh drop kills a
+synchronous remote process) and every transfer is sha256-verified on both ends.
+
+The VM-specific tools remain:
+
+`win_exec`, `win_cargo` (mirrors `Z:\` to
 `C:\Users\Rupansh\helios-vgpu` and sets the local target dir + `LIBCLANG_PATH`),
 `win_build_kmd` + `win_install_kmd` (the KMD build/sign/deploy path), `win_install_umd`,
 `win_dxvk` (the DXVK engine), `win_meson` (Mesa ICD), and the historical
