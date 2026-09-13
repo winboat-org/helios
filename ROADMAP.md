@@ -160,10 +160,13 @@ fix (`helios-windows-x64-22.22.280.0-ef9c6586.zip` sha256
 `helios-windows-x64-22.22.281.0-7bd12310.zip` sha256
 `922b9f0f3c64719066b44731ddcf5f8240647652790d2c7b09fe69a6e66c3a72`,
 `evidence/verify-loaded280.out`, `evidence/verify-loaded281.out`,
-`evidence/verdicts281.txt`, `evidence/raytracing/`, `evidence/verdict-*.txt`,
-`evidence/recover280.log`, `build280c.log`, `assemble280b.log`, `build281c.log`,
-`assemble281.log`; host-side attribution output and the probe source are
-`tools/host_as_size_probe.c`).
+`evidence/verdicts281.txt`, `evidence/results281-summary.txt`,
+`evidence/raytracing/`, `evidence/verdict-*.txt`, `evidence/recover280.log`,
+`evidence/build280c.log`, `evidence/assemble280b.log`,
+`evidence/build281c.log`, `evidence/assemble281.log`,
+`evidence/engine-inputs281.json`, `evidence/validation281.json` and
+`evidence/manifest281.json`; host-side attribution output and the probe source
+are `tools/host_as_size_probe.c`).
 
 The `.280` install is the same package flow as `.279`, with one wrinkle worth
 recording: the ring-3 upgrade driven from a scheduled task was killed by
