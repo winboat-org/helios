@@ -171,26 +171,55 @@ One defect that admission had been hiding remains open:
   and a clean reboot does not change it — a single allocator run still failed to
   complete in 240 s on a fresh boot (`TIMEOUT-NOT-A-DATUM`), against ~1.6–2.1 s for
   the same probe on `.281`.
-  ⚠ Leading hypothesis to test first, because it explains a HANG rather than mere
-  slowness: the escape is issued while `vkd3d_acquire_vk_queue` holds vkd3d's queue
-  mutex, which is the exact exposure `PENDING.md` A3 records — the Venus worker that
-  must retire the fence can be blocked behind the lock the caller holds, so the
-  packet never completes and the app's fence wait never returns. Rate-limiting alone
-  would then only make the wedge rarer, not absent; the mint may have to move to a
-  point that does not hold that lock (or into the engine's own submission path,
-  where the ordering is already correct).
-  ⇒ **Next step is a rate limiter, not more measurement**: mint at most one boundary
-  per queue per frame (or per short interval) and REUSE the last fence for every
-  packet in between — reuse is safe because wire ids are monotonic, so an older
-  fence is a weaker but never wrong gate. Then re-measure, and only then read the
-  oracle. ⚠ Nothing in the paragraphs below may be read as a correctness result
-  from these runs: the probe never produced a verdict.
-  ⚠ Still owed before any claim: an install and a measurement — `D12Fnc` moving
-  with `D12Fn0` falling, the `allocator` oracle's failure rate, `WfOut`=0,
-  `QfRet`=0, `WfBWire` flat — plus the EscSubRing delta that decides whether one
-  boundary per producer is affordable.
-  **Piece (2) design, kept for the record.** The
-  producer goes in the **UMD12**, not the engine, and the reasons are checked, not
+  ⛔ **ROOT CAUSE FOUND AND PROVEN, `.283`→`.286`, and it is neither the ordering,
+  the lock, nor the cost: `vkd3d_acquire_vk_queue` DEADLOCKS when it is called from
+  the UMD's `pfnExecuteCommandLists`.** Read off the UMD12's own log (which is how
+  this was localised in 24 s per arm instead of waited for — a timeout cannot tell a
+  stall from slowness): the log grows to ~290 KB in two seconds, stops inside the
+  FIRST `ExecuteCommandLists` immediately after the bridge resolves the ICD module,
+  and never grows again. Three arms, one per boot, `.285` (mode knob):
+  * mode 1 — **drain only, the export never called**: stalls at the identical point.
+    ⇒ the escape is exonerated; the wait is in acquire/release.
+  * mode 2 — drain then escape (the `.282`–`.285` shipping shape): stalls, same point.
+  * mode 0 — escape only, handle via `vkd3d_lock_vk_queue`/`_unlock`, no drain marker:
+    **`allocator` reaches a verdict, `EXIT=0`.**
+  The acquire waits for the queue worker to reach a caller-pushed submit marker; from
+  inside the engine's own ECL flow that wait never returns, and it is CPU-idle (0.14 s
+  of CPU across 200 s of wall clock on `.284`), which is why the earlier cadence and
+  latency readings could never have fixed it. `.286` ships mode 0 as the default.
+  ⛔⛔ **`.286` ACCEPTANCE: the HANG is fixed, the DEFECT is NOT yet.** `allocator`
+  now runs to a verdict in 1423–1999 ms (`.281` baseline 1260–2364 ms) where it
+  previously never finished at all, so the re-entrancy deadlock is gone — but the
+  oracle still failed 1 of 2 runs and `stream-output` failed both (its runner throws
+  `Native SO acceptance failed`), i.e. an early fence is still reachable.
+  ⚠ **That is exactly the weakness mode 0 documents**: with no drain marker the seqno
+  cannot be proven to include the ECL's own submission, so for a serialized workload
+  (one ECL per epoch) the boundary lags the very work it is meant to cover. The
+  measured-good *shape* (no drain from the DDI) and the *effective* gate (a boundary
+  that provably covers this ECL) are two different things, and `.286` only has the
+  first.
+  ⇒ **The lever is now REMOVED (`.287`, not defaulted off)**: the three producers pass
+  `gpu_wire_fence = 0`, the ICD-export resolver, the knobs and the bridge entry point are
+  deleted, and the record keeps its v3 shape with a zero.
+  ⛔⛔ **And the plan that stood here — "mint from the ENGINE's submission thread" — was
+  the wrong path too**, for the reason `EXECUTION_SYNC.md` states outright: a *sampled*
+  wire fence can precede worker execution, so no mint site rescues it. **The ordered edge
+  this driver already implements is the registered producer stream** (value reserved in
+  the same FIFO commit as the work, carried on `HeliosD3D12SubmitCmd`, signalled
+  `ALL_COMMANDS` after execution — host-ordered, not sampled; it passed the four native
+  ordering cases on `.270`). ⇒ Next change: the D3D12 ECL packet's dependency must name
+  that stream value. Today `note_wddm_submission` picks `(watermark, wire_boundary)` only
+  from the wire-fence namespace while `stream_boundary` feeds just the retire domain and
+  the windowed-BLT admit — so the packet retires on a boundary that cannot include its
+  own work, which is submitted *after* admission by design. Decision logic goes in
+  `kmd_logic` with unit tests (`kmd_render` cannot host them).
+  ⚠ Still owed before any claim: the `allocator` failure rate over ≥10 runs against
+  the `.281` 4-of-10 baseline, `WtOut`=0, `QfRet`=0, `WfBWire` flat, and the rest of the
+  suite (`tiled`, `raytracing`, `stream-output`).
+  ⛔ **WITHDRAWN DESIGN, kept for provenance only — do NOT implement from this block.**
+  It is the rationale for the sampled-wire-fence lever, which `.287` removed: the whole
+  approach is rejected by `EXECUTION_SYNC.md`'s ordering contract (see directly above).
+  The producer goes in the **UMD12**, not the engine, and the reasons were checked, not
   assumed:
   * `vkd3d_acquire_vk_queue(ID3D12CommandQueue *) -> VkQueue` is already **public**
     (`vkd3d-proton-helios/include/vkd3d.h:126`), so the UMD12 can obtain the

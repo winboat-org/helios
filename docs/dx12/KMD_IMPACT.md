@@ -916,6 +916,64 @@ internal producer appears.
 a CPU-side wait for `vkQueueSubmit`, **not** for GPU completion, so it costs no CPU/GPU overlap.
 This is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present path.
 
+#### ⛔⛔ ICD-1's CALLER ORDERING CONTRACT — and why this whole lever is NOT the fix
+
+Measured 2026-09-13, in this order, and the third row is what closed the question:
+
+| arm | shape | result |
+|---|---|---|
+| `Umd12GpuFenceMode=1` | `vkd3d_acquire_vk_queue`/`_release` only, the ICD export never called | stalls at the FIRST `ExecuteCommandLists` |
+| mode 2 (`.282`–`.285`) | drain, then `vkd3d_release_vk_queue`, then the escape | stalls, same point |
+| mode 0 (`.286`) | handle via `vkd3d_lock_vk_queue`/`_unlock`, escape with no drain marker | allocator reaches a verdict |
+
+⇒ `vkd3d_acquire_vk_queue` **deadlocks when called from the UMD's `pfnExecuteCommandLists`**
+(it waits for the queue worker to reach a caller-pushed submit marker, from inside the
+engine's own ECL flow). The escape was never the problem; the drain was. `.286` therefore
+obtains the handle with the lock/unlock pair and escapes without the marker.
+
+⛔ **But the lever does not fix the defect, and that is now measured too.** With
+`Umd12GpuFence=0` — the pre-K-F retire domain, no escape issued anywhere — `allocator`
+failed **2 of 3** runs at 1260–1536 ms on the same `.286` boot, i.e. the early fence the
+oracle hunts is present with and without this lever.
+
+⛔⛔ **The mechanism itself is rejected by the design this driver was built against.**
+`EXECUTION_SYNC.md` ("Contract and ordering"): *"There are two different edges. ... A
+sampled Venus wire fence could precede worker execution and supplied neither guarantee."*
+The intended edge is the **registered producer stream**: the ECL commits an operation
+whose stream value is reserved in the same FIFO commit as the work, `HeliosD3D12SubmitCmd`
+v2 carries that handle/value/cookie, the worker waits for admission, and after execution
+it submits an `ALL_COMMANDS` signal on that exact stream — host-ordered completion, no
+sampling and no GPU-idle wait. That path already exists and passed the four native
+ordering cases on `.270`.
+
+⇒ **The lever has been REMOVED from `umd12` (2026-09-13), not merely disabled.**
+The three producer call sites now pass `gpu_wire_fence = 0`, the ICD-export resolver,
+the knob set and the bridge entry point are deleted, and the record keeps its
+version-3 shape with a zero (exactly version-2 semantics for the KMD). The arm table
+above is kept because it is the only record of how the `.282` deadlock was localised;
+the code that produced it is not kept, because a diagnostic arm that outlives its
+question is scaffolding.
+
+⇒ **The fix is on the STREAM edge.** `EXECUTION_SYNC.md` names it and describes the
+machinery: the ECL reserves a stream value in the same FIFO commit as the work,
+`HeliosD3D12SubmitCmd` carries that handle/value/cookie, the worker waits for
+admission, and after execution submits an `ALL_COMMANDS` signal on that exact stream.
+That is host-ordered completion with no sampling and no GPU-idle wait, and it already
+passed the four native ordering cases on `.270`.
+
+⛔ **THE CONCRETE GAP, and the thing to verify before writing any code:** in
+`note_wddm_submission` the packet's `(watermark, wire_boundary)` is chosen entirely
+from the WIRE-FENCE namespace — the guest's `gpu_wire_fence` when present, else
+`(next_wire_fence, WireBoundary::Prefix)` — while the record's stream value
+(`stream_boundary`) feeds only the retire DOMAIN and the windowed-BLT admit
+(`admit_windowed_blt_prefix`). So a D3D12 ECL packet's watermark never names the
+stream value that the engine will signal for it. Because that work is submitted
+*after* admission by design, the packet retires on a boundary that cannot include its
+own work: the early fence, exactly. ⇒ The next change is to make the D3D12 ECL
+packet's dependency the reserved stream value (decision logic in `kmd_logic` with its
+unit tests, since `kmd_render` cannot host them), then re-run the 2x3 oracle, the
+suite, and the timing check. No part of this section's lever is a prerequisite.
+
 | # | Item | Where | Size | Class |
 |---|---|---|---|---|
 | **FB-1** | Latch the three context windows and re-latch them after every `pfnRenderCb`. ⚠ **Shared by both `pfnRenderCb` users** — the fence carrier and the present identity. Do it once. Reuse `umd_common/src/window.rs`'s `Window`, which already documents the D3D12 case. ✅ **LANDED**: `umd12/src/forward12/queue.rs`'s `ContextWindows` holds all three behind a `Mutex`, re-latched on every `pfnRenderCb`, and it uses the shared `helios_umd_common::window::Window` rather than a second copy. ⛔ **This row's premise is now REVERSED and the old citation is worse than stale**: *"logged and dropped on purpose (`queue.rs:920-940`)"* is exactly what `queue.rs`'s own module doc now overturns — see its *"The three context windows ARE stored — this reverses the earlier round's …"* paragraph. | `umd12` | S | ✅ |
