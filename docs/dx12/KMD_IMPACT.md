@@ -961,6 +961,18 @@ admission, and after execution submits an `ALL_COMMANDS` signal on that exact st
 That is host-ordered completion with no sampling and no GPU-idle wait, and it already
 passed the four native ordering cases on `.270`.
 
+⛔⛔ **SOLVED 2026-09-13 (`.288`): the untruthfulness was in the ENGINE's fence signal,
+one layer above this KMD gate.** `d3d12_command_queue_signal` waited on
+`command_queue->last_submission_timeline_value`, a cached value that may already be
+retired; a fence waiting on a reached value is satisfied with no GPU dependency, which is
+exactly the measured signature (an instrumented oracle recorded `WAIT ... us=4` against a
+normal ~350 us for the same copy, then a readback holding a previous epoch's bytes). The
+signal path now bumps the submission timeline and submits one empty batch signaling a
+fresh value — the same operation `vkd3d_release_vk_queue` performs for interop callers —
+and waits on that, so the fence is ordered behind everything already submitted on the
+queue. Measured: `allocator` 55/55 PASS against 2/20 FAIL on the same guest and probe
+before the fix; `stream-output` 23/25 (2 residual failures, undiagnosed).
+
 ⛔⛔ **MEASURED 2026-09-13 on `.287`, `DiagLevel=2` (see the instrument note below): the
 D3D12 ECL packet IS gated on the registered stream and IS released by real retirement.**
 `allocator` x3 produced: `D12Rec = 2564` records, `D12Fn0 = 2564` (every one carried

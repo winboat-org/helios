@@ -218,6 +218,32 @@ One defect that admission had been hiding remains open:
   `diag.rs:120` drops every count when `DiagLevel == 0`, the default, and it is snapshotted
   at init - so set `DiagLevel=2` on the KMD service key and REBOOT before believing any
   `D12*`/`WfB*` value. A zero there on a `DiagLevel=0` guest is a false negative.
+
+  ⭐⭐ **FIXED IN `.288`, and measured.** The defect was one layer ABOVE the KMD: the
+  application's fence. `d3d12_command_queue_signal` waited on
+  `command_queue->last_submission_timeline_value` — a CACHE of the last timeline value
+  this queue happened to record — and a fence waiting on an already-retired value is
+  satisfied with no GPU dependency at all. Measured directly with an instrumented
+  oracle: `WAIT ... us=4` against a normal ~350 us for the same 16 KiB copy, followed by
+  a readback holding a previous epoch's bytes. The signal path now performs what
+  `vkd3d_release_vk_queue` performs for interop callers — bump the submission timeline
+  and submit one empty batch signaling a FRESH value — and waits on that, so the fence is
+  ordered behind everything already submitted on that queue by construction. Reported
+  from the engine's own refutation path: if that submit fails the cached value is kept,
+  because the consumed value would never arrive.
+
+  Measured on `.288`/`oem35.inf`, DWM on the new stack, `DiagLevel=2`:
+  * `allocator` (the 256-epoch content oracle): **55/55 PASS** across two series
+    (30 + 25). Baseline on the same guest and probe immediately before the fix: **2/20
+    FAIL**, and `.281` recorded 4-of-10.
+  * `stream-output`: **23/25 PASS** (was failing in every pair measured this session,
+    and 5-of-10 on `.281`) — ⚠ **2 failures remain and are NOT yet diagnosed**; they are
+    the next thing to look at, and the archived run shows the probe aborting after the
+    `gs-*` cases with its buffered stdout truncated, so the SO probe needs the same
+    failure-surviving diagnostics the allocator probe now has.
+  * Regression check on the same boot: `adapter`, `raytracing`, `indirect`,
+    `root-signature` PASS; `tiling-buffer` PASS (the `.281` crash fix intact) with only
+    the known `copy-tiles-*` content sub-cases failing; no timeouts anywhere.
   ⚠ Still owed before any claim: the `allocator` failure rate over ≥10 runs against
   the `.281` 4-of-10 baseline, `WtOut`=0, `QfRet`=0, `WfBWire` flat, and the rest of the
   suite (`tiled`, `raytracing`, `stream-output`).
