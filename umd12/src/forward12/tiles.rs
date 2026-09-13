@@ -110,9 +110,15 @@ unsafe fn admit_mapping(
     L2_REFUSALS.tile_mappings_forwarded.bump();
     // SAFETY: runtime submission callbacks stay on the entering DDI thread and
     // the exact context used for this operation's engine completion stream.
-    match unsafe { submit_wddm_render(dev, queue, // No GPU fence yet, like the other two producers (queue.rs): zero is the
-    // "no boundary" value, so this path is unchanged.
-    &ecl_submit_command(boundary, 0), "TileMappings") } {
+    // One boundary per producer, like the other two (queue.rs). The tile-mapping
+    // path is the sparse one this stage already fixed, so it must carry the fence
+    // too: a zero here would leave exactly this producer at worker completion.
+    // SAFETY: `engine_queue` is the live engine queue this state owns.
+    let gpu_wire_fence =
+        unsafe { crate::bridge12::queue_gpu_fence(queue.engine_queue.as_raw() as usize) };
+    match unsafe {
+        submit_wddm_render(dev, queue, &ecl_submit_command(boundary, gpu_wire_fence), "TileMappings")
+    } {
         WddmSubmit::Submitted => {
             // SAFETY: SignalAtSubmission follows Render on the same context;
             // this grants execution permission, not GPU completion.

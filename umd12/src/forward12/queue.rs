@@ -915,14 +915,18 @@ pub(crate) unsafe fn publish_present_producer(
             admission.0 .0 as usize,
         )
     }?;
+    // The host GPU-completion fence for this packet (0 = no boundary). Fetched
+    // ONCE per producer, not per record: the ICD export is a SUBMIT_VENUS escape
+    // whose fences stay in flight until host GPU completion.
+    // SAFETY: `engine_queue` is the live engine queue this state owns.
+    let gpu_wire_fence =
+        unsafe { crate::bridge12::queue_gpu_fence(queue.engine_queue.as_raw() as usize) };
     // SAFETY: Present's entering DDI thread, exact queue context and complete record.
     let outcome = unsafe {
         submit_wddm_render(
             dev,
             queue,
-            // No GPU fence yet: the producer lands separately, and zero is the
-            // "no boundary" value that keeps this inert.
-            &ecl_submit_command(boundary, 0),
+            &ecl_submit_command(boundary, gpu_wire_fence),
             "Present producer",
         )
     };
@@ -3058,14 +3062,16 @@ unsafe extern "system" fn execute_command_lists(
     };
     L2_REFUSALS.ecl_forwarded.bump();
     L2_REFUSALS.ecl_exact_boundary.bump();
+    // One boundary per producer, not per record: see the Present producer's note.
+    // SAFETY: `engine_queue` is the live engine queue this state owns.
+    let gpu_wire_fence =
+        unsafe { crate::bridge12::queue_gpu_fence(queue.engine_queue.as_raw() as usize) };
     // SAFETY: required runtime callback stays on the entering DDI thread.
     match unsafe {
         submit_wddm_render(
             dev,
             queue,
-            // No GPU fence yet: see ecl_submit_command. The K-F piece that fills
-            // this must also count nonzero fences reaching the KMD.
-            &ecl_submit_command(boundary, 0),
+            &ecl_submit_command(boundary, gpu_wire_fence),
             "ExecuteCommandLists",
         )
     } {

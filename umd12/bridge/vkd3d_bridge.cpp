@@ -76,6 +76,12 @@ extern "C" HRESULT helios_vkd3d_serialize_root_signature(
 extern "C" HRESULT helios_vkd3d_create_root_signature(ID3D12Device* device, UINT node_mask,
     const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, ID3D12RootSignature** root) noexcept(false);
 extern "C" HRESULT helios_vkd3d_clear_root_arguments(ID3D12GraphicsCommandList* list) noexcept(false);
+// vkd3d's public queue API (include/vkd3d.h): the *only* supported way to reach
+// the VkQueue the ICD export needs, and the same lock the submission drain uses.
+// Declared here rather than including vkd3d.h, whose widl-generated D3D12 types
+// collide with the SDK's (see vkd3d_bridge.h's header rule).
+extern "C" void* vkd3d_acquire_vk_queue(ID3D12CommandQueue* queue);
+extern "C" void vkd3d_release_vk_queue(ID3D12CommandQueue* queue);
 // Same SDK/widl COM ABI as the public pipeline factory; the separate symbol
 // supplies SO origin without reserving a legal application semantic name.
 extern "C" HRESULT helios_vkd3d_create_stream_output_pipeline(ID3D12Device* device,
@@ -389,6 +395,54 @@ struct MemoryIdentityExports {
   // `HELIOS_VKD3D_IDENTITY_NO_ICD` / `_NO_EXPORT` / `_RESOLVED`, decided once.
   std::uint32_t status = HELIOS_VKD3D_IDENTITY_NO_ICD;
 };
+
+// `bool helios_venus_queue_gpu_fence(VkQueue, uint64_t *)` — the ICD's own
+// `__cdecl` export. The VkQueue crosses as `void*`: VkQueue is a dispatchable
+// pointer handle on Windows x64, and naming it would drag vulkan.h across this
+// seam for no gain.
+using QueueGpuFenceFn = bool(__cdecl*)(void*, std::uint64_t*);
+
+struct QueueGpuFenceExport {
+  QueueGpuFenceFn fn = nullptr;
+};
+
+const QueueGpuFenceExport& queue_gpu_fence_export() {
+  static const QueueGpuFenceExport resolved = [] {
+    QueueGpuFenceExport out;
+    void* candidate = helios_bridge::find_venus_icd_module();
+    if (!candidate) return out;
+    void* canonical = helios_bridge::reconcile_icd_anchor(candidate);
+    if (!canonical) return out;
+    out.fn = reinterpret_cast<QueueGpuFenceFn>(reinterpret_cast<void*>(
+        GetProcAddress(static_cast<HMODULE>(canonical), "helios_venus_queue_gpu_fence")));
+    if (!out.fn) {
+      // Not an error: an ICD predating the export means D3D12 packets retire at
+      // worker completion exactly as they did before, and the KMD counts that
+      // separately (`D12Fn0`) instead of trusting a silent zero.
+      umd_log("queue_gpu_fence: venus ICD does not export helios_venus_queue_gpu_fence "
+              "-- D3D12 packets keep retiring at worker completion");
+    }
+    return out;
+  }();
+  return resolved;
+}
+
+std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue) noexcept {
+  if (!queue) return 0;
+  const QueueGpuFenceExport& resolved = queue_gpu_fence_export();
+  if (!resolved.fn) return 0;
+
+  auto* command_queue = reinterpret_cast<ID3D12CommandQueue*>(queue);
+  void* vk_queue = vkd3d_acquire_vk_queue(command_queue);
+  if (!vk_queue) return 0;
+
+  std::uint64_t fence = 0;
+  // A refusal leaves `fence` at 0 and is not an error: the KMD treats 0 as "no
+  // boundary", which is the pre-existing behaviour rather than a wrong fence.
+  resolved.fn(vk_queue, &fence);
+  vkd3d_release_vk_queue(command_queue);
+  return fence;
+}
 
 const MemoryIdentityExports& memory_identity_exports() {
   static const MemoryIdentityExports resolved = [] {

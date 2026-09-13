@@ -75,6 +75,15 @@ mod ffi {
         /// taking ownership.
         fn d3d12_device_ptr(self: &HeliosVkd3dDevice) -> usize;
 
+        /// KMD-issued wire fence of one command queue's own timeline, from the
+        /// venus ICD's `helios_venus_queue_gpu_fence`. **0 = no boundary**, which
+        /// is what every refusal returns (see the header comment).
+        ///
+        /// # Safety
+        /// `queue` is an `ID3D12CommandQueue*` owned by the engine and alive for
+        /// the call; the bridge acquires and releases the engine's queue lock.
+        unsafe fn helios_umd12_queue_gpu_fence(queue: usize) -> u64;
+
         /// The venus context id this device's `VkInstance` belongs to (S4b),
         /// captured at create time on the creating thread. 0 if the ICD is
         /// absent or too old to export it.
@@ -739,6 +748,26 @@ pub(crate) unsafe fn execute(
 
 /// # Safety
 /// Queue is still owned by QueueState while workers are cancelled.
+/// The wire fence to gate one D3D12 packet on, or 0 for "no boundary".
+///
+/// ⛔ Zero is NOT an error path here: it is returned for every refusal in the ICD
+/// export, and it restores the previous behaviour exactly (the packet retires on
+/// worker completion). The KMD counts carried and absent fences separately
+/// (`D12Fnc`/`D12Fn0`), so an inert wire is visible rather than assumed.
+///
+/// ⚠ Cost: the export issues one SUBMIT_VENUS escape per call and its fences stay
+/// in flight until host GPU completion, so the caller must not call this per
+/// packet without checking `EscSubRing`. It acquires the engine queue lock, which
+/// is the same lock the submission drain holds.
+///
+/// # Safety
+/// `queue` is an `ID3D12CommandQueue*` (as `usize`) owned by the engine and alive
+/// for the call.
+#[inline]
+pub(crate) unsafe fn queue_gpu_fence(queue: usize) -> u64 {
+    ffi::helios_umd12_queue_gpu_fence(queue)
+}
+
 pub(crate) unsafe fn cancel_execution(queue: usize, reason: i32) {
     // SAFETY: forwarded live queue; no reference escapes the call.
     unsafe { ffi::helios_vkd3d_bridge_cancel_execution(queue, reason) };
