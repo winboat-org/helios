@@ -102,6 +102,32 @@ pub(crate) static UMD12_TRACE: BoolKnob = BoolKnob::new(c"Umd12Trace", false);
 /// switch is usable in exactly the situation it exists for.
 pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", true);
 
+/// **The D3D12 packet retire-boundary lever's kill switch.** Absent = ON;
+/// explicit `0` = OFF, and OFF means every D3D12 packet reaches the KMD with
+/// wire fence 0, i.e. **exactly the pre-K-F retire domain** (`RetireDomain::
+/// ExcludingGpu`: dxgkrnl retires the packet when the venus *worker* returns
+/// rather than when the host GPU completes).
+///
+/// ⚠ It exists because the ON arm has a measured failure to explain and the
+/// explanation has two candidates that this knob separates on ONE binary: with
+/// 0 the fence path is not merely weaker, it is *absent* (no `SUBMIT_VENUS`
+/// escape is issued, so `EscSubRing` does not move either), so a run that hangs
+/// with 1 and completes with 0 convicts the fence path rather than the KMD or
+/// `umd12` as a whole. That is the control arm for `docs/dx12/KMD_IMPACT.md`
+/// §14a.1 UV1, and it is the cheaper half of a bisection whose other half is a
+/// rebuild.
+///
+/// The question it was born from (`.282`, 2026-09-13): the ON arm wedged the
+/// `allocator` oracle at `TIMEOUT-NOT-A-DATUM` while `vulkan-smoke` and
+/// `d3d11-smoke` passed on the same install, with `QfRet=2` and `WtOut=0` —
+/// i.e. a wedge inside the new path, not a driver-wide failure.
+///
+/// ⛔ Not a shipping default change. It defaults to ON because ON is the
+/// behaviour under test; the lever must not become a quiet way to ship the
+/// defect this project exists to fix (`AGENTS.md` rule 8; read site:
+/// `bridge12::queue_gpu_fence`).
+pub(crate) static UMD12_GPU_FENCE: BoolKnob = BoolKnob::new(c"Umd12GpuFence", true);
+
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12Trace` (REG_DWORD) != 0, forcing its
 /// `OnceLock`. Read once per process.
 ///
@@ -120,6 +146,13 @@ pub(crate) fn umd12_trace() -> bool {
 /// `adapter12::OpenAdapter12`.
 pub(crate) fn umd_d3d12() -> bool {
     UMD_D3D12.get()
+}
+
+/// Resolve `HKLM\SOFTWARE\Helios!Umd12GpuFence` (REG_DWORD) != 0, forcing its
+/// `OnceLock`. Read once per process, and consulted on every D3D12 producer's
+/// boundary fetch ([`crate::bridge12::queue_gpu_fence`]).
+pub(crate) fn umd12_gpu_fence() -> bool {
+    UMD12_GPU_FENCE.get()
 }
 
 /// The largest delay either diagnostic arm below will honour, in microseconds.
@@ -290,7 +323,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 9] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -308,5 +341,9 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 9] {
         ("Umd12EclFence", 1),
         ("Umd12EclDrain", 0),
         ("ExecutionSyncVersion", 2),
+        // APPENDED 2026-09-13 (UV1's control arm). Through the accessor, like the
+        // delay arms, so a capture can never report a configuration the read
+        // site would not have used.
+        ("Umd12GpuFence", umd12_gpu_fence() as u32),
     ]
 }

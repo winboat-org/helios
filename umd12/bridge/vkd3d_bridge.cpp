@@ -1108,13 +1108,34 @@ std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue) noexcept {
   if (!resolved.fn) return 0;
 
   auto* command_queue = reinterpret_cast<ID3D12CommandQueue*>(queue);
+
+  /* ORDER IS CORRECTNESS, and the ICD's caller contract is explicit about it
+   * (icd/mesa vn_renderer_helios.c: "call this AFTER the submission to be
+   * covered has reached the host driver, i.e. after the engine's own
+   * vkQueueSubmit returned (for vkd3d: after the VKD3D_SUBMISSION_DRAIN
+   * handshake inside vkd3d_acquire_vk_queue) ... reading a stale smaller
+   * [seqno] is the correctness hazard").
+   *
+   * `vkd3d_release_vk_queue` is that handshake: it issues the pending
+   * `vkQueueSubmit2` and bumps the submission timeline. So the acquire/release
+   * pair must COMPLETE before the escape reads the ring seqno, or the fence
+   * covers less than the packet it is about to gate — the packet would retire
+   * before host completion, which is the pre-fix behaviour bought at full price.
+   *
+   * Releasing the engine's queue lock BEFORE the escape is the second half of
+   * the same ordering. The escape is a synchronous SUBMIT_VENUS whose wire fence
+   * retires only when the host reaches that seqno; holding the lock that the
+   * engine's own submission/completion machinery needs while waiting on host
+   * progress on the same queue is a self-deadlock. The ICD takes no dev_mutex
+   * here by design, so it is callable unlocked — and this is the only place a
+   * D3D12 packet's retire boundary is minted. */
   void* vk_queue = vkd3d_acquire_vk_queue(command_queue);
   if (!vk_queue) return 0;
+  vkd3d_release_vk_queue(command_queue);
 
   std::uint64_t fence = 0;
   // A refusal leaves `fence` at 0 and is not an error: the KMD treats 0 as "no
   // boundary", which is the pre-existing behaviour rather than a wrong fence.
   resolved.fn(vk_queue, &fence);
-  vkd3d_release_vk_queue(command_queue);
   return fence;
 }

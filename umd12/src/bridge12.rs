@@ -765,7 +765,17 @@ pub(crate) unsafe fn execute(
 /// for the call.
 #[inline]
 pub(crate) unsafe fn queue_gpu_fence(queue: usize) -> u64 {
-    ffi::helios_umd12_queue_gpu_fence(queue)
+    // ⛔ THE ONE GATE for UV1's lever (`Umd12GpuFence`, `knobs12`). It sits at the
+    // choke point rather than at the three producer call sites so that "no
+    // boundary" is decided in exactly one place and a disabled fence cannot be
+    // reached past a half-applied change. `0` is the KMD's documented "no
+    // boundary" value, so the disabled arm is the pre-K-F retire domain with no
+    // other difference — see the knob's doc for why that control is worth having.
+    if !crate::knobs12::umd12_gpu_fence() {
+        return 0;
+    }
+    // SAFETY: forwarded live queue; the bridge owns the escape's ordering.
+    unsafe { ffi::helios_umd12_queue_gpu_fence(queue) }
 }
 
 pub(crate) unsafe fn cancel_execution(queue: usize, reason: i32) {
