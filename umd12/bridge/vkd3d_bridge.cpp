@@ -253,7 +253,9 @@ void umd_log(const char* msg) {
   }
 }
 
-}  // namespace helios_bridge
+}  // namespace
+
+ helios_bridge
 
 using helios_bridge::umd_log;
 
@@ -427,22 +429,6 @@ const QueueGpuFenceExport& queue_gpu_fence_export() {
   return resolved;
 }
 
-std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue) noexcept {
-  if (!queue) return 0;
-  const QueueGpuFenceExport& resolved = queue_gpu_fence_export();
-  if (!resolved.fn) return 0;
-
-  auto* command_queue = reinterpret_cast<ID3D12CommandQueue*>(queue);
-  void* vk_queue = vkd3d_acquire_vk_queue(command_queue);
-  if (!vk_queue) return 0;
-
-  std::uint64_t fence = 0;
-  // A refusal leaves `fence` at 0 and is not an error: the KMD treats 0 as "no
-  // boundary", which is the pre-existing behaviour rather than a wrong fence.
-  resolved.fn(vk_queue, &fence);
-  vkd3d_release_vk_queue(command_queue);
-  return fence;
-}
 
 const MemoryIdentityExports& memory_identity_exports() {
   static const MemoryIdentityExports resolved = [] {
@@ -1116,4 +1102,21 @@ std::int32_t helios_vkd3d_bridge_copy_tiles(std::size_t queue, std::size_t dst,
       reinterpret_cast<const D3D12_TILE_REGION_SIZE*>(size), static_cast<D3D12_TILE_MAPPING_FLAGS>(flags),
       reinterpret_cast<HANDLE>(admission), ctx, value, cookie);
   });
+}
+
+std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue) noexcept {
+  if (!queue) return 0;
+  const QueueGpuFenceExport& resolved = queue_gpu_fence_export();
+  if (!resolved.fn) return 0;
+
+  auto* command_queue = reinterpret_cast<ID3D12CommandQueue*>(queue);
+  void* vk_queue = vkd3d_acquire_vk_queue(command_queue);
+  if (!vk_queue) return 0;
+
+  std::uint64_t fence = 0;
+  // A refusal leaves `fence` at 0 and is not an error: the KMD treats 0 as "no
+  // boundary", which is the pre-existing behaviour rather than a wrong fence.
+  resolved.fn(vk_queue, &fence);
+  vkd3d_release_vk_queue(command_queue);
+  return fence;
 }
