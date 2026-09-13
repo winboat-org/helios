@@ -31,16 +31,31 @@ suite moved `adapter` and `allocator` from FAIL to PASS and unblocked
 `raytracing`, which now reports `CAP,NativeFL12_1Admission,00000000`.
 
 Three defects that admission had been hiding are now open:
-- `stream-output`: **a completion/visibility race, not a layout error.** A raw
-  stride dump shows a correct 32-byte stride with the gap and both padding words
-  intact on a passing run, and the failing check is different every run
-  (`32-bit counter guards overwritten`, `stride padding overwritten`,
-  `counter32 guard changed`). The probe waits on a queue fence before `Map`, so
-  the fence is being satisfied before the stream-output writes and the copies
-  that read them back are complete. Measured: without a delay the probe failed
-  3 of 11 runs across those three checks; with `HELIOS_SO_DIAG_DELAY_MS=500`
-  inserted between the fence wait and the readback it passed 11 of 11.
-  (Delay hook lives only in a local diagnostic probe build, not committed.)
+- `stream-output`: **the D3D12 `ExecuteCommandLists` path retires its WDDM DMA
+  packet on Venus *worker* completion, not on host GPU completion.** A raw stride
+  dump shows a correct 32-byte stride with gap and padding intact on a passing
+  run, the failing check differs every run (`32-bit counter guards overwritten`,
+  `stride padding overwritten`, `counter32 guard changed`), and the probe does
+  wait on a queue fence before `Map` — so the fence is advancing early. Measured:
+  3 of 11 runs fail without help; with `HELIOS_SO_DIAG_DELAY_MS=500` between the
+  fence wait and the readback, 11 of 11 pass (delay hook is a local diagnostic
+  build only, not committed).
+  Cause, located: `kmd_render/src/ddi/submit_command.rs:688` derives
+  `gpu_completion_fence` **only from the Present BLT marker**
+  (`present_packet.rs`'s `gpu_fence_id`). For D3D12 the KMD receives only
+  `execution_boundary` — `HeliosD3D12SubmitCmd`'s worker-completion `value`
+  (`protocol/src/wddm.rs:579`, 24 bytes, `{magic, version, ctx_id, value,
+  cookie}`; no fence id exists in the record). So Present is gated on real GPU
+  completion and D3D12 is not. This is the documented `D12-G8` rung 0 /
+  `KMD_IMPACT.md` §14a.1 **UV1** gap, and it is why the fence returns in
+  ~1 µs while the pixels land seconds later.
+  Proper fix, cross-stack (the designed K-F workstream): mint a per-queue
+  GPU-completion wire fence with the ICD export `helios_venus_queue_gpu_fence`
+  (ICD-1, **already landed** in `vn_renderer_helios.c:2024`) after the engine's
+  submission drain, carry it on a **versioned** `HeliosD3D12SubmitCmd`, and pass
+  it to `note_wddm_submission` as `gpu_completion_fence` so the existing
+  `wddm_boundary::select` D3D12 arm gates the DMA packet on host completion.
+  Today nothing calls that export and the record has no field for it.
 - `raytracing` FAIL "uncompacted current/prebuild size agreement", after four
   passing stages.
 - `tiled` `tiling-buffer` now runs (`TiledResourcesTier` reports 2, not 1) and
