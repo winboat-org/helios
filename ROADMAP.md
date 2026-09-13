@@ -83,6 +83,24 @@ One defect that admission had been hiding remains open:
   it to `note_wddm_submission` as `gpu_completion_fence` so the existing
   `wddm_boundary::select` D3D12 arm gates the DMA packet on host completion.
   Today nothing calls that export and the record has no field for it.
+  **UV1 reading taken 2026-09-13 on `.281` (`oem28.inf`): UV1 ✓.** The instrument
+  is `WddmHoldMs`, which delays retiring an otherwise-READY D3D12 ECL packet at the
+  WDDM FIFO head — the one dependency this driver can create unilaterally — and the
+  oracle is the `allocator` probe (256 epochs, a fence wait each, ~1.5 s). Both
+  knobs are snapshotted at `VirtioGpu::init`, so each arm took a reboot, and
+  `DiagLevel=1` was required for any counter to be written:
+  ```
+  hold 0   : 1260 / 1403 / 1461 / 1632 / 1756 / 2364 ms   WfBHold Δ 0      D12Rec Δ 513–897
+  hold 100 : 11403 / 22992 ms                             WfBHold Δ 2227 / 3892   D12Rec Δ 11 / 68
+  ```
+  The hold demonstrably armed (`WfBHold` moved — without that, a flat reading is a
+  trusting-a-zero, which is what the knob's own doc warns about), and the
+  application's fence wait stretched by ~45–90 ms per epoch. **dxgkrnl does release
+  the runtime's monitored fence behind our DMA packet**: the submission path is
+  sound and the defect is exactly the packet's completion domain (Venus worker vs
+  host GPU). That is the precondition K-F3..K-F9 was waiting on. ⚠ The held runs
+  still FAIL the probe's content check, so this reading *licenses* the fix; it does
+  not fix it. Instrument `tools/uv1-fence-latency.ps1`, evidence `tmp/uv1-20260913/`.
 - ~~`raytracing` FAIL "uncompacted current/prebuild size agreement"~~ — **FIXED in
   22.22.280.0 (`ef9c6586`); design record `docs/dx12/ACCELERATION_STRUCTURE_CURRENT_SIZE.md`.**
   It was never a D3D12 admission problem: `CURRENT_SIZE` was answered with

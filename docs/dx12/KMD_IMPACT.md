@@ -789,7 +789,7 @@ the two are one piece of work.
 
 | id | Question | Why it decides the design |
 |---|---|---|
-| **UV1** | Does dxgkrnl release the runtime's queued monitored-fence signal behind **our** DMA packets? | If no, no amount of submission helps and the design needs a different lever entirely. Doc support is good (`context-monitoring.md:35,47`); **local proof is absent** — §7's cited `tools/vehicle_flipwait_probe.c` issues no `D3DKMTRender` and no `D3DKMTSubmitCommand`, so it proves sync-packet-vs-sync-packet ordering only. |
+| **UV1** | Does dxgkrnl release the runtime's queued monitored-fence signal behind **our** DMA packets? ✅ **ANSWERED 2026-09-13: YES (UV1 ✓)** — see the reading below. | If no, no amount of submission helps and the design needs a different lever entirely. Doc support is good (`context-monitoring.md:35,47`); **local proof was absent** — §7's cited `tools/vehicle_flipwait_probe.c` issues no `D3DKMTRender` and no `D3DKMTSubmitCommand`, so it proves sync-packet-vs-sync-packet ordering only. |
 | **UV3** | Does vkd3d's venus work retire at **host GPU completion** or at **decode**? | `RetireDomain::IncludingGpu` only means GPU completion for work on `ring_idx >= 1`. The ICD says outright: *"the synchronous SUBMIT_VENUS path does not yet propagate `batch->ring_idx` … per-ring async fencing is a later refinement"* (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:3969-3973`). If D3D12 submits land on ring 0, a D3D12 fence gated `IncludingGpu` still reports **decode**, and it lies even with a perfect packet. |
 
 **The experiment, in three readings.** Land the UMD's bare `pfnRenderCb` (K-F1, below — zero KMD
@@ -801,6 +801,29 @@ change), then read the probe's own `WaitForSingleObject signalled in N us` again
 | N → real GPU time, no hold | **UV1 ✓ and UV3 ✓.** The design stands; everything after K-F5 is performance. |
 | N flat; with `WddmHoldMs=100` **scoped to that context**, N → ~100 ms | **UV1 ✓, UV3 ✗.** The packet works, the venus retirement domain is the bug. Fix the ring, not the submission. |
 | N flat under both | **UV1 ✗.** Say so loudly and stop — none of K-F3..K-F9 is the answer. |
+
+### UV1 reading, 2026-09-13 — UV1 ✓
+
+Taken on package `22.22.281.0` (`oem28.inf`) with `tools/uv1-fence-latency.ps1`,
+`DiagLevel=1` (without it `diag::record` is a no-op and every counter reads a
+permanent zero) and one reboot per arm, because `WddmHoldMs` is snapshotted at
+`VirtioGpu::init`. Oracle: the native `allocator` probe — 256 epochs, each with a
+fence wait — so the elapsed time *is* the fence latency under test.
+
+| arm | elapsed | `WfBHold` Δ | `D12Rec` Δ |
+|---|---|---|---|
+| `WddmHoldMs=0` | 1260 / 1403 / 1461 / 1632 / 1756 / 2364 ms | 0 | 513–897 |
+| `WddmHoldMs=100` | 11403 / 22992 ms | 2227 / 3892 | 11 / 68 |
+
+`WfBHold` moved, so the hold armed and the experiment ran; the application's fence
+wait then stretched by ~45–90 ms per epoch. dxgkrnl therefore **does** order the
+runtime's monitored fence behind this driver's DMA packet, which is the row above's
+✓ / UV3 ✓ case: the packet works and the *venus retirement domain* is the bug, so
+the fix is to give the packet a truthful host GPU-completion fence (K-F3..K-F9)
+rather than another submission mechanism. ⚠ The held runs still fail the probe's
+content check; this reading licenses the fix, it does not fix it. Evidence:
+`tmp/uv1-20260913/` (both arms' JSON, per-run logs), and the same result is
+recorded in `ROADMAP.md`'s open-defect entry.
 
 ~~⭐ **UV3 is separately pre-checkable with ZERO code**: read `RING_SUBMIT_COUNT` /
 `RING_COMPLETE_COUNT` (`kmd_render/src/virtio/gpu/mod.rs`, bumped in `enqueue_submit_inner` and in
