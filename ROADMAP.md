@@ -57,7 +57,29 @@ Three defects that admission had been hiding are now open:
   `wddm_boundary::select` D3D12 arm gates the DMA packet on host completion.
   Today nothing calls that export and the record has no field for it.
 - `raytracing` FAIL "uncompacted current/prebuild size agreement", after four
-  passing stages.
+  passing stages. **Measured with a diagnostic probe build** that dumps the raw
+  postbuild-info buffer (`tools/d3d12_raytracing_probe.cpp`, local only):
+  ```
+  compacted [320, 320, 0]   current [392, 392, 568]   prebuild max [320, 320, 512]
+  ```
+  The check is a legitimate D3D12 invariant — an uncompacted structure's
+  `CURRENT_SIZE` may not exceed `ResultDataMaxSizeInBytes` — and it is violated
+  in the **opposite** direction from a benign difference: current *exceeds* max
+  by 72/72/56 bytes for the two BLAS and the TLAS. Both numbers are Vulkan's:
+  the prebuild is `vkGetAccelerationStructureBuildSizesKHR`'s
+  `accelerationStructureSize` (`device.c:8993`), and current is
+  `VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR` on the built structure
+  (`acceleration_structure.c:459`). The guest ICD translates that query
+  correctly and forwards it (`vn_query_pool.c:103`), and vkd3d's prebuild and
+  build both derive from `vkd3d_acceleration_structure_convert_inputs`, so the
+  two host answers disagree for identical geometry. Note also that the BLAS
+  *compacted* size equals the prebuild max (320), which compaction should not
+  leave unchanged. Attribution needs a host-side (non-Venus) probe against RADV
+  in the WinBoat container; that is the next step, and it decides whether the fix
+  belongs in the ICD/engine or is a host-driver inconsistency. A defensible
+  engine-side fix exists if the host query is at fault: D3D12's uncompacted
+  `CURRENT_SIZE` is the size the structure was built with, which the engine
+  already knows, so it can be produced without the Vulkan size query.
 - `tiled` `tiling-buffer` now runs (`TiledResourcesTier` reports 2, not 1) and
   crashes with 0xC0000005. **Localised with a WER mini dump** (dumps enabled for
   `d3d12_tiled_probe.exe`, captured, then removed): the fault is a read at
