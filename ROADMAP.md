@@ -59,7 +59,21 @@ Three defects that admission had been hiding are now open:
 - `raytracing` FAIL "uncompacted current/prebuild size agreement", after four
   passing stages.
 - `tiled` `tiling-buffer` now runs (`TiledResourcesTier` reports 2, not 1) and
-  crashes with 0xC0000005 after its first tile-mapping submission.
+  crashes with 0xC0000005. **Localised with a WER mini dump** (dumps enabled for
+  `d3d12_tiled_probe.exe`, captured, then removed): the fault is a read at
+  address `0x18` inside the **guest Venus ICD**, `vulkan_virtio.dll` RVA
+  `0x379205` = `vn_queue_submission_prepare + 0x325` (`icd/mesa`; the shipped DLL
+  still carries its symbol table, so the function resolves without a PDB). The
+  faulting instruction is `mov 0x18(%rax,%r12,1),%r11` reached from
+  `jne vn_queue_submission_prepare+0x320` at `+0x181`: a cold block that loads
+  `submit->batches` (`vn_queue_submission.batches` is at `+0x18`) and then reads
+  a pointer field at `+0x38` of a batch, dereferencing that pointer at `+0x18`.
+  `+0x38` in `VkSubmitInfo2` is `pSignalSemaphoreInfos`, so the read is a
+  signal-semaphore field through a NULL semaphore-info array — a submit whose
+  signal count is non-zero with no array behind it. The engine's submits all use
+  a live stack array (`command.c`'s `signal_semaphore_infos`, `transition_semaphore`),
+  so the next step is an ICD rebuild with debug info (or a defensive check at the
+  site) to name the exact submit; that is a ~15-20 min build per iteration.
 
 `no-output-msaa` and `tiled-format-caps` stay BLOCKED on this guest by the absent
 D3D12 debug layer (Graphics Tools FoD, `0x887a002d`); DISM is denied in this
