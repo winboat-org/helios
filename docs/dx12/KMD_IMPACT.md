@@ -789,7 +789,7 @@ the two are one piece of work.
 
 | id | Question | Why it decides the design |
 |---|---|---|
-| **UV1** | Does dxgkrnl release the runtime's queued monitored-fence signal behind **our** DMA packets? ✅ **ANSWERED 2026-09-13: YES (UV1 ✓)** — see the reading below. | If no, no amount of submission helps and the design needs a different lever entirely. Doc support is good (`context-monitoring.md:35,47`); **local proof was absent** — §7's cited `tools/vehicle_flipwait_probe.c` issues no `D3DKMTRender` and no `D3DKMTSubmitCommand`, so it proves sync-packet-vs-sync-packet ordering only. |
+| **UV1** | Does dxgkrnl release the runtime's queued monitored-fence signal behind **our** DMA packets? ⚠ **STILL OPEN** — a 2026-09-13 reading claimed ✓ and was retracted on review (see below). | If no, no amount of submission helps and the design needs a different lever entirely. Doc support is good (`context-monitoring.md:35,47`); **local proof was absent** — §7's cited `tools/vehicle_flipwait_probe.c` issues no `D3DKMTRender` and no `D3DKMTSubmitCommand`, so it proves sync-packet-vs-sync-packet ordering only. |
 | **UV3** | Does vkd3d's venus work retire at **host GPU completion** or at **decode**? | `RetireDomain::IncludingGpu` only means GPU completion for work on `ring_idx >= 1`. The ICD says outright: *"the synchronous SUBMIT_VENUS path does not yet propagate `batch->ring_idx` … per-ring async fencing is a later refinement"* (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:3969-3973`). If D3D12 submits land on ring 0, a D3D12 fence gated `IncludingGpu` still reports **decode**, and it lies even with a perfect packet. |
 
 **The experiment, in three readings.** Land the UMD's bare `pfnRenderCb` (K-F1, below — zero KMD
@@ -802,40 +802,37 @@ change), then read the probe's own `WaitForSingleObject signalled in N us` again
 | N flat; with `WddmHoldMs=100` **scoped to that context**, N → ~100 ms | **UV1 ✓, UV3 ✗.** The packet works, the venus retirement domain is the bug. Fix the ring, not the submission. |
 | N flat under both | **UV1 ✗.** Say so loudly and stop — none of K-F3..K-F9 is the answer. |
 
-### UV1 reading, 2026-09-13 — UV1 ✓
+### UV1 reading, 2026-09-13 — RETRACTED
 
-Taken on package `22.22.281.0` (`oem28.inf`) with `tools/uv1-fence-latency.ps1`,
-`DiagLevel=1` (without it `diag::record` is a no-op and every counter reads a
-permanent zero) and one reboot per arm, because `WddmHoldMs` is snapshotted at
-`VirtioGpu::init`. Oracle: the native `allocator` probe — 256 epochs, each with a
-fence wait — so the elapsed time *is* the fence latency under test.
+A first pass on `22.22.281.0` (`tools/uv1-fence-latency.ps1`) looked like UV1 ✓: hold
+0 gave 1260/1403/1461/1632/1756/2364 ms with `WfBHold` Δ 0, hold 100 gave
+11403/22992 ms with `WfBHold` Δ 2227/3892. **It is retracted.** Two reviews showed:
 
-| arm | elapsed | `WfBHold` Δ | `D12Rec` Δ |
-|---|---|---|---|
-| `WddmHoldMs=0` | 1260 / 1403 / 1461 / 1632 / 1756 / 2364 ms | 0 | 513–897 |
-| `WddmHoldMs=100` | 11403 / 22992 ms | 2227 / 3892 | 11 / 68 |
+* the two held runs **overlapped** (started ~12 s apart, both ended 13:55:05.5), so
+  their `counters_after` are identical and each Δ mixes both runs — while the
+  measured counters are adapter-global on a strictly head-of-line FIFO;
+* 11 403 and 22 992 ms are ~1× and ~2× the probe's **own 10 s fence-wait timeout**
+  (`tools/d3d12_allocator_probe.cpp:30`), and the held runs' `D12Rec` deltas (68, 11)
+  are 1–10 % of a full run's — so those wall times are at least as consistent with
+  one or two timeouts as with 256 delayed epochs;
+* three of the six baseline points came from an earlier instrument revision that
+  watched counter names absent from the KMD key, so the usable baseline is only
+  1403/1632/1260 ms;
+* the instrument read `DiagLevel` live from the registry although the driver
+  snapshots it at `VirtioGpu::init`, and it never captured the probe's exit code.
 
-`WfBHold` moved, so the hold armed and the experiment ran; the application's fence
-wait then stretched by ~45–90 ms per epoch. dxgkrnl therefore **does** order the
-runtime's monitored fence behind this driver's DMA packet, which is the row above's
-✓ / UV3 ✓ case: the packet works and the *venus retirement domain* is the bug, so
-the fix is to give the packet a truthful host GPU-completion fence (K-F3..K-F9)
-rather than another submission mechanism. ⚠ The held runs still fail the probe's
-content check; this reading licenses the fix, it does not fix it. Evidence:
-`tmp/uv1-20260913/` (both arms' JSON, per-run logs, and the `DiagLevel=0`
-control), and the same result is recorded in `ROADMAP.md`'s open-defect entry.
+The verdict stands unmeasured, and the row above stays open. `WtOut` (the registry
+mirror of `FENCE_WAIT_TIMEOUTS`, `adapter/scanout.rs:710-713`) is the counter that
+settles it; the full re-run recipe is in `ROADMAP.md`'s open-defect entry.
 
-The control (hold=100, `DiagLevel=0`) is one line of the record: it hit the
-probe's own completion bound (`FAIL completion missing; timeout is not
-completion`) at 120 s, so it is not a latency datum. It excludes registry I/O as
-the explanation for the graded pair's growth, because turning the counters off
-made the arm worse rather than faster.
+⛔ One contradiction a re-run must also settle, because it decides the lever: the
+UV1 ✓ / **UV3 ✗** row of the table above reads *"Fix the ring, not the
+submission"*, while this document's other correction says UV3 is answered ✗ from
+source — and the planned fix in `ROADMAP.md` is submission-side (carry a
+`gpu_wire_fence` into the D3D12 record). Both cannot be right. Until UV1 is
+re-taken cleanly, do not act on either reading.
 
-~~⭐ **UV3 is separately pre-checkable with ZERO code**: read `RING_SUBMIT_COUNT` /
-`RING_COMPLETE_COUNT` (`kmd_render/src/virtio/gpu/mod.rs`, bumped in `enqueue_submit_inner` and in
-the used-ring drain) before and after a D3D12 run. Do this first; it costs one run.~~
-
-#### ⛔⛔ CORRECTION 2026-08-06 — UV3 IS ANSWERED (✗) FROM SOURCE, AND THE TABLE ABOVE IS UNSOUND
+## ⛔⛔ CORRECTION 2026-08-06 — UV3 IS ANSWERED (✗) FROM SOURCE, AND THE TABLE ABOVE IS UNSOUND
 
 **UV3: ✗, and worse than "decode" — for a D3D12 frame this driver usually sees no wire fence at
 all.** Answered without a run, and the two things that made it look unanswerable were both wrong.

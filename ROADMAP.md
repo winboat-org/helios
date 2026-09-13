@@ -83,34 +83,42 @@ One defect that admission had been hiding remains open:
   it to `note_wddm_submission` as `gpu_completion_fence` so the existing
   `wddm_boundary::select` D3D12 arm gates the DMA packet on host completion.
   Today nothing calls that export and the record has no field for it.
-  **UV1 reading taken 2026-09-13 on `.281` (`oem28.inf`): UV1 ✓.** The instrument
-  is `WddmHoldMs`, which delays retiring an otherwise-READY D3D12 ECL packet at the
-  WDDM FIFO head — the one dependency this driver can create unilaterally — and the
-  oracle is the `allocator` probe (256 epochs, a fence wait each, ~1.5 s). Both
-  knobs are snapshotted at `VirtioGpu::init`, so each arm took a reboot, and
-  `DiagLevel=1` was required for any counter to be written:
-  ```
-  hold 0   : 1260 / 1403 / 1461 / 1632 / 1756 / 2364 ms   WfBHold Δ 0      D12Rec Δ 513–897
-  hold 100 : 11403 / 22992 ms                             WfBHold Δ 2227 / 3892   D12Rec Δ 11 / 68
-  ```
-  The hold demonstrably armed (`WfBHold` moved — without that, a flat reading is a
-  trusting-a-zero, which is what the knob's own doc warns about), and the
-  application's fence wait stretched by ~45–90 ms per epoch. **dxgkrnl does release
-  the runtime's monitored fence behind our DMA packet**: the submission path is
-  sound and the defect is exactly the packet's completion domain (Venus worker vs
-  host GPU). That is the precondition K-F3..K-F9 was waiting on. ⚠ The held runs
-  still FAIL the probe's content check, so this reading *licenses* the fix; it does
-  not fix it. Instrument `tools/uv1-fence-latency.ps1`, evidence `tmp/uv1-20260913/`.
-  **Control that closes the obvious objection** (that the growth is `DiagLevel=1`
-  registry I/O amplified by the hold): hold=100 with `DiagLevel=0`, i.e. no counter
-  writes at all. That arm did not measure a latency — it hit the probe's *own*
-  completion bound and failed with `FAIL completion missing; timeout is not
-  completion` after 120 s — so it is recorded as a control, not as a datapoint.
-  What it settles is the direction: switching the registry writes OFF made the arm
-  worse, not faster, so the graded pair's growth is the hold and the held
-  latencies (11.4/23.0 s) are if anything understated. ⚠ It also shows the hold can
-  starve a fence past a probe-side bound, which is a property of the knob's 60 Hz
-  release edge, not of the shipping configuration (the knob is 0 there).
+  **UV1 reading attempted 2026-09-13 on `.281` (`oem28.inf`) — RETRACTED as not
+  established. A clean re-run is required before anything is built on it.** The
+  first pass looked like UV1 ✓ (hold 0: 1260/1403/1461/1632/1756/2364 ms, `WfBHold`
+  Δ 0; hold 100: 11403/22992 ms, `WfBHold` Δ 2227/3892) and was written up as such.
+  Two independent reviews then showed it cannot carry that conclusion:
+  * **The two held runs overlapped.** They were started ~12 s apart and both
+    finished at 13:55:05.5 — so `counters_after` is byte-identical for both files,
+    and every held Δ, including the "~45–90 ms/epoch" derived from it, mixes the
+    two runs. `WfBHold`/`WfBWait` counters are adapter-global and the FIFO is
+    strictly head-of-line, so the runs also contended with each other. The baseline
+    six were sequential (their counters chain), and three of those six
+    (`hold0-1/2/3`, valid values 1260/1403/1461 ms) came from an earlier revision
+    of the instrument that watched UMD-side counter names present in no KMD key —
+    so the honest baseline subset is `hold0-4/5/6` = 1403/1632/1260 ms.
+  * **The held elapsed is at least as consistent with the probe's own timeout.**
+    `tools/d3d12_allocator_probe.cpp:30` waits on a fence for 10 000 ms and
+    `_Exit(1)`s; 11 403 and 22 992 ms are ~1× and ~2× that bound, and the held runs'
+    `D12Rec` deltas (68, 11 — themselves from the shared window) are 1–10 % of a
+    full run's 513–897, i.e. those runs did a fraction of the work. Wall time
+    cannot distinguish "256 epochs each delayed" from "one or two 10 s timeouts".
+  * Two more gaps: the instrument read `DiagLevel` live from the registry when the
+    driver snapshots it at `VirtioGpu::init` (so a missing reboot grades as "the
+    probe did not exercise the path"), and it never recorded the probe's exit code
+    (`$p.Dispose()` before `$p.ExitCode`), so a FAIL was recorded as exit 0.
+  The counter that settles it already exists: **`WtOut`**, the registry mirror of
+  `FENCE_WAIT_TIMEOUTS` (`adapter/scanout.rs:710-713`), which the instrument did not
+  watch. A trustworthy run needs: arms taken strictly sequentially (one probe at a
+  time), `WtOut` in the watch list plus the probe's own per-epoch
+  `WaitForSingleObject` timings and its archived run directory, `DiagLevel` liveness
+  proved by counter movement rather than by reading the knob back, interleaved
+  boot pairs rather than all-A-then-all-B, a dose-response ladder (hold 0/1/100) to
+  separate hold *duration* from per-event bookkeeping, and the `DiagLevel=0`
+  hold=0 arm to price the registry tax. Until that exists, **UV1 is unmeasured**,
+  and the `DiagLevel=0` control already taken does not rescue it: it also hit the
+  probe's bound (`FAIL completion missing; timeout is not completion`, 120 s), so it
+  excludes registry I/O as a cause but is not a latency datum.
   **Next (the fix this licenses) — four pieces, in dependency order.** (1) the
   producer: call `helios_venus_queue_gpu_fence` per submission and get the wire
   fence back to whoever fills the D3D12 record. The ICD export exists and is
@@ -127,8 +135,8 @@ One defect that admission had been hiding remains open:
   instead of deriving that only from the Present BLT marker
   (`submit_command.rs:688`). The decision to extend that record rather than reuse
   Present's `gpu_fence_id` is deliberate: `present_packet.rs` records why the two
-  must not be conflated. (4) verification: the `allocator` oracle must go 4/10 fail
-  → 0/10 and `elapsed_ms` must stop being bimodal; `stream-output` must stop
+  must not be conflated. (4) verification: the `allocator` oracle must go from its measured failure
+  rate to 0/10 and `elapsed_ms` must stop being bimodal; `stream-output` must stop
   varying. ⛔ Gate the whole thing on a nonzero `gpu_wire_fence` actually reaching
   the KMD (count it) — an inert wire is the fake-success shape this defect already
   punished once.
