@@ -961,28 +961,40 @@ admission, and after execution submits an `ALL_COMMANDS` signal on that exact st
 That is host-ordered completion with no sampling and no GPU-idle wait, and it already
 passed the four native ordering cases on `.270`.
 
-⛔⛔ **CORRECTION (2026-09-13, same day, after reading the wiring): the stream gate
-already exists AND is armed for a D3D12 ECL packet.** `decode_execution_boundary`
-(`submit_command.rs:667`) returns the record's `boundary_for(execution_stream)`, and
-`note_and_maybe_signal` sets `exact_execution = true` plus
-`execution_boundary_value = Some(boundary)` for it; `note_wddm_submission` turns that
-into `execution: Option<execution_completion::Wait>`, and `take_one_ready_wddm`'s FIRST
-check blocks the head on it while `!wait.completed()`, counting `WfBStrm`. So the
-earlier claim in this section — "the packet's watermark never names the stream value" —
-is **wrong**: the *wire* watermark is separate, but the *execution* gate is exactly the
-stream value. Do not act on that claim.
+⛔⛔ **MEASURED 2026-09-13 on `.287`, `DiagLevel=2` (see the instrument note below): the
+D3D12 ECL packet IS gated on the registered stream and IS released by real retirement.**
+`allocator` x3 produced: `D12Rec = 2564` records, `D12Fn0 = 2564` (every one carried
+`gpu_wire_fence = 0`, the post-withdrawal shape), `D12MrgF = 0` (no boundary was refused),
+**`WfBStrm = 2739`** (the FIFO head blocked on the execution/stream gate) and
+**`WfBReb = 0` with `WfBRebS = 0`, `WfBRebB = 0`** — i.e. not one of those blocks was
+given up on by the `WddmHeadMs` rebase. Every block was satisfied.
 
-⇒ **The narrowed, still-open question is what ADVANCES that value.** `Wait::observe`
-completes when `retired_value >= value` for the same stream handle, and the only writer
-is `complete_present_stream_gpu`, whose own doc calls its trigger *"the exact successful
-queue-marker response"* (i.e. the host's used-ring/queue-marker receipt). ⛔ If that
-receipt is a DECODE-level acknowledgement of the submission rather than GPU completion
-of it, the gate is satisfied microseconds after submission — which is exactly the
-measured symptom (`stream-output`/`allocator` fences advancing in ~1 us while the pixels
-land later, and the UV1 reading where a KMD-side hold moves the app's wait). **The next
-step is therefore to establish what that response means on ring>=1 and, if it is decode,
-to make the completion the host's GPU-retire signal for the registered stream** — not to
-add a gate that is already there.
+⇒ **Everything this section previously concluded about the retire domain is WRONG and must
+not be acted on**: the packet is not retiring on a worker/decode boundary, the wire-fence
+lever was not needed for this, and "add a stream gate" or "the watermark never names the
+stream value" were both false readings of code I had not finished tracing. What is true:
+`decode_execution_boundary` -> `note_and_maybe_signal` (`exact_execution = true`,
+`execution_boundary_value = Some(...)`) -> `note_wddm_submission` (`execution: Option<Wait>`)
+-> `take_one_ready_wddm`'s first check, released by `Wait::observe` when the registered
+stream reports `retired_value >= value`.
+
+⛔⛔ **AND THE INSTRUMENT WAS OFF, which is why every earlier reading of this was empty.**
+`kmd_render/src/diag.rs:120` — `record` returns early when `DiagLevel == 0`, and `DiagLevel`
+is absent (0) on a default guest; it is snapshotted at `VirtioGpu::init`, so it needs a
+**reboot**, not `pnputil`. Every counter read before this one (`D12Rec`, `D12Fnc`, `D12Fn0`,
+`WfB*`) returned 0 because it was never written, not because the event did not happen. The
+instrument now requires: `DiagLevel=2` on `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`,
+reboot, then read. A zero counter on a `DiagLevel=0` guest is a false negative.
+
+⇒ **So the `stream-output` / `allocator` content mismatches are still unexplained, and the
+retire-domain theory that has driven this workstream for weeks does not survive this
+measurement.** The next question is a different one: with the packet provably retiring at
+GPU completion, what else can let a map/readback see a previous epoch's bytes? Candidates
+to test with the working instrument: whether the *runtime* fence the app waits on is the
+packet's DMA fence at all for the D3D12 path, the `HELIOS_SO_DIAG_DELAY_MS` result (11/11
+pass with a 500 ms delay after the wait — a delay fixing it is consistent with a fence
+completing BEFORE the packet's DMA completion, which is now the leading shape), and the
+copy-tiles content failures.
 
 | # | Item | Where | Size | Class |
 |---|---|---|---|---|

@@ -204,22 +204,20 @@ One defect that admission had been hiding remains open:
   ⛔⛔ **And the plan that stood here — "mint from the ENGINE's submission thread" — was
   the wrong path too**, for the reason `EXECUTION_SYNC.md` states outright: a *sampled*
   wire fence can precede worker execution, so no mint site rescues it.
-  ⛔⛔ **AND SO WAS THE REPLACEMENT PLAN IN THE PREVIOUS VERSION OF THIS PARAGRAPH.** Reading
-  the wiring (`submit_command.rs:667` → `note_and_maybe_signal` →
-  `note_wddm_submission`, then `take_one_ready_wddm`'s first check) shows the stream gate
-  **already exists and is armed**: a D3D12 ECL packet carries `exact_execution = true`
-  with `execution_boundary_value = Some(record.boundary_for(execution_stream))`, the KMD
-  stores it as `execution: Option<Wait>`, and the FIFO head blocks on it while
-  `!wait.completed()`, counted as `WfBStrm`. Nothing needs adding.
-  ⇒ **The actual open question is what ADVANCES that value.** `Wait::observe` completes on
-  `retired_value >= value` for the same stream handle, and the sole writer is
-  `complete_present_stream_gpu`, whose doc names its trigger *"the exact successful
-  queue-marker response"* — the host's used-ring/queue-marker receipt. If that is a
-  DECODE-level ack of the submission rather than GPU completion of it, the gate is
-  satisfied ~microseconds after submission, which is precisely the measured symptom
-  (fences advancing in ~1 us while the pixels land later, and UV1's KMD-side hold moving
-  the app's wait). Next step: establish what that response means on ring>=1 and, if it is
-  decode, make the registered stream's completion the host's GPU-retire signal.
+  ⛔⛔ **AND THE RETIRE-DOMAIN THEORY ITSELF DOES NOT SURVIVE MEASUREMENT (`.287`,
+  `DiagLevel=2`, 2026-09-13).** `allocator` x3: `D12Rec=2564`, `D12Fn0=2564` (the withdrawn
+  `gpu_wire_fence=0` shape), `WfBStrm=2739` (the head DOES block on the execution/stream
+  gate) and **`WfBReb=0`** — no block was ever rebased, so every one was satisfied by a real
+  stream retirement. The packet is therefore already gated on host GPU completion, and the
+  "it retires on the worker boundary" premise that this whole workstream was built on is
+  **not true on `.287`**. What remains unexplained is why the content oracles still fail
+  occasionally with a truthful gate — starting with the `HELIOS_SO_DIAG_DELAY_MS` result
+  (500 ms after the wait makes 11/11 pass), which now points at the app-visible fence
+  completing before the packet's DMA completion rather than at the KMD retire domain.
+  ⛔ **INSTRUMENT PRECONDITION, and this is why earlier readings in this file are empty:**
+  `diag.rs:120` drops every count when `DiagLevel == 0`, the default, and it is snapshotted
+  at init - so set `DiagLevel=2` on the KMD service key and REBOOT before believing any
+  `D12*`/`WfB*` value. A zero there on a `DiagLevel=0` guest is a false negative.
   ⚠ Still owed before any claim: the `allocator` failure rate over ≥10 runs against
   the `.281` 4-of-10 baseline, `WtOut`=0, `QfRet`=0, `WfBWire` flat, and the rest of the
   suite (`tiled`, `raytracing`, `stream-output`).
