@@ -149,6 +149,24 @@ One defect that admission had been hiding remains open:
   LNK2019 on the decorated name plus a `-Wunused-function` warning (the definition
   must sit at top level, after the resolver it calls); and matching a namespace
   comment with a prefix (`}  // namespace`) splits the word that follows it.
+  ⛔⛔ **First measurement on `.282` (`oem29.inf`, Code 0, DWM on the new stack):
+  THE FIX IS TOO EXPENSIVE AS LANDED. Not a correctness verdict — a stop.** A single
+  `allocator` run went from ~2 s on `.281` to over five minutes and was killed; the
+  child produced no verdict inside its 300 s timeout, and its archive directory was
+  never created. Counters while it ran: `EscSubRing` +2267 over ~2 runs (≈1100
+  escapes per run, against an idle-window baseline of ~5/s), **`QfRet` = 2** — the
+  control queue hit `QUEUE_FULL` and the KMD retried — and `WtOut` = 0, so this is
+  not a fence-wait timeout being wrongly reported: the work is simply crawling.
+  This is exactly the performance review's P2-1/P2-2 pair (one SUBMIT_VENUS escape
+  per producer at the ICD's own ~1200/s ceiling; QueueFull retries while `umd12`
+  holds vkd3d's queue mutex), which is why those risks were written down before the
+  code was.
+  ⇒ **Next step is a rate limiter, not more measurement**: mint at most one boundary
+  per queue per frame (or per short interval) and REUSE the last fence for every
+  packet in between — reuse is safe because wire ids are monotonic, so an older
+  fence is a weaker but never wrong gate. Then re-measure, and only then read the
+  oracle. ⚠ Nothing in the paragraphs below may be read as a correctness result
+  from these runs: the probe never produced a verdict.
   ⚠ Still owed before any claim: an install and a measurement — `D12Fnc` moving
   with `D12Fn0` falling, the `allocator` oracle's failure rate, `WfOut`=0,
   `QfRet`=0, `WfBWire` flat — plus the EscSubRing delta that decides whether one
