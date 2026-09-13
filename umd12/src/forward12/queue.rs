@@ -920,7 +920,9 @@ pub(crate) unsafe fn publish_present_producer(
         submit_wddm_render(
             dev,
             queue,
-            &ecl_submit_command(boundary),
+            // No GPU fence yet: the producer lands separately, and zero is the
+            // "no boundary" value that keeps this inert.
+            &ecl_submit_command(boundary, 0),
             "Present producer",
         )
     };
@@ -2462,13 +2464,26 @@ unsafe extern "system" fn destroy_command_signature(
 // ---------------------------------------------------------------------------
 
 /// Exact registered worker boundary for an ECL or Present producer packet.
-fn ecl_submit_command(boundary: (u32, u32, u64)) -> helios_protocol::HeliosD3D12SubmitCmd {
+/// `gpu_wire_fence` is the KMD-issued wire fence of the queue's own timeline, from
+/// the ICD export `helios_venus_queue_gpu_fence`. It is **0 here** until the
+/// producer lands (the record is version 3 and the KMD accepts both lengths, so
+/// this is deliberately inert rather than a half-change): zero means "no boundary"
+/// and is exactly version-2 behaviour.
+///
+/// ⛔ When the producer fills it, gate the change on a counter of records with a
+/// NONZERO fence: every refusal in that export returns 0 for the caller to absorb,
+/// so an inert wire is indistinguishable from a working one without it.
+fn ecl_submit_command(
+    boundary: (u32, u32, u64),
+    gpu_wire_fence: u64,
+) -> helios_protocol::HeliosD3D12SubmitCmd {
     helios_protocol::HeliosD3D12SubmitCmd {
         magic: helios_protocol::HELIOS_D3D12_SUBMIT_MAGIC,
         version: helios_protocol::HELIOS_D3D12_SUBMIT_VERSION,
         ctx_id: boundary.0,
         value: boundary.1,
         cookie: boundary.2,
+        gpu_wire_fence,
     }
 }
 
@@ -3048,7 +3063,9 @@ unsafe extern "system" fn execute_command_lists(
         submit_wddm_render(
             dev,
             queue,
-            &ecl_submit_command(boundary),
+            // No GPU fence yet: see ecl_submit_command. The K-F piece that fills
+            // this must also count nonzero fences reaching the KMD.
+            &ecl_submit_command(boundary, 0),
             "ExecuteCommandLists",
         )
     } {

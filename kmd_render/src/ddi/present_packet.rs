@@ -25,10 +25,15 @@ const PRESENT_SUBMISSION_MAGIC: u32 = 0x4850_424C; // "HPBL"
 pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 32;
 
 /// The existing 32-byte Present prefix and 56-byte flip/snapshot record stay
-/// fixed. Append a separate 16-byte execution record and request all 104 bytes
-/// at CreateContext; the assertions below pin both boundaries.
+/// fixed. Append a separate execution record and request all 112 bytes at
+/// CreateContext; the assertions below pin both boundaries.
+///
+/// 104 -> 112 when `execution_completion::Record` grew from 16 to 24 bytes for
+/// the D3D12 host GPU-completion wire fence. The size is a per-context
+/// declaration, and the assertion below ties it to the record exactly, so the two
+/// cannot drift.
 pub(crate) const EXECUTION_PRIVATE_OFFSET: usize = 88;
-pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 104;
+pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 112;
 
 /// Separate from the existing Present/flip records: a batched HEPR must not
 /// overwrite an ECL predecessor, and a preempted replay keeps its exact proof.

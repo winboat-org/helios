@@ -26,6 +26,15 @@ pub struct Record {
     magic: u32,
     version: u32,
     boundary: u64,
+    /// KMD-issued wire fence of the queue's own timeline, from the D3D12 record's
+    /// `gpu_wire_fence`. Zero means "no boundary": the packet retires exactly as it
+    /// did before this field existed.
+    ///
+    /// ⚠ It is deliberately NOT merged into `boundary`: `boundary` is the exact
+    /// *worker* completion predicate for the context's execution stream, and the
+    /// two are consumed by different arms of `wddm_boundary::select`. Conflating
+    /// them would make a worker boundary selectable as a wire fence.
+    gpu_wire_fence: u64,
 }
 
 impl Record {
@@ -39,7 +48,29 @@ impl Record {
             magic: MAGIC,
             version: VERSION,
             boundary: previous.max(boundary),
+            // Preserve a fence a previous Render already attached to this buffer.
+            gpu_wire_fence: self.gpu_wire_fence,
         })
+    }
+
+    /// Attach a host GPU-completion wire fence for this packet.
+    ///
+    /// `fence == 0` leaves whatever was there: a D3D12 record without a boundary
+    /// must not clear one that a batched predecessor attached to the same buffer.
+    /// The largest id wins for the same reason it does for `boundary` — a later
+    /// fence on the same timeline implies every earlier one.
+    pub fn with_gpu_wire_fence(self, fence: u64) -> Self {
+        Self {
+            gpu_wire_fence: self.gpu_wire_fence.max(fence),
+            ..self
+        }
+    }
+
+    /// The wire fence to gate this packet on, or `None` when the record names no
+    /// boundary (or does not belong to `context_stream`).
+    pub fn gpu_wire_fence_for(self, context_stream: u32) -> Option<u64> {
+        (self.boundary_for(context_stream).is_some() && self.gpu_wire_fence != 0)
+            .then_some(self.gpu_wire_fence)
     }
 
     pub fn boundary_for(self, context_stream: u32) -> Option<u64> {
@@ -116,7 +147,10 @@ impl Progress {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<Record>() == 16);
+// 16 -> 24 with the appended `gpu_wire_fence` (the D3D12 host-completion gate).
+// `PRESENT_DMA_PRIVATE_DATA_BYTES` in `kmd_render` is pinned to
+// `EXECUTION_PRIVATE_OFFSET + size_of::<Record>()` and was raised with this.
+const _: () = assert!(core::mem::size_of::<Record>() == 24);
 
 #[cfg(test)]
 mod tests {
@@ -144,6 +178,38 @@ mod tests {
             .unwrap();
         assert_eq!(record.boundary_for(7), Some(boundary(7, 8)));
         assert_eq!(record.boundary_for(7), Some(boundary(7, 8)));
+    }
+
+    #[test]
+    fn gpu_wire_fence_is_optional_and_never_leaks_across_streams() {
+        let rec = Record::default()
+            .merge(boundary(7, 5))
+            .unwrap()
+            .with_gpu_wire_fence(41);
+        assert_eq!(rec.gpu_wire_fence_for(7), Some(41));
+        // A record with no boundary names no fence, even if one was attached.
+        assert_eq!(Record::default().with_gpu_wire_fence(41).gpu_wire_fence_for(7), None);
+        // And a fence attached for one stream is not usable for another.
+        assert_eq!(rec.gpu_wire_fence_for(8), None);
+        assert_eq!(rec.gpu_wire_fence_for(0), None);
+    }
+
+    #[test]
+    fn zero_fence_keeps_a_batched_predecessors_boundary() {
+        // The inert path must be a no-op: a v2 record (no fence) or a producer that
+        // has not landed passes 0, and that must not CLEAR an earlier fence on the
+        // same DMA buffer, nor resurrect on a boundary it does not own.
+        let first = Record::default()
+            .merge(boundary(7, 5))
+            .unwrap()
+            .with_gpu_wire_fence(41);
+        let batched = first.merge(boundary(7, 6)).unwrap().with_gpu_wire_fence(0);
+        assert_eq!(batched.gpu_wire_fence_for(7), Some(41));
+        assert_eq!(batched.boundary_for(7), Some(boundary(7, 6)));
+        // The largest fence wins: a later fence on the same timeline implies every
+        // earlier one.
+        assert_eq!(batched.with_gpu_wire_fence(9).gpu_wire_fence_for(7), Some(41));
+        assert_eq!(batched.with_gpu_wire_fence(77).gpu_wire_fence_for(7), Some(77));
     }
 
     #[test]

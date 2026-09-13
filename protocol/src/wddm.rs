@@ -454,7 +454,12 @@ pub const HELIOS_PRESENT_REFRESH_VERSION: u32 = 1;
 /// refresh — which a compute or graphics `ExecuteCommandLists` must never do.
 pub const HELIOS_D3D12_SUBMIT_MAGIC: u32 = 0x3231_4548;
 /// Current D3D12 submission-command ABI version.
-pub const HELIOS_D3D12_SUBMIT_VERSION: u32 = 2;
+pub const HELIOS_D3D12_SUBMIT_VERSION: u32 = 3;
+/// The previous record's version. Its 24-byte prefix is unchanged, and the KMD
+/// still accepts it: a long-lived process (dwm) can hold the previous package's
+/// `helios_umd12.dll` across an upgrade, and rejecting its records would break
+/// D3D12 for that window.
+pub const HELIOS_D3D12_SUBMIT_VERSION_V2: u32 = 2;
 
 /// Private payload carried through `DXGIDDICB_PRESENT::pPrivateDriverData` to
 /// `DxgkDdiPresent`.
@@ -573,7 +578,17 @@ impl HeliosPresentRefreshCmd {
 /// was registered by the live ICD; KMD authenticates its cookie against the
 /// exact hKmdProcess of the runtime context. The value may be in the future:
 /// it is signaled only after this batch reaches the queue submission worker.
-/// Version 1's sampled wire fence is deliberately incompatible.
+///
+/// **Version 3 appends `gpu_wire_fence`** — the wire fence of the queue's own
+/// timeline, minted by the ICD export `helios_venus_queue_gpu_fence`. The KMD
+/// gates the packet on it so a D3D12 fence means *host GPU* completion instead of
+/// worker completion. **Zero means "no boundary" and restores version-2 behaviour
+/// exactly**, which is what lets the plumbing land before the producer does.
+///
+/// Version 2's 24-byte prefix is unchanged and still accepted (see
+/// [`HeliosD3D12SubmitCmdV2`]). Version 1's *sampled* wire fence stays deliberately
+/// incompatible: sampling returns whatever submit happened last, process-wide, on
+/// any thread.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosD3D12SubmitCmd {
@@ -582,6 +597,7 @@ pub struct HeliosD3D12SubmitCmd {
     pub ctx_id: u32,
     pub value: u32,
     pub cookie: u64,
+    pub gpu_wire_fence: u64,
 }
 
 impl HeliosD3D12SubmitCmd {
@@ -589,6 +605,42 @@ impl HeliosD3D12SubmitCmd {
     pub fn is_valid(&self) -> bool {
         self.magic == HELIOS_D3D12_SUBMIT_MAGIC && self.version == HELIOS_D3D12_SUBMIT_VERSION
             && self.ctx_id != 0 && self.value != 0 && self.cookie != 0
+    }
+}
+
+/// The version-2 record: the same 24-byte prefix without a GPU fence. Read when a
+/// v2 UMD is still loaded; its fence is zero by definition.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosD3D12SubmitCmdV2 {
+    pub magic: u32,
+    pub version: u32,
+    pub ctx_id: u32,
+    pub value: u32,
+    pub cookie: u64,
+}
+
+impl HeliosD3D12SubmitCmdV2 {
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.magic == HELIOS_D3D12_SUBMIT_MAGIC
+            && self.version == HELIOS_D3D12_SUBMIT_VERSION_V2
+            && self.ctx_id != 0
+            && self.value != 0
+            && self.cookie != 0
+    }
+
+    /// Widen to the current shape with no boundary: exactly version-2 behaviour.
+    #[inline]
+    pub fn widen(self) -> HeliosD3D12SubmitCmd {
+        HeliosD3D12SubmitCmd {
+            magic: self.magic,
+            version: HELIOS_D3D12_SUBMIT_VERSION,
+            ctx_id: self.ctx_id,
+            value: self.value,
+            cookie: self.cookie,
+            gpu_wire_fence: 0,
+        }
     }
 }
 
@@ -605,9 +657,15 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosPresentRenderCmd>() == 80);
     assert!(core::mem::size_of::<HeliosPresentRefreshCmd>() == 32);
     assert!(core::mem::offset_of!(HeliosPresentRefreshCmd, present_ctx_id) == 16);
-    assert!(core::mem::size_of::<HeliosD3D12SubmitCmd>() == 24);
+    // 24 -> 32 with the appended `gpu_wire_fence` (D3D12 host-completion gate);
+    // the 24-byte prefix is unchanged, which is why v2 is still readable.
+    assert!(core::mem::size_of::<HeliosD3D12SubmitCmd>() == 32);
     assert!(core::mem::offset_of!(HeliosD3D12SubmitCmd, ctx_id) == 8);
     assert!(core::mem::offset_of!(HeliosD3D12SubmitCmd, cookie) == 16);
+    assert!(core::mem::offset_of!(HeliosD3D12SubmitCmd, gpu_wire_fence) == 24);
+    assert!(core::mem::size_of::<HeliosD3D12SubmitCmdV2>() == 24);
+    assert!(core::mem::offset_of!(HeliosD3D12SubmitCmdV2, ctx_id) == 8);
+    assert!(core::mem::offset_of!(HeliosD3D12SubmitCmdV2, cookie) == 16);
     // The identity record must fit exactly over the HeliosWddmAllocPrivate
     // region so the meta trailer's offset is unchanged for openers.
     assert!(

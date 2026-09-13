@@ -116,6 +116,13 @@ static PRESENT_MARKER_SCAN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 /// `D12-G8` could not establish, because `EclNoWddmSubmission = 1` meant no
 /// packet was ever built.
 pub static D3D12_SUBMIT_RECORDS: AtomicU32 = AtomicU32::new(0);
+/// Accepted `HeliosD3D12SubmitCmd` records that carried a **nonzero**
+/// `gpu_wire_fence` — the K-F gate. The ICD export returns 0 on every refusal and
+/// the caller absorbs that as "no boundary", so without this pair an inert wire is
+/// indistinguishable from a working one; that is the fake-success shape this
+/// defect has already punished once. Mirrored as `D12Fnc` / `D12Fn0`.
+pub static D3D12_FENCE_CARRIED: AtomicU32 = AtomicU32::new(0);
+pub static D3D12_FENCE_ABSENT: AtomicU32 = AtomicU32::new(0);
 /// Retired HE12 v1 diagnostic. V2 rejects a zero boundary at Render; always zero.
 pub static D3D12_SUBMIT_ZERO_FENCE: AtomicU32 = AtomicU32::new(0);
 /// HE12 validation/authentication or private-tail sizing failed. Render refuses the packet; expected zero.
@@ -212,6 +219,8 @@ pub(crate) fn record_present_handoff_telemetry() {
     // HE12 v2: accepted exact records and validation failures. D12Zero is a
     // retired diagnostic; a zero boundary is refused before submission.
     crate::diag::record_named_bytes(b"D12Rec", D3D12_SUBMIT_RECORDS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D12Fnc", D3D12_FENCE_CARRIED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D12Fn0", D3D12_FENCE_ABSENT.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D12Zero", D3D12_SUBMIT_ZERO_FENCE.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D12MrgF", D3D12_SUBMIT_MERGE_FAILS.load(Ordering::Relaxed));
     // NOT a failure counter: records that found a predecessor in the same
@@ -659,13 +668,18 @@ unsafe fn decode_execution_boundary(
     h_context: HANDLE,
     data: *mut c_void,
     size: u32,
-) -> Option<u64> {
+) -> Option<(u64, Option<u64>)> {
     // SAFETY: forwarded live context and runtime-private range; helper checks bounds.
     let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) }?;
     // SAFETY: helper checks null and the full private tail size.
     let record = unsafe { crate::ddi::present_packet::execution_record(data, size) }?;
     // SAFETY: checked readable record, using an unaligned load as required by the DDI.
-    unsafe { record.read_unaligned() }.boundary_for(context.execution_stream())
+    let record = unsafe { record.read_unaligned() };
+    let stream = context.execution_stream();
+    // The worker boundary decides *exactness*; the fence, when present, is what the
+    // packet is gated on. They are separate fields for that reason.
+    let boundary = record.boundary_for(stream)?;
+    Some((boundary, record.gpu_wire_fence_for(stream)))
 }
 
 fn note_and_maybe_signal(
@@ -673,7 +687,7 @@ fn note_and_maybe_signal(
     fence: u32,
     is_paging: bool,
     present_submission: Option<PresentSubmissionBoundary>,
-    execution_boundary: Option<u64>,
+    execution_boundary: Option<(u64, Option<u64>)>,
 ) -> SubmitAck {
     let Ok(dxgkrnl) = adapter.dxgkrnl() else {
         // Effectively unreachable: dxgkrnl is set at StartDevice and never
@@ -685,9 +699,18 @@ fn note_and_maybe_signal(
     adapter.with_wddm_notify_lock(|guard| {
         let signal_now = guard
             .with_virtio(|o, v| {
-                let gpu_completion_fence = present_submission.and_then(|present| {
-                    (present.gpu_fence_id != 0).then_some(present.gpu_fence_id)
-                });
+                // A D3D12 ECL packet carries its own host GPU-completion fence (the
+                // ICD's `helios_venus_queue_gpu_fence`); Present carries the BLT
+                // marker's. Either way the packet is gated on a real wire fence, and
+                // `None` on both is the old behaviour, byte for byte.
+                let d3d12_gpu_fence = execution_boundary.and_then(|(_, fence)| fence);
+                let gpu_completion_fence = present_submission
+                    .and_then(|present| (present.gpu_fence_id != 0).then_some(present.gpu_fence_id))
+                    .or(d3d12_gpu_fence);
+                let (exact_execution, execution_boundary_value) = match execution_boundary {
+                    Some((boundary, _)) => (true, Some(boundary)),
+                    None => (false, None),
+                };
                 let stream_boundary = present_submission.and_then(|present| {
                     (present.stream_boundary != 0).then_some(present.stream_boundary)
                 });
@@ -702,8 +725,8 @@ fn note_and_maybe_signal(
                     gpu_completion_fence,
                     stream_boundary,
                     blt_token,
-                    execution_boundary.is_some(),
-                    execution_boundary,
+                    exact_execution,
+                    execution_boundary_value,
                 )
             })
             // Transport down (bring-up / teardown): no venus work can gate it.
@@ -1314,14 +1337,31 @@ pub unsafe extern "C" fn dxgkddi_render(
         unsafe { args.pCommand.cast::<u32>().read_unaligned() } == helios_protocol::HELIOS_D3D12_SUBMIT_MAGIC;
     if is_ecl {
         let result = (|| {
-            if cmd_len != size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
+            // BOTH lengths are accepted. A long-lived process (dwm) can still hold
+            // the previous package's `helios_umd12.dll` across an upgrade, and
+            // reading a 32-byte struct out of a 24-byte command would run past its
+            // end. The v2 shape widens with `gpu_wire_fence = 0`, i.e. exactly v2
+            // behaviour.
+            let command = if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmd>() {
+                // SAFETY: the exact full command size is validated before this read.
+                unsafe {
+                    args.pCommand
+                        .cast::<helios_protocol::HeliosD3D12SubmitCmd>()
+                        .read_unaligned()
+                }
+            } else if cmd_len == size_of::<helios_protocol::HeliosD3D12SubmitCmdV2>() {
+                // SAFETY: as above, for the 24-byte v2 shape.
+                let v2 = unsafe {
+                    args.pCommand
+                        .cast::<helios_protocol::HeliosD3D12SubmitCmdV2>()
+                        .read_unaligned()
+                };
+                if !v2.is_valid() {
+                    return None;
+                }
+                v2.widen()
+            } else {
                 return None;
-            }
-            // SAFETY: the exact full command size is validated before this read.
-            let command = unsafe {
-                args.pCommand
-                    .cast::<helios_protocol::HeliosD3D12SubmitCmd>()
-                    .read_unaligned()
             };
             if !command.is_valid() {
                 return None;
@@ -1348,7 +1388,16 @@ pub unsafe extern "C" fn dxgkddi_render(
             }
             // SAFETY: record points into the size-checked runtime-private tail.
             let old = unsafe { record.read_unaligned() };
-            let next = old.merge(boundary)?;
+            // Attach the host GPU-completion fence before publishing the record: a
+            // preempted replay must carry the same proof, and `merge` preserves it.
+            let next = old
+                .merge(boundary)?
+                .with_gpu_wire_fence(command.gpu_wire_fence);
+            if command.gpu_wire_fence != 0 {
+                D3D12_FENCE_CARRIED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                D3D12_FENCE_ABSENT.fetch_add(1, Ordering::Relaxed);
+            }
             if old.boundary_for(context.execution_stream()).is_some() {
                 D3D12_SUBMIT_MERGED.fetch_add(1, Ordering::Relaxed);
             }
