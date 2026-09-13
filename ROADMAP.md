@@ -31,10 +31,16 @@ suite moved `adapter` and `allocator` from FAIL to PASS and unblocked
 `raytracing`, which now reports `CAP,NativeFL12_1Admission,00000000`.
 
 Three defects that admission had been hiding are now open:
-- `stream-output` FAIL "32-bit counter guards overwritten". Both filled-size
-  values are correct, so the guard words are clobbered by something writing more
-  than four bytes at the counter address. It failed earlier at "SO overflow or
-  tail overwritten" on .278.
+- `stream-output`: **a completion/visibility race, not a layout error.** A raw
+  stride dump shows a correct 32-byte stride with the gap and both padding words
+  intact on a passing run, and the failing check is different every run
+  (`32-bit counter guards overwritten`, `stride padding overwritten`,
+  `counter32 guard changed`). The probe waits on a queue fence before `Map`, so
+  the fence is being satisfied before the stream-output writes and the copies
+  that read them back are complete. Measured: without a delay the probe failed
+  3 of 11 runs across those three checks; with `HELIOS_SO_DIAG_DELAY_MS=500`
+  inserted between the fence wait and the readback it passed 11 of 11.
+  (Delay hook lives only in a local diagnostic probe build, not committed.)
 - `raytracing` FAIL "uncompacted current/prebuild size agreement", after four
   passing stages.
 - `tiled` `tiling-buffer` now runs (`TiledResourcesTier` reports 2, not 1) and
