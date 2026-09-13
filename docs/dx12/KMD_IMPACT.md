@@ -822,8 +822,14 @@ runtime's monitored fence behind this driver's DMA packet, which is the row abov
 the fix is to give the packet a truthful host GPU-completion fence (K-F3..K-F9)
 rather than another submission mechanism. ⚠ The held runs still fail the probe's
 content check; this reading licenses the fix, it does not fix it. Evidence:
-`tmp/uv1-20260913/` (both arms' JSON, per-run logs), and the same result is
-recorded in `ROADMAP.md`'s open-defect entry.
+`tmp/uv1-20260913/` (both arms' JSON, per-run logs, and the `DiagLevel=0`
+control), and the same result is recorded in `ROADMAP.md`'s open-defect entry.
+
+The control (hold=100, `DiagLevel=0`) is one line of the record: it hit the
+probe's own completion bound (`FAIL completion missing; timeout is not
+completion`) at 120 s, so it is not a latency datum. It excludes registry I/O as
+the explanation for the graded pair's growth, because turning the counters off
+made the arm worse rather than faster.
 
 ~~⭐ **UV3 is separately pre-checkable with ZERO code**: read `RING_SUBMIT_COUNT` /
 `RING_COMPLETE_COUNT` (`kmd_render/src/virtio/gpu/mod.rs`, bumped in `enqueue_submit_inner` and in

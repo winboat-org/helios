@@ -101,6 +101,16 @@ One defect that admission had been hiding remains open:
   host GPU). That is the precondition K-F3..K-F9 was waiting on. ⚠ The held runs
   still FAIL the probe's content check, so this reading *licenses* the fix; it does
   not fix it. Instrument `tools/uv1-fence-latency.ps1`, evidence `tmp/uv1-20260913/`.
+  **Control that closes the obvious objection** (that the growth is `DiagLevel=1`
+  registry I/O amplified by the hold): hold=100 with `DiagLevel=0`, i.e. no counter
+  writes at all. That arm did not measure a latency — it hit the probe's *own*
+  completion bound and failed with `FAIL completion missing; timeout is not
+  completion` after 120 s — so it is recorded as a control, not as a datapoint.
+  What it settles is the direction: switching the registry writes OFF made the arm
+  worse, not faster, so the graded pair's growth is the hold and the held
+  latencies (11.4/23.0 s) are if anything understated. ⚠ It also shows the hold can
+  starve a fence past a probe-side bound, which is a property of the knob's 60 Hz
+  release edge, not of the shipping configuration (the knob is 0 there).
   **Next (the fix this licenses) — four pieces, in dependency order.** (1) the
   producer: call `helios_venus_queue_gpu_fence` per submission and get the wire
   fence back to whoever fills the D3D12 record. The ICD export exists and is
