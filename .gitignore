@@ -65,5 +65,8 @@ __pycache__/
 # Local reverse-engineering and compatibility investigation notes
 /INVESTIGATIONS/
 
+# Local scratch launchers/probes — never part of the tree
+/config-temp/
+
 # Local build-slave (firstheberg2) usage notes
 /testenv-guide.md
