@@ -137,8 +137,10 @@ driver regression). See TOOLCHAIN.md and ROADMAP.md tooling.
 
 **Standing VM authorization (owner directive, 2026-09-12):** start, stop, restart,
 cold-boot or reboot the test VM and build slave whenever needed for Helios work.
-This includes changing and relaunching `tools/launch-helios-gtk.sh`, QEMU
-display/debug transport and launcher environment variables. Do not pause for
+This includes changing and relaunching the VM, its QEMU
+display/debug transport and its environment variables — which for the test VM means the
+**WinBoat compose project** (see "Test environment" below), NOT the retired
+`tools/launch-helios-gtk.sh` bare-GTK launcher. Do not pause for
 approval or require the owner to be present; the owner is often AFK. This
 authorization supersedes older approval requirements in the project docs.
 Document launch changes, report disruptive restarts, and verify guest health and
@@ -146,6 +148,28 @@ loaded driver versions afterward. `pnputil /restart-device` re-runs AddAdapter
 when a full guest reboot is unnecessary.
 
 ---
+
+## Test environment (read this before touching the VM)
+
+⚠ **The Win11 test target is not a bare QEMU process on this host — it is a container**, and
+this section exists because an agent that assumed otherwise lost time on 2026-09-13 (it read
+the old "QEMU/KVM on a Linux host" line here and never inspected the host).
+
+| | |
+|---|---|
+| Container | `WinBoat`, compose project `winboat`, image `ghcr.io/winboat-org/helios-windows:6.03.8` (dockur/windows-derived Win11) |
+| Compose file | `~/.local/share/winboat-app/docker-compose.yml` — **this is the launch lever** |
+| Passthrough | `/dev/kvm` and `/dev/dri/renderD128` (`RENDERNODE`); `privileged: true`, `cap_add: NET_ADMIN` |
+| Host stack | QEMU fork + `/opt/helios/libexec/virgl_render_server` run **inside the container** (`LD_LIBRARY_PATH=/opt/helios/lib`, image-provided, so host-stack changes need an image rebuild) |
+| Volumes | repo → `/shared`; `/home/tibix/Data/WinboatGPUInstall/winboat` → `/storage` (the guest disk, `data.img`); `./oem` → `/oem` |
+| Access | `ssh win` = `127.0.0.1:2222`; VNC-web `47270`; RDP `47273`; QMP `47272` (in-container `7149`) for reset/screendump |
+| QEMU args | set by the `ARGUMENTS` env (e.g. `-qmp …`); `virtio-gpu-gl-pci,venus=on,blob=on,hostmem=5G,host3d_blob_limit=5G` comes from the Helios image entrypoint |
+| VM knobs | compose env: `RAM_SIZE`, `CPU_CORES`, `HELIOS_HOSTMEM`, `HELIOS_BLOB_LIMIT`, `VKR_DEVICE_MEMORY_LIMIT_BYTES`, `override_vram_size`, `LOSSY` |
+| Host logs | **`docker logs WinBoat`** (QEMU stderr + render-server output). `docker exec WinBoat ps aux` shows QEMU and the render servers |
+| Lifecycle | `restart: no`. A guest shutdown/power-off leaves the container exited: **`docker start WinBoat`** resumes it (this is why a guest reboot can end with the VM down — `ROADMAP.md` records the same trap) |
+
+⚠ Running `tools/launch-helios-gtk.sh` (or expecting `/tmp/helios-qemu-stderr.log`) targets
+the retired bare-GTK environment and will not describe what is actually running.
 
 ## Operating Rules
 
@@ -293,8 +317,11 @@ re-create them; if you need a host-side or user-mode probe, add it under `tools/
    "what is dxgkrnl doing to my thread" — take a ~2 s circular slice mid-run and read the
    `Present` / `Flip` / `QueuePacket` / `DmaPacket` / `BlockThread` events; that is how the
    present-queue stall was found (ROADMAP WS2).
-3. Venus protocol ground truth: `venus-protocol/vk.xml`, `virglrenderer/src/venus/`. Host-side
-   log: `/tmp/helios-qemu-stderr.log` (launcher tee); `HELIOS_VKR_DEBUG=validate` enables host
+3. Venus protocol ground truth: `venus-protocol/vk.xml`, `virglrenderer/src/venus/`. ⛔
+   **Host-side logs are `docker logs WinBoat`** — the QEMU fork and
+   `/opt/helios/libexec/virgl_render_server` run INSIDE the WinBoat container, so there is no
+   `/tmp/helios-qemu-stderr.log` in this environment (verified 2026-09-13; that path is a
+   leftover of the retired bare-GTK launcher). `HELIOS_VKR_DEBUG=validate` enables host
    validation layers.
 4. Reference drivers: mvisor-win-vgpu-driver (System-class model), kvm-guest-drivers-windows
    viogpu (virtio init only).
