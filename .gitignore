@@ -64,3 +64,6 @@ __pycache__/
 
 # Local reverse-engineering and compatibility investigation notes
 /INVESTIGATIONS/
+
+# Local build-slave (firstheberg2) usage notes
+/testenv-guide.md
