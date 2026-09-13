@@ -134,7 +134,26 @@ One defect that admission had been hiding remains open:
   packet) **and `umd12/src/forward12/tiles.rs` (tile mappings)** — the last one is
   the sparse path this stage already fixed, it was missed by a grep scoped to
   queue.rs, and the slave build caught it as an E0061.
-  **Piece (2) design settled (investigated 2026-09-13, not yet written).** The
+  **Piece (2) LANDED AND COMPILING (`73f4e0f` + `c1c5e59` + `87f3ab8`) — the wire
+  is now LIVE, and has never run.** `umd12/bridge/vkd3d_bridge.cpp` resolves
+  `helios_venus_queue_gpu_fence` from the loaded venus ICD module by name through
+  the same `find_venus_icd_module`/`reconcile_icd_anchor` path as
+  `memory_identity_exports` (cached; a missing export logs and stays null), and
+  `helios_umd12_queue_gpu_fence` takes the `VkQueue` through vkd3d's public
+  `vkd3d_acquire_vk_queue`/`vkd3d_release_vk_queue` and calls it. All three
+  producers (`queue.rs` ×2, `tiles.rs`) fetch it **once per producer** and stamp it
+  into the record. Verified by a slave driver build only (`KMD BUILD PASS`, INF
+  valid, `C:\src\out\kf-20260913\driver`): nothing has been installed or run.
+  ⛔ Two build lessons worth keeping: a bridge definition inserted inside the file's
+  anonymous `namespace {` gets INTERNAL linkage, which the cxx glue reports as
+  LNK2019 on the decorated name plus a `-Wunused-function` warning (the definition
+  must sit at top level, after the resolver it calls); and matching a namespace
+  comment with a prefix (`}  // namespace`) splits the word that follows it.
+  ⚠ Still owed before any claim: an install and a measurement — `D12Fnc` moving
+  with `D12Fn0` falling, the `allocator` oracle's failure rate, `WfOut`=0,
+  `QfRet`=0, `WfBWire` flat — plus the EscSubRing delta that decides whether one
+  boundary per producer is affordable.
+  **Piece (2) design, kept for the record.** The
   producer goes in the **UMD12**, not the engine, and the reasons are checked, not
   assumed:
   * `vkd3d_acquire_vk_queue(ID3D12CommandQueue *) -> VkQueue` is already **public**
