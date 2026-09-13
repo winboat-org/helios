@@ -789,7 +789,7 @@ the two are one piece of work.
 
 | id | Question | Why it decides the design |
 |---|---|---|
-| **UV1** | Does dxgkrnl release the runtime's queued monitored-fence signal behind **our** DMA packets? ⚠ **STILL OPEN** — a 2026-09-13 reading claimed ✓ and was retracted on review (see below). | If no, no amount of submission helps and the design needs a different lever entirely. Doc support is good (`context-monitoring.md:35,47`); **local proof was absent** — §7's cited `tools/vehicle_flipwait_probe.c` issues no `D3DKMTRender` and no `D3DKMTSubmitCommand`, so it proves sync-packet-vs-sync-packet ordering only. |
+| **UV1** | Does dxgkrnl release the runtime's queued monitored-fence signal behind **our** DMA packets? ✅ **ANSWERED 2026-09-13: YES**, by a clean re-run (see below). An earlier reading was retracted on review; the instrument now enforces its preconditions. | If no, no amount of submission helps and the design needs a different lever entirely. Doc support is good (`context-monitoring.md:35,47`); **local proof was absent** — §7's cited `tools/vehicle_flipwait_probe.c` issues no `D3DKMTRender` and no `D3DKMTSubmitCommand`, so it proves sync-packet-vs-sync-packet ordering only. |
 | **UV3** | Does vkd3d's venus work retire at **host GPU completion** or at **decode**? | `RetireDomain::IncludingGpu` only means GPU completion for work on `ring_idx >= 1`. The ICD says outright: *"the synchronous SUBMIT_VENUS path does not yet propagate `batch->ring_idx` … per-ring async fencing is a later refinement"* (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:3969-3973`). If D3D12 submits land on ring 0, a D3D12 fence gated `IncludingGpu` still reports **decode**, and it lies even with a perfect packet. |
 
 **The experiment, in three readings.** Land the UMD's bare `pfnRenderCb` (K-F1, below — zero KMD
@@ -802,35 +802,43 @@ change), then read the probe's own `WaitForSingleObject signalled in N us` again
 | N flat; with `WddmHoldMs=100` **scoped to that context**, N → ~100 ms | **UV1 ✓, UV3 ✗.** The packet works, the venus retirement domain is the bug. Fix the ring, not the submission. |
 | N flat under both | **UV1 ✗.** Say so loudly and stop — none of K-F3..K-F9 is the answer. |
 
-### UV1 reading, 2026-09-13 — RETRACTED
+### UV1 reading, 2026-09-13 — UV1 ✓ (clean re-run)
 
-A first pass on `22.22.281.0` (`tools/uv1-fence-latency.ps1`) looked like UV1 ✓: hold
-0 gave 1260/1403/1461/1632/1756/2364 ms with `WfBHold` Δ 0, hold 100 gave
-11403/22992 ms with `WfBHold` Δ 2227/3892. **It is retracted.** Two reviews showed:
+Six samples over two boots on `22.22.281.0`, arms **strictly sequential** (the
+instrument refuses to start while another probe runs, because the counters are
+adapter-global on a strictly head-of-line FIFO), all six valid latency samples
+(`WtOut` Δ 0 — no fence-wait timeout), same work in both arms (Δ`D12Rec` = 770):
 
-* the two held runs **overlapped** (started ~12 s apart, both ended 13:55:05.5), so
-  their `counters_after` are identical and each Δ mixes both runs — while the
-  measured counters are adapter-global on a strictly head-of-line FIFO;
-* 11 403 and 22 992 ms are ~1× and ~2× the probe's **own 10 s fence-wait timeout**
-  (`tools/d3d12_allocator_probe.cpp:30`), and the held runs' `D12Rec` deltas (68, 11)
-  are 1–10 % of a full run's — so those wall times are at least as consistent with
-  one or two timeouts as with 256 delayed epochs;
-* three of the six baseline points came from an earlier instrument revision that
-  watched counter names absent from the KMD key, so the usable baseline is only
-  1403/1632/1260 ms;
-* the instrument read `DiagLevel` live from the registry although the driver
-  snapshots it at `VirtioGpu::init`, and it never captured the probe's exit code.
+| arm | elapsed (3 runs) | `WfBHold` Δ | `WtOut` Δ |
+|---|---|---|---|
+| `WddmHoldMs=0` | 2120 / 1619 / 1615 ms | 0 | 0 |
+| `WddmHoldMs=100` | 117297 / 116897 / 116960 ms | ~9.7–10.1 k | 0 |
 
-The verdict stands unmeasured, and the row above stays open. `WtOut` (the registry
-mirror of `FENCE_WAIT_TIMEOUTS`, `adapter/scanout.rs:710-713`) is the counter that
-settles it; the full re-run recipe is in `ROADMAP.md`'s open-defect entry.
+Graded by the instrument: **`UV1-YES: the app fence waits on our packet`**,
+ratio 72.4×. dxgkrnl therefore orders the runtime's monitored fence behind this
+driver's DMA packet, which is the ✓ / UV3 ✗ row of the table above: the packet
+works and the venus retirement domain is the bug.
 
-⛔ One contradiction a re-run must also settle, because it decides the lever: the
-UV1 ✓ / **UV3 ✗** row of the table above reads *"Fix the ring, not the
-submission"*, while this document's other correction says UV3 is answered ✗ from
-source — and the planned fix in `ROADMAP.md` is submission-side (carry a
-`gpu_wire_fence` into the D3D12 record). Both cannot be right. Until UV1 is
-re-taken cleanly, do not act on either reading.
+**Why the first attempt is not cited.** It was retracted: its two held runs
+overlapped (identical `counters_after`, both ending 13:55:05.5), and 11 403 /
+22 992 ms were ~1×/~2× the probe's own 10 s fence-wait timeout
+(`tools/d3d12_allocator_probe.cpp:30`) while doing 1–10 % of a run's work. The
+instrument now checks, per run and in its JSON: no concurrent probe; `WtOut` = 0;
+`DiagLevel` live (hazard counters moving, not the knob read back); ECL path live
+(`D12Rec`); the hold attached (`WfBHold`); plus instrument revision, boot
+time/uptime, probe exit code and the probe archive. Evidence:
+`tmp/uv1-20260913/evidence2/`.
+
+⚠ **The lever, stated precisely.** The table's UV1 ✓ / UV3 ✗ row reads *"Fix the
+ring, not the submission"*. UV3 ✗ was answered from source on 2026-08-06, when
+nothing on the D3D12 path could name a ring≥1 GPU-completion fence — so a perfect
+packet would still have retired at decode, and the submission-side change would
+have bought nothing. ICD-1 changed that by minting exactly such a fence
+(`ring_idx = queue->ring_idx`, ring 0 refused loudly), so the planned fence carry
+**is** the ring fix delivered through the submission path. Unproven and therefore
+gated: that the D3D12 queue's `ring_idx` is ≥ 1 in practice. If it is not, the
+export refuses, the wire stays 0, and the fix is inert — hence the
+`gpu_wire_fence != 0` counter that must land with the plumbing.
 
 ## ⛔⛔ CORRECTION 2026-08-06 — UV3 IS ANSWERED (✗) FROM SOURCE, AND THE TABLE ABOVE IS UNSOUND
 
