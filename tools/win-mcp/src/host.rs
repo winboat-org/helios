@@ -36,6 +36,17 @@ use tokio::process::Command;
 
 use crate::{clean_stderr, encode_powershell, ps_single_quote, ExecOutput};
 
+/// Environment variable names are embedded as identifiers, so they must look like
+/// identifiers.
+pub fn valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// A PowerShell single-quoted literal: escape, then wrap. Every value embedded
 /// in a payload goes through this — forgetting the wrap (rather than the escape)
 /// is the bug the unit tests below pin down.
@@ -151,6 +162,22 @@ pub struct HostSpec {
 }
 
 impl HostSpec {
+    /// Prefix the curated build PATH, then append the machine/user PATH with the
+    /// MSYS2 `usr\bin` entries REMOVED. Appending them unfiltered would leave
+    /// `msys64\usr\bin\git.exe` able to shadow Windows Git further down the search
+    /// order, which is the failure this curation exists to prevent — so the filter
+    /// is what makes the claim true rather than aspirational.
+    fn build_path_snippet(&self) -> String {
+        let quoted = lit(self.build_path);
+        "$machine = [Environment]::GetEnvironmentVariable('Path','Machine')\n\
+         $user = [Environment]::GetEnvironmentVariable('Path','User')\n\
+         $rest = ((($machine + ';' + $user) -split ';') | Where-Object { $_ -and ($_ -notmatch 'msys64.*usr\\bin') }) -join ';'\n\
+         $env:PATH = "
+            .to_string()
+            + &quoted
+            + " + $rest\n"
+    }
+
     pub fn ssh_target(&self) -> String {
         std::env::var(self.ssh_target_env).unwrap_or_else(|_| self.ssh_target_default.to_string())
     }
@@ -182,6 +209,22 @@ const SLAVE: HostSpec = HostSpec {
     build_path: SLAVE_BUILD_PATH,
     default_purpose: Purpose::Build,
 };
+
+/// Task names reach four sinks (a log path, a local temp file, a remote wrapper
+/// path and a scheduled-task `-Argument` string), so they are whitelisted rather
+/// than escaped: a `"` truncates the argument into a path that never runs, and
+/// `..\` writes outside staging.
+pub fn validate_task_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !ok {
+        bail!("invalid task name '{name}': use 1-64 of [A-Za-z0-9._-]");
+    }
+    Ok(())
+}
 
 pub fn host_spec(name: &str) -> Result<&'static HostSpec> {
     match name {
@@ -279,13 +322,17 @@ pub fn shell_body(command: &str, cwd: &str, env: &[(String, String)], purpose: P
         );
     }
     if purpose == Purpose::Build {
+        // PATH FIRST: `safe.directory` must be written by the same git the build
+        // will use, and the snippet runs `git` — with the inherited PATH that could
+        // be MSYS2's, the exact confusion this exists to prevent.
+        script.push_str(&spec.build_path_snippet());
         script.push_str(SAFE_DIRECTORY_SNIPPET);
-        script.push_str(&format!(
-            "$env:PATH = {} + [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User');\n",
-            lit(spec.build_path)
-        ));
     }
     for (k, v) in env {
+        if !valid_env_key(k) {
+            script.push_str("Write-Error 'winrun: refusing invalid env key'; exit 88\n");
+            return script;
+        }
         script.push_str(&format!("$env:{k} = {};\n", lit(v)));
     }
     script.push_str(&format!("Set-Location -LiteralPath {};\n", lit(cwd)));
@@ -414,7 +461,10 @@ async fn scp(from: &str, to: &str) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let out = cmd.output().await.context("spawning scp")?;
+    let out = tokio::time::timeout(Duration::from_secs(1800), cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("scp {from} -> {to} exceeded 1800s"))?
+        .context("spawning scp")?;
     if !out.status.success() {
         bail!(
             "scp {from} -> {to} failed: {}",
@@ -440,10 +490,16 @@ pub async fn ensure_staging(spec: &HostSpec) -> Result<()> {
 pub async fn push(spec: &HostSpec, local: &Path, remote: &str) -> Result<TransferReport> {
     let local_sha = sha256_file(local)?;
     let size = std::fs::metadata(local)?.len();
-    if let Some(parent) = Path::new(remote).parent() {
-        let parent = parent.to_string_lossy().to_string();
+    // NOT Path::parent(): these are Windows paths, and under Unix semantics
+    // `C:\a\b.ps1` has an empty parent — the mkdir would never run and a push into
+    // a fresh directory would fail at scp.
+    if let Some(idx) = remote.rfind(['\\', '/']) {
+        let parent = &remote[..idx];
         if !parent.is_empty() {
-            let cmd = format!("New-Item -ItemType Directory -Force -Path {} | Out-Null", lit(&parent));
+            let cmd = format!(
+                "New-Item -ItemType Directory -Force -Path {} | Out-Null",
+                lit(parent)
+            );
             let _ = run_body(spec, &cmd, 120).await?;
         }
     }
@@ -498,19 +554,26 @@ pub async fn pull(spec: &HostSpec, remote: &str, local: &Path) -> Result<Transfe
 /// Pure — unit tested, because the escaping and the log path are what go wrong.
 pub fn task_wrapper(payload: &str, log: &str, purpose: Purpose, spec: &HostSpec) -> String {
     let mut s = String::from("$ErrorActionPreference='Continue'\n$ProgressPreference='SilentlyContinue'\n");
+    s.push_str(&format!("$env:WINRUN_PURPOSE = '{}'\n", purpose.as_str()));
     if purpose == Purpose::Desktop {
+        s.push_str("$env:WINRUN_EXPECT_SESSION = '1'\n");
+        // Fail CLOSED: an unreadable session is not evidence of an interactive one.
+        // And write the exit marker — without it, a refusal that never reached the
+        // payload read as success to any caller treating a missing marker as ok.
         s.push_str(&format!(
-            "if ((Get-Process -Id $PID).SessionId -eq 0) {{\n  \
-             Add-Content -LiteralPath {} -Value 'winrun: refusing purpose=desktop in session 0';\n  exit 87\n}}\n",
-            lit(log)
+            "try {{ $session = (Get-Process -Id $PID).SessionId }} catch {{ $session = 0 }}\n\
+             if ($null -eq $session -or $session -eq 0) {{\n  \
+             $msg = 'winrun: refusing purpose=desktop in session 0 (GPU/desktop results would be fake)'\n  \
+             Write-Output $msg\n  \
+             Add-Content -LiteralPath {log} -Value $msg\n  \
+             Add-Content -LiteralPath {log} -Value 'WINRUN_EXIT=87'\n  \
+             exit 87\n}}\n",
+            log = lit(log)
         ));
     }
     if purpose == Purpose::Build {
+        s.push_str(&spec.build_path_snippet());
         s.push_str(SAFE_DIRECTORY_SNIPPET);
-        s.push_str(&format!(
-            "$env:PATH = '{}' + [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')\n",
-            ps_single_quote(spec.build_path)
-        ));
     }
     s.push_str(&format!(
         "& {} -NoProfile -ExecutionPolicy Bypass -File {} *> {}\n",
@@ -578,6 +641,7 @@ pub async fn task_start(
     purpose: Purpose,
     log: Option<&str>,
 ) -> Result<TaskStart> {
+    validate_task_name(name)?;
     ensure_staging(spec).await?;
     let log = log
         .map(|s| s.to_string())
@@ -585,7 +649,7 @@ pub async fn task_start(
     let payload_cmd = quoted_path_with_args(payload, payload_args);
     let wrapper = task_wrapper(&payload_cmd, &log, purpose, spec);
 
-    let local = std::env::temp_dir().join(format!("winrun-{name}-task.ps1"));
+    let local = std::env::temp_dir().join(format!("winrun-{name}-{}-task.ps1", std::process::id()));
     std::fs::write(&local, wrapper.as_bytes())?;
     let remote_wrapper = format!("{}\\{}-task.ps1", spec.staging, name);
     push(spec, &local, &remote_wrapper).await?;
@@ -621,6 +685,7 @@ pub struct TaskStatus {
 
 /// Poll a task's state and log. `log` is the path returned by [`task_start`].
 pub async fn task_status(spec: &HostSpec, name: &str, log: &str, tail_lines: usize) -> Result<TaskStatus> {
+    validate_task_name(name)?;
     let cmd = format!(
         "$ErrorActionPreference='Continue'\n\
          $t = Get-ScheduledTask -TaskName {name} -ErrorAction SilentlyContinue\n\
@@ -669,6 +734,7 @@ pub async fn task_status(spec: &HostSpec, name: &str, log: &str, tail_lines: usi
 
 /// Unregister a task (idempotent).
 pub async fn task_kill(spec: &HostSpec, name: &str) -> Result<()> {
+    validate_task_name(name)?;
     let cmd = format!(
         "Unregister-ScheduledTask -TaskName {} -Confirm:$false -ErrorAction SilentlyContinue; Write-Output 'WINRUN_KILLED'",
         lit(name)
@@ -748,7 +814,7 @@ async fn run_shipped(
     timeout_secs: u64,
 ) -> Result<String> {
     ensure_staging(spec).await?;
-    let local = std::env::temp_dir().join(format!("winrun-{}-{}", spec.name, name));
+    let local = std::env::temp_dir().join(format!("winrun-{}-{}-{}", spec.name, std::process::id(), name));
     std::fs::write(&local, script.as_bytes())?;
     let remote = format!("{}\\{}", spec.staging, name);
     push(spec, &local, &remote).await?;
@@ -758,10 +824,15 @@ async fn run_shipped(
         spec.powershell_arg(),
         quoted_path_with_args(&remote, args)
     );
-    let out = run_command(spec, &command, None, &[], Purpose::System, timeout_secs).await?;
-    if !out.stdout.contains("WINRUN_JSON_BEGIN") {
+    // preflight answers a BUILD question (can this account read the repo and see
+    // the toolchain), so it must run under build principals, not session 0.
+    let purpose = if name == "preflight.ps1" { Purpose::Build } else { Purpose::System };
+    let out = run_command(spec, &command, None, &[], purpose, timeout_secs).await?;
+    // Both markers, and the payload must parse: a script that dies between them
+    // must not hand back "the whole stdout" as if it were JSON.
+    if !out.stdout.contains("WINRUN_JSON_BEGIN") || !out.stdout.contains("WINRUN_JSON_END") {
         bail!(
-            "{} on {} produced no JSON envelope (exit {:?}):\n{}\n{}",
+            "{} on {} produced no complete JSON envelope (exit {:?}):\n{}\n{}",
             name,
             spec.name,
             out.code,
@@ -769,7 +840,14 @@ async fn run_shipped(
             out.stderr.trim()
         );
     }
-    Ok(extract_json(&out.stdout))
+    let json = extract_json(&out.stdout);
+    if let Err(e) = serde_json::from_str::<serde_json::Value>(&json) {
+        bail!("{name} on {} produced invalid JSON ({e})", spec.name);
+    }
+    if out.code != Some(0) {
+        bail!("{} on {} exited {:?} despite emitting JSON", name, spec.name, out.code);
+    }
+    Ok(json)
 }
 
 /// Pull the JSON out of the `WINRUN_JSON_BEGIN/END` envelope the host scripts
@@ -944,6 +1022,58 @@ mod tests {
         let argv = quoted_path_with_args(r"C:\s.ps1", &["-Role".into(), "vm".into()]);
         assert_eq!(argv, r"'C:\s.ps1' '-Role' 'vm'");
         assert!(!argv.contains("'-Role vm'"));
+    }
+
+    #[test]
+    fn task_names_are_whitelisted_not_escaped() {
+        // A name reaches a log path, a temp file, a remote wrapper path and the
+        // scheduled-task -Argument string. A quote truncates the argument and
+        // `..\` escapes staging, so neither may be accepted.
+        for good in ["winrun-smoke", "winrun-uv1-hold0-1", "A.b_c-1"] {
+            assert!(validate_task_name(good).is_ok(), "{good}");
+        }
+        for bad in ["", "has space", "quote\"here", r"..\escape", "semi;colon", "a/b"] {
+            assert!(validate_task_name(bad).is_err(), "{bad}");
+        }
+        assert!(validate_task_name(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn desktop_refusal_writes_the_exit_marker_and_fails_closed() {
+        // Review finding: the guard exited 87 WITHOUT the marker, and a caller that
+        // treated a missing marker as "not failed" then read a refusal as success.
+        let w = task_wrapper("payload", r"C:\l.log", Purpose::Desktop, spec("vm"));
+        assert!(w.contains("WINRUN_EXIT=87"), "the refusal must leave a marker");
+        // Fail closed: an unreadable session is not evidence of an interactive one.
+        assert!(w.contains("catch { $session = 0 }"));
+        assert!(w.contains("Add-Content -LiteralPath 'C:\\l.log'"));
+        // And the payload can assert what it was promised.
+        assert!(w.contains("$env:WINRUN_EXPECT_SESSION = '1'"));
+        assert!(w.contains("$env:WINRUN_PURPOSE = 'desktop'"));
+    }
+
+    #[test]
+    fn build_path_filters_msys2_out_of_the_inherited_path() {
+        // Review finding: appending Machine/User PATH unfiltered left
+        // msys64\usr\bin\git.exe able to shadow Windows Git, so the guarantee held
+        // only by luck of that machine's PATH.
+        let snippet = spec("slave").build_path_snippet();
+        assert!(snippet.contains("msys64.*usr\\bin"), "{snippet}");
+        assert!(snippet.contains(r"C:\helios\llvm-22.1.8\bin"), "{snippet}");
+        // PATH must be set BEFORE the safe.directory snippet runs git.
+        let body = shell_body("cargo build", r"C:\src", &[], Purpose::Build, spec("slave"));
+        let path_at = body.find("$env:PATH").unwrap();
+        let safe_at = body.find("safe.directory").unwrap();
+        assert!(path_at < safe_at, "PATH must be curated before git is called");
+    }
+
+    #[test]
+    fn env_keys_must_be_identifiers() {
+        assert!(valid_env_key("GOOD_VAR1"));
+        assert!(!valid_env_key("A B"));
+        assert!(!valid_env_key("A;X"));
+        assert!(!valid_env_key("1LEADING"));
+        assert!(!valid_env_key(""));
     }
 
     #[test]

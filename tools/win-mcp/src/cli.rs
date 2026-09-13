@@ -311,8 +311,12 @@ async fn dispatch(raw: Vec<String>) -> Result<i32> {
                     );
                     if args.json {
                         println!(
-                            "{{\"task\":\"{}\",\"state\":\"{}\",\"log\":\"{}\"}}",
-                            started.name, started.state, started.log
+                            "{}",
+                            serde_json::json!({
+                                "task": started.name,
+                                "state": started.state,
+                                "log": started.log,
+                            })
                         );
                     }
                     Ok(0)
@@ -328,14 +332,18 @@ async fn dispatch(raw: Vec<String>) -> Result<i32> {
                     let tail: usize = args.opt("tail").unwrap_or("40").parse()?;
                     let st = host::task_status(spec, name, &log, tail).await?;
                     if args.json {
+                        // serde_json, not format!: a Windows log path carries
+                        // backslashes that make hand-built JSON invalid.
                         println!(
-                            "{{\"exists\":{},\"state\":\"{}\",\"last_result\":{},\"log_exists\":{},\"exit_marker\":{},\"log\":\"{}\"}}",
-                            st.exists,
-                            st.state,
-                            st.last_result.map(|v| v.to_string()).unwrap_or("null".into()),
-                            st.log_exists,
-                            st.exit_marker.map(|v| v.to_string()).unwrap_or("null".into()),
-                            log
+                            "{}",
+                            serde_json::json!({
+                                "exists": st.exists,
+                                "state": st.state,
+                                "last_result": st.last_result,
+                                "log_exists": st.log_exists,
+                                "exit_marker": st.exit_marker,
+                                "log": log,
+                            })
                         );
                     } else {
                         println!(
@@ -350,12 +358,18 @@ async fn dispatch(raw: Vec<String>) -> Result<i32> {
                             println!("--- log tail ({log}) ---\n{}", st.log_tail);
                         }
                     }
-                    // A finished task with a non-zero WINRUN_EXIT marker is a failure.
-                    let ok = !st.exists
-                        || st.exit_marker.is_none()
-                        || st.exit_marker == Some(0)
-                        || st.last_result == Some(0);
-                    Ok(if ok { 0 } else { 1 })
+                    // A MISSING exit marker is NOT success: the desktop guard
+                    // refuses before the payload runs, and a task whose principal
+                    // never started writes no marker either. Success is exactly
+                    // "finished, last result 0, marker 0". Running gets its own code
+                    // so a poller can tell "wait" from "failed".
+                    if !st.exists {
+                        return Ok(1);
+                    }
+                    if st.state.eq_ignore_ascii_case("running") {
+                        return Ok(2);
+                    }
+                    Ok(if st.exit_marker == Some(0) && st.last_result == Some(0) { 0 } else { 1 })
                 }
                 "kill" => {
                     let name = args
