@@ -82,6 +82,10 @@ extern "C" HRESULT helios_vkd3d_clear_root_arguments(ID3D12GraphicsCommandList* 
 // collide with the SDK's (see vkd3d_bridge.h's header rule).
 extern "C" void* vkd3d_acquire_vk_queue(ID3D12CommandQueue* queue);
 extern "C" void vkd3d_release_vk_queue(ID3D12CommandQueue* queue);
+// The LOCK/UNLOCK pair the diagnostic mode-2 arm uses to obtain the handle
+// without running the drain marker (`include/vkd3d.h:128-129`).
+extern "C" void* vkd3d_lock_vk_queue(ID3D12CommandQueue* queue);
+extern "C" void vkd3d_unlock_vk_queue(ID3D12CommandQueue* queue);
 // Same SDK/widl COM ABI as the public pipeline factory; the separate symbol
 // supplies SO origin without reserving a legal application semantic name.
 extern "C" HRESULT helios_vkd3d_create_stream_output_pipeline(ID3D12Device* device,
@@ -1102,7 +1106,26 @@ std::int32_t helios_vkd3d_bridge_copy_tiles(std::size_t queue, std::size_t dst,
   });
 }
 
-std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue) noexcept {
+/* `mode` is `Umd12GpuFenceMode` (knobs12) and exists to split ONE measurement:
+ * which half of this sequence stalls the first D3D12 `ExecuteCommandLists`.
+ * Measured 2026-09-13 on `.284` (fence ON, interval 0): the UMD12 log stops
+ * growing inside that first ECL, immediately after this bridge resolved the ICD
+ * module, and never resumes — while the same binary with the whole fetch skipped
+ * (`Umd12GpuFence=0`) passes `allocator` in 2.19 s. The engine's own ECL runs in
+ * BOTH arms, so the difference is everything below, and there are exactly two
+ * candidates: the drain handshake and the escape.
+ *
+ *   0 (default) full: drain, then the escape.
+ *   1 drain only: run the drain, skip the escape. Returns 0, i.e. no boundary —
+ *     so a stall here convicts `vkd3d_acquire_vk_queue`/`vkd3d_release_vk_queue`.
+ *   2 escape only: obtain the handle with the lock/unlock pair (NO drain marker)
+ *     and escape. Weaker than mode 0 on purpose — the fence then covers work the
+ *     caller cannot prove reached the host — so a stall here convicts the escape,
+ *     and a pass here with a stall in 0/1 convicts the drain.
+ *
+ * ⛔ DIAGNOSTIC SCAFFOLDING: delete this parameter, mode 2 and the lock/unlock
+ * declarations in the commit that lands the real fix. */
+std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue, std::uint32_t mode) noexcept {
   if (!queue) return 0;
   const QueueGpuFenceExport& resolved = queue_gpu_fence_export();
   if (!resolved.fn) return 0;
@@ -1129,9 +1152,17 @@ std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue) noexcept {
    * progress on the same queue is a self-deadlock. The ICD takes no dev_mutex
    * here by design, so it is callable unlocked — and this is the only place a
    * D3D12 packet's retire boundary is minted. */
-  void* vk_queue = vkd3d_acquire_vk_queue(command_queue);
+  void* vk_queue;
+  if (mode == 2) {
+    vk_queue = vkd3d_lock_vk_queue(command_queue);
+    vkd3d_unlock_vk_queue(command_queue);
+  } else {
+    vk_queue = vkd3d_acquire_vk_queue(command_queue);
+    if (!vk_queue) return 0;
+    vkd3d_release_vk_queue(command_queue);
+  }
   if (!vk_queue) return 0;
-  vkd3d_release_vk_queue(command_queue);
+  if (mode == 1) return 0;
 
   std::uint64_t fence = 0;
   // A refusal leaves `fence` at 0 and is not an error: the KMD treats 0 as "no

@@ -153,6 +153,18 @@ pub(crate) static UMD12_GPU_FENCE: BoolKnob = BoolKnob::new(c"Umd12GpuFence", tr
 pub(crate) static UMD12_GPU_FENCE_INTERVAL_MS: DwordKnob =
     DwordKnob::new(c"Umd12GpuFenceIntervalMs", 0);
 
+/// **WHICH HALF of the mint runs. Diagnostic; see the table in
+/// `umd12/bridge/vkd3d_bridge.cpp`.** 0 = full (drain then escape). 1 = drain
+/// only, no escape (returns 0 = no boundary). 2 = escape only, no drain marker.
+///
+/// ⛔ One question, asked once: the first `ExecuteCommandLists` stalls inside the
+/// mint (`umd12-<pid>.log` stops growing right after the ICD module line) while
+/// `Umd12GpuFence=0` passes `allocator` in 2.19 s on the same binary and boot.
+/// The engine's own ECL runs in both arms, so the stall is the drain handshake or
+/// the escape, and this knob is the split. ⛔ DELETE IT in the commit that lands
+/// the real fix — an arm that outlives its question is scaffolding.
+pub(crate) static UMD12_GPU_FENCE_MODE: DwordKnob = DwordKnob::new(c"Umd12GpuFenceMode", 0);
+
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12Trace` (REG_DWORD) != 0, forcing its
 /// `OnceLock`. Read once per process.
 ///
@@ -184,6 +196,12 @@ pub(crate) fn umd12_gpu_fence() -> bool {
 /// its `OnceLock`. 0 = unlimited; see [`UMD12_GPU_FENCE_INTERVAL_MS`].
 pub(crate) fn umd12_gpu_fence_interval_ms() -> u32 {
     UMD12_GPU_FENCE_INTERVAL_MS.get()
+}
+
+/// Resolve `HKLM\SOFTWARE\Helios!Umd12GpuFenceMode` (REG_DWORD). See
+/// [`UMD12_GPU_FENCE_MODE`].
+pub(crate) fn umd12_gpu_fence_mode() -> u32 {
+    UMD12_GPU_FENCE_MODE.get()
 }
 
 /// The largest delay either diagnostic arm below will honour, in microseconds.
@@ -354,7 +372,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 12] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -377,5 +395,6 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
         // site would not have used.
         ("Umd12GpuFence", umd12_gpu_fence() as u32),
         ("Umd12GpuFenceIntervalMs", umd12_gpu_fence_interval_ms()),
+        ("Umd12GpuFenceMode", umd12_gpu_fence_mode()),
     ]
 }

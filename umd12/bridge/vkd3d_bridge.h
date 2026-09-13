@@ -41,9 +41,13 @@ struct HeliosVkd3dDeviceImpl;
 // configuration, the export name is the ABI — through the same anchor path as
 // `memory_identity_exports`, and cached for the process lifetime.
 //
-// `queue` is an `ID3D12CommandQueue*` as a `std::size_t`. Acquires and releases
-// the engine's queue lock around the escape.
-std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue) noexcept;
+// `queue` is an `ID3D12CommandQueue*` as a `std::size_t`. Takes and releases the
+// engine's queue lock to run the submission drain, then escapes WITHOUT the lock.
+//
+// `mode` is `Umd12GpuFenceMode`: 0 full (drain then escape), 1 drain only (no
+// escape, returns 0), 2 escape only (no drain marker). ⛔ DIAGNOSTIC — see the
+// table at the definition; delete with the fix.
+std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue, std::uint32_t mode) noexcept;
 
 struct HeliosVkd3dDevice {
   HeliosVkd3dDevice() noexcept;

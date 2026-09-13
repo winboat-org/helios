@@ -82,7 +82,7 @@ mod ffi {
         /// # Safety
         /// `queue` is an `ID3D12CommandQueue*` owned by the engine and alive for
         /// the call; the bridge acquires and releases the engine's queue lock.
-        unsafe fn helios_umd12_queue_gpu_fence(queue: usize) -> u64;
+        unsafe fn helios_umd12_queue_gpu_fence(queue: usize, mode: u32) -> u64;
 
         /// The venus context id this device's `VkInstance` belongs to (S4b),
         /// captured at create time on the creating thread. 0 if the ICD is
@@ -777,9 +777,10 @@ pub(crate) unsafe fn queue_gpu_fence(queue: usize) -> u64 {
         return 0;
     }
     let interval_ms = crate::knobs12::umd12_gpu_fence_interval_ms();
+    let mode = crate::knobs12::umd12_gpu_fence_mode();
     if interval_ms == 0 {
         // SAFETY: forwarded live queue; the bridge owns the escape's ordering.
-        return unsafe { ffi::helios_umd12_queue_gpu_fence(queue) };
+        return unsafe { ffi::helios_umd12_queue_gpu_fence(queue, mode) };
     }
     // ⛔ THE THROTTLE, and the reason it is here rather than in the ICD: the ICD
     // export is one escape AND one wire fence that stays in flight until host GPU
@@ -807,7 +808,7 @@ pub(crate) unsafe fn queue_gpu_fence(queue: usize) -> u64 {
         return LAST_FENCE.load(Ordering::Relaxed);
     }
     // SAFETY: forwarded live queue; the bridge owns the escape's ordering.
-    let fence = unsafe { ffi::helios_umd12_queue_gpu_fence(queue) };
+    let fence = unsafe { ffi::helios_umd12_queue_gpu_fence(queue, mode) };
     if fence != 0 {
         // Publish the fence BEFORE the stamp that makes it reusable: a thread that
         // observes a fresh stamp must observe a fence that has already been stored,
