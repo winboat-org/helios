@@ -253,9 +253,7 @@ void umd_log(const char* msg) {
   }
 }
 
-}  // namespace
-
- helios_bridge
+}  // namespace helios_bridge
 
 using helios_bridge::umd_log;
 
