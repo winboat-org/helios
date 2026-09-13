@@ -961,18 +961,28 @@ admission, and after execution submits an `ALL_COMMANDS` signal on that exact st
 That is host-ordered completion with no sampling and no GPU-idle wait, and it already
 passed the four native ordering cases on `.270`.
 
-⛔ **THE CONCRETE GAP, and the thing to verify before writing any code:** in
-`note_wddm_submission` the packet's `(watermark, wire_boundary)` is chosen entirely
-from the WIRE-FENCE namespace — the guest's `gpu_wire_fence` when present, else
-`(next_wire_fence, WireBoundary::Prefix)` — while the record's stream value
-(`stream_boundary`) feeds only the retire DOMAIN and the windowed-BLT admit
-(`admit_windowed_blt_prefix`). So a D3D12 ECL packet's watermark never names the
-stream value that the engine will signal for it. Because that work is submitted
-*after* admission by design, the packet retires on a boundary that cannot include its
-own work: the early fence, exactly. ⇒ The next change is to make the D3D12 ECL
-packet's dependency the reserved stream value (decision logic in `kmd_logic` with its
-unit tests, since `kmd_render` cannot host them), then re-run the 2x3 oracle, the
-suite, and the timing check. No part of this section's lever is a prerequisite.
+⛔⛔ **CORRECTION (2026-09-13, same day, after reading the wiring): the stream gate
+already exists AND is armed for a D3D12 ECL packet.** `decode_execution_boundary`
+(`submit_command.rs:667`) returns the record's `boundary_for(execution_stream)`, and
+`note_and_maybe_signal` sets `exact_execution = true` plus
+`execution_boundary_value = Some(boundary)` for it; `note_wddm_submission` turns that
+into `execution: Option<execution_completion::Wait>`, and `take_one_ready_wddm`'s FIRST
+check blocks the head on it while `!wait.completed()`, counting `WfBStrm`. So the
+earlier claim in this section — "the packet's watermark never names the stream value" —
+is **wrong**: the *wire* watermark is separate, but the *execution* gate is exactly the
+stream value. Do not act on that claim.
+
+⇒ **The narrowed, still-open question is what ADVANCES that value.** `Wait::observe`
+completes when `retired_value >= value` for the same stream handle, and the only writer
+is `complete_present_stream_gpu`, whose own doc calls its trigger *"the exact successful
+queue-marker response"* (i.e. the host's used-ring/queue-marker receipt). ⛔ If that
+receipt is a DECODE-level acknowledgement of the submission rather than GPU completion
+of it, the gate is satisfied microseconds after submission — which is exactly the
+measured symptom (`stream-output`/`allocator` fences advancing in ~1 us while the pixels
+land later, and the UV1 reading where a KMD-side hold moves the app's wait). **The next
+step is therefore to establish what that response means on ring>=1 and, if it is decode,
+to make the completion the host's GPU-retire signal for the registered stream** — not to
+add a gate that is already there.
 
 | # | Item | Where | Size | Class |
 |---|---|---|---|---|

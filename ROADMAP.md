@@ -203,16 +203,23 @@ One defect that admission had been hiding remains open:
   deleted, and the record keeps its v3 shape with a zero.
   ⛔⛔ **And the plan that stood here — "mint from the ENGINE's submission thread" — was
   the wrong path too**, for the reason `EXECUTION_SYNC.md` states outright: a *sampled*
-  wire fence can precede worker execution, so no mint site rescues it. **The ordered edge
-  this driver already implements is the registered producer stream** (value reserved in
-  the same FIFO commit as the work, carried on `HeliosD3D12SubmitCmd`, signalled
-  `ALL_COMMANDS` after execution — host-ordered, not sampled; it passed the four native
-  ordering cases on `.270`). ⇒ Next change: the D3D12 ECL packet's dependency must name
-  that stream value. Today `note_wddm_submission` picks `(watermark, wire_boundary)` only
-  from the wire-fence namespace while `stream_boundary` feeds just the retire domain and
-  the windowed-BLT admit — so the packet retires on a boundary that cannot include its
-  own work, which is submitted *after* admission by design. Decision logic goes in
-  `kmd_logic` with unit tests (`kmd_render` cannot host them).
+  wire fence can precede worker execution, so no mint site rescues it.
+  ⛔⛔ **AND SO WAS THE REPLACEMENT PLAN IN THE PREVIOUS VERSION OF THIS PARAGRAPH.** Reading
+  the wiring (`submit_command.rs:667` → `note_and_maybe_signal` →
+  `note_wddm_submission`, then `take_one_ready_wddm`'s first check) shows the stream gate
+  **already exists and is armed**: a D3D12 ECL packet carries `exact_execution = true`
+  with `execution_boundary_value = Some(record.boundary_for(execution_stream))`, the KMD
+  stores it as `execution: Option<Wait>`, and the FIFO head blocks on it while
+  `!wait.completed()`, counted as `WfBStrm`. Nothing needs adding.
+  ⇒ **The actual open question is what ADVANCES that value.** `Wait::observe` completes on
+  `retired_value >= value` for the same stream handle, and the sole writer is
+  `complete_present_stream_gpu`, whose doc names its trigger *"the exact successful
+  queue-marker response"* — the host's used-ring/queue-marker receipt. If that is a
+  DECODE-level ack of the submission rather than GPU completion of it, the gate is
+  satisfied ~microseconds after submission, which is precisely the measured symptom
+  (fences advancing in ~1 us while the pixels land later, and UV1's KMD-side hold moving
+  the app's wait). Next step: establish what that response means on ring>=1 and, if it is
+  decode, make the registered stream's completion the host's GPU-retire signal.
   ⚠ Still owed before any claim: the `allocator` failure rate over ≥10 runs against
   the `.281` 4-of-10 baseline, `WtOut`=0, `QfRet`=0, `WfBWire` flat, and the rest of the
   suite (`tiled`, `raytracing`, `stream-output`).
