@@ -138,9 +138,9 @@ driver regression). See TOOLCHAIN.md and ROADMAP.md tooling.
 **Standing VM authorization (owner directive, 2026-09-12):** start, stop, restart,
 cold-boot or reboot the test VM and build slave whenever needed for Helios work.
 This includes changing and relaunching the VM, its QEMU
-display/debug transport and its environment variables — which for the test VM means the
-**WinBoat compose project** (see "Test environment" below), NOT the retired
-`tools/launch-helios-gtk.sh` bare-GTK launcher. Do not pause for
+display/debug transport and its environment variables — which on this host means the
+**WinBoat container** (see "Test environment" below); the retired
+`tools/launch-helios-gtk.sh` bare-GTK launcher is dead. Do not pause for
 approval or require the owner to be present; the owner is often AFK. This
 authorization supersedes older approval requirements in the project docs.
 Document launch changes, report disruptive restarts, and verify guest health and
@@ -149,11 +149,14 @@ when a full guest reboot is unnecessary.
 
 ---
 
-## Test environment (read this before touching the VM)
+## Test environment
 
-⚠ **The Win11 test target is not a bare QEMU process on this host — it is a container**, and
-this section exists because an agent that assumed otherwise lost time on 2026-09-13 (it read
-the old "QEMU/KVM on a Linux host" line here and never inspected the host).
+⚠ **The test VM is contributor-specific, and on this host it is a container.** Helios itself is
+*part of* WinBoat upstream, but WinBoat is only one way to run the guest — other contributors
+run their own QEMU/KVM VM, and the driver does not depend on WinBoat. So: environment facts
+belong in this section, not in code, scripts or probe arguments, and nothing here should be
+assumed to hold on someone else's machine. This snapshot is what this host is actually running
+(written after an agent assumed a bare QEMU process and lost time on 2026-09-13).
 
 | | |
 |---|---|
