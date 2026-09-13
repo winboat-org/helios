@@ -116,8 +116,25 @@ One defect that admission had been hiding remains open:
   remains unproven and must be gated: that the D3D12 queue's `ring_idx` is ≥ 1 in
   practice. If it is not, the export refuses, the wire stays 0 and the fix is inert
   — which is what the nonzero-fence counter in piece (4) exists to catch.
-  **Next (the fix this licenses) — four pieces, in dependency order.** (1) the
-  producer: call `helios_venus_queue_gpu_fence` per submission and get the wire
+  **Piece (1) LANDED (`5d81437` + `c94e299`), compiling on the slave
+  (`C:\src\out\kf-20260913\driver`, INF valid) and deliberately inert:**
+  `HeliosD3D12SubmitCmd` is version 3 with `gpu_wire_fence` appended (24 → 32 bytes,
+  24-byte prefix unchanged, `HeliosD3D12SubmitCmdV2` still readable and widened
+  with a zero fence so a process holding the previous package's UMD is not broken);
+  `kmd_logic::execution_completion::Record` carries the fence (16 → 24 bytes, with
+  `with_gpu_wire_fence` = max and `gpu_wire_fence_for` requiring a valid boundary
+  for that stream — deliberately NOT merged into `boundary`); `Render` accepts both
+  record lengths; `decode_execution_boundary` returns the worker boundary plus the
+  fence; `note_and_maybe_signal` gates the packet on it and falls back to Present's
+  BLT marker; and `D12Fnc`/`D12Fn0` count records that did and did not carry a
+  nonzero fence. `PRESENT_DMA_PRIVATE_DATA_BYTES` 104 → 112 (88 + 24, still pinned
+  to the record by the existing assert). 217 `kmd_logic` + 14 `protocol` tests pass.
+  ⭐ **There are THREE producers that must each carry the fence, not two:**
+  `umd12/src/forward12/queue.rs` twice (ExecuteCommandLists and the Present producer
+  packet) **and `umd12/src/forward12/tiles.rs` (tile mappings)** — the last one is
+  the sparse path this stage already fixed, it was missed by a grep scoped to
+  queue.rs, and the slave build caught it as an E0061.
+  (2) the producer: call `helios_venus_queue_gpu_fence` per submission and get the wire
   fence back to whoever fills the D3D12 record. The ICD export exists and is
   uncalled; the caller must hold a `VkQueue`, so this lands in the engine
   (`vkd3d-proton-helios`) with an interop accessor the UMD12 reads. (2) the wire
