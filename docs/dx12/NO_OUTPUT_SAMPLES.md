@@ -103,5 +103,8 @@ entry specifically; the alternative is not claiming FL12_1 at all.
 Consequences for the charter: the native suite's other three failures
 (`stream-output` "32-bit counter guards overwritten", `raytracing` "uncompacted
 current/prebuild size agreement", and the `tiling-buffer` 0xC0000005 crash) were
-previously unreachable behind the admission block and are now open defects.
+previously unreachable behind the admission block and are now open defects. The
+`raytracing` one was fixed in `22.22.280.0`; it turned out to be a D3D12/host
+quantity mismatch rather than an admission consequence, see
+[ACCELERATION_STRUCTURE_CURRENT_SIZE.md](ACCELERATION_STRUCTURE_CURRENT_SIZE.md).
 

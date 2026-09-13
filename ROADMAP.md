@@ -30,7 +30,12 @@ images verified, `oem26.inf`, Code 0, DWM on the hardware stack. The native D3D1
 suite moved `adapter` and `allocator` from FAIL to PASS and unblocked
 `raytracing`, which now reports `CAP,NativeFL12_1Admission,00000000`.
 
-Three defects that admission had been hiding are now open:
+Package 22.22.280.0 (`ef9c6586`) then fixed the first of the three defects
+admission had exposed — the `raytracing` size disagreement — and is installed on
+the guest as `oem27.inf`, Code 0, DWM on the hardware stack. Suites on `.280`:
+`raytracing` PASS, every other case unchanged from `.279`.
+
+Two defects that admission had been hiding remain open:
 - `stream-output`: **the D3D12 `ExecuteCommandLists` path retires its WDDM DMA
   packet on Venus *worker* completion, not on host GPU completion.** A raw stride
   dump shows a correct 32-byte stride with gap and padding intact on a passing
@@ -56,30 +61,36 @@ Three defects that admission had been hiding are now open:
   it to `note_wddm_submission` as `gpu_completion_fence` so the existing
   `wddm_boundary::select` D3D12 arm gates the DMA packet on host completion.
   Today nothing calls that export and the record has no field for it.
-- `raytracing` FAIL "uncompacted current/prebuild size agreement", after four
-  passing stages. **Measured with a diagnostic probe build** that dumps the raw
-  postbuild-info buffer (`tools/d3d12_raytracing_probe.cpp`, local only):
+- ~~`raytracing` FAIL "uncompacted current/prebuild size agreement"~~ — **FIXED in
+  22.22.280.0 (`ef9c6586`); design record `docs/dx12/ACCELERATION_STRUCTURE_CURRENT_SIZE.md`.**
+  It was never a D3D12 admission problem: `CURRENT_SIZE` was answered with
+  `VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR`, and RADV's `bvh/header.comp`
+  reports the packed size **plus the 128-byte serialization-header alignment
+  padding**, a quantity that for a small structure exceeds the prebuild
+  requirement and for a compacted or cloned one exceeds the allocation itself.
+  Measured on bare RADV in the WinBoat container (Mesa 25.0.7, RX 6600, no Venus
+  or guest in the loop) with `tools/host_as_size_probe.c`, which reproduces the
+  guest's 72/72/56-byte deltas exactly. The engine now records the D3D12 answer
+  per structure — through the same helper the prebuild uses, so the two cannot
+  disagree — and replays it: built structures get the recorded constant,
+  compacted and cloned ones follow the `COMPACTED_SIZE` query, and unrecorded
+  (deserialized) ones keep the old host fallback. Cost: one extra
+  `vkGetAccelerationStructureBuildSizesKHR` (a synchronous Venus round trip) per
+  D3D12 AS build; a content-keyed prebuild cache is the follow-up if that ever
+  shows up in a profile.
+  Original characterisation, kept for provenance: the check is a legitimate D3D12
+  invariant — an uncompacted structure's `CURRENT_SIZE` **is** the
+  `ResultDataMaxSizeInBytes` prebuild reported, not merely at most it — and the
+  diagnostic probe build that dumped the raw postbuild-info buffer reported
   ```
   compacted [320, 320, 0]   current [392, 392, 568]   prebuild max [320, 320, 512]
   ```
-  The check is a legitimate D3D12 invariant — an uncompacted structure's
-  `CURRENT_SIZE` may not exceed `ResultDataMaxSizeInBytes` — and it is violated
-  in the **opposite** direction from a benign difference: current *exceeds* max
-  by 72/72/56 bytes for the two BLAS and the TLAS. Both numbers are Vulkan's:
-  the prebuild is `vkGetAccelerationStructureBuildSizesKHR`'s
-  `accelerationStructureSize` (`device.c:8993`), and current is
-  `VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR` on the built structure
-  (`acceleration_structure.c:459`). The guest ICD translates that query
-  correctly and forwards it (`vn_query_pool.c:103`), and vkd3d's prebuild and
-  build both derive from `vkd3d_acceleration_structure_convert_inputs`, so the
-  two host answers disagree for identical geometry. Note also that the BLAS
-  *compacted* size equals the prebuild max (320), which compaction should not
-  leave unchanged. Attribution needs a host-side (non-Venus) probe against RADV
-  in the WinBoat container; that is the next step, and it decides whether the fix
-  belongs in the ICD/engine or is a host-driver inconsistency. A defensible
-  engine-side fix exists if the host query is at fault: D3D12's uncompacted
-  `CURRENT_SIZE` is the size the structure was built with, which the engine
-  already knows, so it can be produced without the Vulkan size query.
+  Both numbers come from Vulkan: the prebuild is
+  `vkGetAccelerationStructureBuildSizesKHR`'s `accelerationStructureSize`
+  (`device.c:8993`) and current was `VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR`
+  (`acceleration_structure.c:459`). The guest ICD translated that query correctly
+  and forwarded it (`vn_query_pool.c:103`), which is what the host-side probe then
+  confirmed: the disagreement is in the host's answer, not in the translation.
 - `tiled` `tiling-buffer` now runs (`TiledResourcesTier` reports 2, not 1) and
   crashes with 0xC0000005. **Localised with a WER mini dump** (dumps enabled for
   `d3d12_tiled_probe.exe`, captured, then removed): the fault is a read at
@@ -106,7 +117,22 @@ so a 16x no-output PSO is accepted but produces 8-sample coverage. That is the
 documented boundary, not an implementation error.
 
 Evidence: `tmp/integration-20260912/` (`verify-loaded279.json`, `results279.txt`,
-`nooutput-task.out`, `driver279-build.log`, `assemble279.log`).
+`nooutput-task.out`, `driver279-build.log`, `assemble279.log`) for `.279`, and
+`tmp/rtas-size-20260913/` for the `.280` CURRENT_SIZE fix
+(`helios-windows-x64-22.22.280.0-ef9c6586.zip` sha256
+`ef77e4cf0ab16e43fcefa47c5f891e8527d8a3439c6b37b066270e5282eb7f5e`,
+`evidence/verify-loaded280.out`, `evidence/raytracing/`,
+`evidence/verdict-*.txt`, `evidence/recover280.log`, `build280c.log`,
+`assemble280b.log`; host-side attribution output and the probe source are
+`tools/host_as_size_probe.c`).
+
+The `.280` install is the same package flow as `.279`, with one wrinkle worth
+recording: the ring-3 upgrade driven from a scheduled task was killed by
+`STATUS_CONTROL_C_EXIT` at the `pnputil /add-driver` step (a console control
+event during the display-driver swap), which left `install-state.json` written
+but incomplete. Recovery is the documented path — `Uninstall-Helios.ps1
+-KeepDriver`, then `Install-Helios.ps1` — run as `SYSTEM` in session 0 so no
+console event can interrupt it (`tmp/rtas-size-20260913/recover280.ps1`).
 
 ## Combined DX12/WoW64 integration, 2026-09-12
 
