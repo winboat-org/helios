@@ -2,16 +2,20 @@
 
 ## PassMark DX11 timer resolution, 2026-09-12
 
-The local WinBoat guest now runs signed **22.22.276.0**, with a measured DX11
+The signed **22.22.276.0** WinBoat acceptance run measured a DX11
 improvement: alternating disabled/default-enabled runs score **11.4 / 20.6 /
 10.9 / 21.1**. The means are **11.15 → 20.85 (+87.0%)**; individual paired gains
 are +80.7% and +93.6%. This is four completed runs, not a confidence interval or
-a native-GPU performance claim. PassMark DX12's stateful command-signature
-refusal remains open; this change does not implement device-generated commands.
+a native-GPU performance claim. On that pre-integration stack, PassMark DX12
+still refused stateful command signatures. The combined native DGC stack is
+tracked separately in ROADMAP.md.
 
-This machine has a Ryzen 5 5600 and Radeon RX 6600 (RADV NAVI23, host Mesa
-26.2.2), with four guest vCPUs and 12 GB RAM. It is a separate configuration
-from the earlier 3DMark measurements below. The actual workload is the **32-bit
+This machine has a Ryzen 5 5600 and Radeon RX 6600 (RADV NAVI23), with four
+guest vCPUs and 12 GB RAM. The active WinBoat renderer uses Debian Mesa
+25.0.7; the previously recorded 26.2.2 belongs to the outer Fedora installation.
+The container package and mapped RADV library were checked during integration.
+This is a separate configuration from the earlier 3DMark measurements below.
+The actual workload is the **32-bit
 `PT-D3D11Test.exe`** launched by PerformanceTest64 in interactive session 2.
 The 1280×800 desktop and benchmark settings stayed fixed. These reported
 PassMark results include its low-resolution penalty; the live scene displays

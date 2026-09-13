@@ -1576,6 +1576,32 @@ manifest entries/signing-certificate checks passed. The package records actual
 tool versions, including LLVM 22.1.8, Meson 1.12.0 and widl 11.12; this is a
 build-box validation, not a new Helios GPU/runtime acceptance result.
 
+The same package is installed in the local WinBoat guest as `oem21.inf`,
+upgrading 22.22.259.0. After the owner-approved reboot, Windows reports the
+active Helios driver as 22.22.270.0 with status OK, and package verification
+passes. Interactive rendering acceptance remains pending a desktop login;
+`quser` reports no logged-in user, so session-0 graphics probes were not run.
+Payload verification and DriverStore hashes for the KMD and both UMDs pass,
+the device reports Code 0, and UMD12 occupies `UserModeDriverName[3]` with no
+`UmdD3D12` override. No Compose changes were needed. The prior installation and
+exported driver are backed up under
+`C:\ProgramData\HeliosDeployBackups\before-dx12-20260907`.
+This upgrade exposed a prerequisite bug: bundled VC runtime 14.44.35211.0
+rejects installed 14.51.36247.0 with error 1638. The installer now checks the
+registered x64 runtime version and keeps an equal or newer installation;
+the successful retry exercised this path. Guest installation logs are under
+`C:\Users\Tibix\HeliosDX12-20260907`.
+
+Local metadata refresh on 2026-09-12: after the owner-approved start/reboot,
+22.22.271.0 (`6e8de383`) is active as `oem0.inf`, named Helios vGPU, provider
+WinBoat, Code 0. Runtime registrations/hashes, five DriverStore files and 24
+trusted package signatures pass. The already-installed Resolve ADL shim was
+upgraded too. Removed unused `oem21.inf` and .259/.270 runtime leftovers
+(157,032,640 bytes); post-cleanup verification passes. Rollback is saved under
+`C:\ProgramData\HeliosDeployBackups\before-metadata-20260912`; local evidence is
+`tmp/deploy/metadata-20260912`. No user is logged in, so interactive graphics
+acceptance remains pending.
+
 The owner requested default DX12 admission and a Windows CI bundle containing
 the native D3D12 UMD. `UmdD3D12` now defaults ON; explicit DWORD `0` still
 refuses admission, and installation preserves that override. CI initializes
