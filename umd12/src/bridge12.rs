@@ -263,6 +263,7 @@ mod ffi {
 
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
@@ -756,9 +757,10 @@ pub(crate) unsafe fn execute(
 /// (`D12Fnc`/`D12Fn0`), so an inert wire is visible rather than assumed.
 ///
 /// ⚠ Cost: the export issues one SUBMIT_VENUS escape per call and its fences stay
-/// in flight until host GPU completion, so the caller must not call this per
-/// packet without checking `EscSubRing`. It acquires the engine queue lock, which
-/// is the same lock the submission drain holds.
+/// in flight until host GPU completion, so this is **rate-limited** — see
+/// [`FENCE_INTERVAL_MS`](crate::knobs12::UMD12_GPU_FENCE_INTERVAL_MS). The bridge
+/// takes and releases the engine queue lock *before* the escape (it needs the
+/// drain, not the lock), so the escape does not hold it.
 ///
 /// # Safety
 /// `queue` is an `ID3D12CommandQueue*` (as `usize`) owned by the engine and alive
@@ -774,9 +776,67 @@ pub(crate) unsafe fn queue_gpu_fence(queue: usize) -> u64 {
     if !crate::knobs12::umd12_gpu_fence() {
         return 0;
     }
+    let interval_ms = crate::knobs12::umd12_gpu_fence_interval_ms();
+    if interval_ms == 0 {
+        // SAFETY: forwarded live queue; the bridge owns the escape's ordering.
+        return unsafe { ffi::helios_umd12_queue_gpu_fence(queue) };
+    }
+    // ⛔ THE THROTTLE, and the reason it is here rather than in the ICD: the ICD
+    // export is one escape AND one wire fence that stays in flight until host GPU
+    // completion, so calling it per packet is what `helios_venus_queue_gpu_fence`'s
+    // own COST note names as the pressure limit (~1200/s) and what PENDING.md §4
+    // calls "per-fence completion unbatched". Measured 2026-09-13 on .283: with the
+    // fence per producer the `allocator` oracle never completed in 150 s, and with
+    // `Umd12GpuFence=0` (no escape at all) the same case reached a verdict.
+    //
+    // Within the interval the LAST MINTED fence is reused rather than a second one
+    // minted. That can only UNDER-order: a boundary minted earlier retires no later
+    // than one minted now, so no packet can be retired before the host work the
+    // reused fence already covers. It never over-orders, which is the direction
+    // that would signal a fence before host completion. The cost is that a packet
+    // submitted inside the window is gated on the window's opening boundary rather
+    // than on its own work — the trade the interval knob exists to expose.
+    let now = fence_clock_ms();
+    // ACQUIRE, pairing with the RELEASE stores below: a thread that reads the new
+    // stamp must also see the fence stored before it, or it would reuse a fence
+    // from an older window than the stamp claims. (Reading a stale fence is only
+    // ever an under-order, i.e. the safe direction, but there is no reason to
+    // design for it.)
+    let last_ms = LAST_MINT_MS.load(Ordering::Acquire);
+    if last_ms != 0 && now.saturating_sub(last_ms) < u64::from(interval_ms) {
+        return LAST_FENCE.load(Ordering::Relaxed);
+    }
     // SAFETY: forwarded live queue; the bridge owns the escape's ordering.
-    unsafe { ffi::helios_umd12_queue_gpu_fence(queue) }
+    let fence = unsafe { ffi::helios_umd12_queue_gpu_fence(queue) };
+    if fence != 0 {
+        // Publish the fence BEFORE the stamp that makes it reusable: a thread that
+        // observes a fresh stamp must observe a fence that has already been stored,
+        // or it would reuse a fence from an older window than the stamp claims.
+        LAST_FENCE.store(fence, Ordering::Release);
+        LAST_MINT_MS.store(now, Ordering::Release);
+    }
+    fence
 }
+
+/// Milliseconds since this process's first fence fetch.
+///
+/// ⚠ `Instant`, not wall clock: the interval is a rate, and a clock step (NTP,
+/// suspend/resume) must not be able to make a throttle window negative or
+/// arbitrarily long. `OnceLock` keeps the baseline per process, which is the
+/// scope the knob is read at.
+fn fence_clock_ms() -> u64 {
+    static CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    CLOCK.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// When the last wire fence was minted (0 = never), and which one it was.
+///
+/// ⚠ PROCESS-WIDE, deliberately: the pressure being throttled is the adapter's
+/// in-flight-fence budget, and the ICD's ring is ring-global across this device's
+/// queues (`vn_renderer_helios.c`'s `dev->primary_ring` note), so a per-queue
+/// window would multiply the escape rate by the queue count for no benefit.
+static LAST_MINT_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_FENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) unsafe fn cancel_execution(queue: usize, reason: i32) {
     // SAFETY: forwarded live queue; no reference escapes the call.

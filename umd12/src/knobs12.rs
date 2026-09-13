@@ -128,6 +128,31 @@ pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", true);
 /// `bridge12::queue_gpu_fence`).
 pub(crate) static UMD12_GPU_FENCE: BoolKnob = BoolKnob::new(c"Umd12GpuFence", true);
 
+/// **How often the D3D12 retire-boundary mint may fire, in milliseconds.** 0 =
+/// unlimited (mint one boundary per producer call, the `.282` behaviour).
+///
+/// ⛔ The measured reason this exists. `.283` kept the per-producer mint with the
+/// ordering corrected and the `allocator` oracle still did not complete in 150 s;
+/// the SAME binary with `Umd12GpuFence=0` — no escape issued at all — reached a
+/// verdict on the same guest and boot. So the cost is the fence cadence, not the
+/// ordering and not the lock: one `SUBMIT_VENUS` escape plus one
+/// in-flight-until-GPU-completion wire fence per producer call. The ICD's own
+/// COST note (`helios_venus_queue_gpu_fence`, `vn_renderer_helios.c`) names the
+/// ceiling at ~1200/s and the lever as *"rate-limiting in the CALLER (one
+/// boundary per frame)"*, which is what this value is.
+///
+/// ⚠ Within the window the last minted fence is REUSED
+/// (`bridge12::queue_gpu_fence`): monotonic, so it can only under-order — never
+/// signal a fence before host completion. The trade is that a packet inside the
+/// window is gated on the window's opening boundary instead of its own work.
+///
+/// ⚠ 0 is the default until a value is measured on the oracle, because
+/// `AGENTS.md` rule 8 makes an unmeasured default a decision nobody took: the
+/// knob reaches the guest as a registry value, so the bisection (0 vs 5 vs 50)
+/// needs no rebuild and the winning value lands in a commit that cites the run.
+pub(crate) static UMD12_GPU_FENCE_INTERVAL_MS: DwordKnob =
+    DwordKnob::new(c"Umd12GpuFenceIntervalMs", 0);
+
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12Trace` (REG_DWORD) != 0, forcing its
 /// `OnceLock`. Read once per process.
 ///
@@ -153,6 +178,12 @@ pub(crate) fn umd_d3d12() -> bool {
 /// boundary fetch ([`crate::bridge12::queue_gpu_fence`]).
 pub(crate) fn umd12_gpu_fence() -> bool {
     UMD12_GPU_FENCE.get()
+}
+
+/// Resolve `HKLM\SOFTWARE\Helios!Umd12GpuFenceIntervalMs` (REG_DWORD), forcing
+/// its `OnceLock`. 0 = unlimited; see [`UMD12_GPU_FENCE_INTERVAL_MS`].
+pub(crate) fn umd12_gpu_fence_interval_ms() -> u32 {
+    UMD12_GPU_FENCE_INTERVAL_MS.get()
 }
 
 /// The largest delay either diagnostic arm below will honour, in microseconds.
@@ -323,7 +354,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -345,5 +376,6 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
         // delay arms, so a capture can never report a configuration the read
         // site would not have used.
         ("Umd12GpuFence", umd12_gpu_fence() as u32),
+        ("Umd12GpuFenceIntervalMs", umd12_gpu_fence_interval_ms()),
     ]
 }
