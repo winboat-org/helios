@@ -110,12 +110,14 @@ unsafe fn admit_mapping(
     L2_REFUSALS.tile_mappings_forwarded.bump();
     // SAFETY: runtime submission callbacks stay on the entering DDI thread and
     // the exact context used for this operation's engine completion stream.
-    // One boundary per producer, like the other two (queue.rs). The tile-mapping
-    // path is the sparse one this stage already fixed, so it must carry the fence
-    // too: a zero here would leave exactly this producer at worker completion.
-    // SAFETY: `engine_queue` is the live engine queue this state owns.
-    let gpu_wire_fence =
-        unsafe { crate::bridge12::queue_gpu_fence(queue.engine_queue.as_raw() as usize) };
+    // ⛔ WIRE FENCE WITHDRAWN (2026-09-13): the D3D12 record carries
+    // `gpu_wire_fence = 0`, i.e. the pre-lever retire domain. The sampled Venus
+    // wire fence was measured not to fix the early fence (allocator failed 2 of 2
+    // with it and 2 of 3 without) and `EXECUTION_SYNC.md` rejects it by design: a
+    // sampled wire fence can precede worker execution. The gate this packet needs
+    // is the registered producer stream (`ctx`/`value`/`cookie` above), which the
+    // engine signals on ALL_COMMANDS after execution. See KMD_IMPACT §14a.2.
+    let gpu_wire_fence = 0u64;
     match unsafe {
         submit_wddm_render(dev, queue, &ecl_submit_command(boundary, gpu_wire_fence), "TileMappings")
     } {

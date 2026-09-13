@@ -31,25 +31,6 @@
 // Owns the `ID3D12Device*`; defined in vkd3d_bridge.cpp.
 struct HeliosVkd3dDeviceImpl;
 
-// KMD-issued wire fence of one command queue's own timeline, from the venus ICD's
-// `helios_venus_queue_gpu_fence` export. **0 means "no boundary"** and is what
-// every refusal returns (no ICD, an ICD too old to export it, a ring-0 queue the
-// export refuses loudly, or an encoding failure); zero is exactly the behaviour
-// the D3D12 submission record had before this existed.
-//
-// Resolved from the loaded venus ICD module by NAME — the DLL name is
-// configuration, the export name is the ABI — through the same anchor path as
-// `memory_identity_exports`, and cached for the process lifetime.
-//
-// `queue` is an `ID3D12CommandQueue*` as a `std::size_t`. Takes and releases the
-// engine's queue lock to run the submission drain, then escapes WITHOUT the lock.
-//
-// `mode` is `Umd12GpuFenceMode`: 0 escape only, no drain marker (DEFAULT, the
-// measured arm), 1 drain only (no escape, returns 0), 2 drain then escape (the
-// pre-.286 shape). ⛔ See the table at the definition: the drain deadlocks when
-// called from this DDI, which is why it is off the shipping path.
-std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue, std::uint32_t mode) noexcept;
-
 struct HeliosVkd3dDevice {
   HeliosVkd3dDevice() noexcept;
   ~HeliosVkd3dDevice();

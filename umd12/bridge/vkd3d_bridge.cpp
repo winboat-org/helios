@@ -80,12 +80,6 @@ extern "C" HRESULT helios_vkd3d_clear_root_arguments(ID3D12GraphicsCommandList* 
 // the VkQueue the ICD export needs, and the same lock the submission drain uses.
 // Declared here rather than including vkd3d.h, whose widl-generated D3D12 types
 // collide with the SDK's (see vkd3d_bridge.h's header rule).
-extern "C" void* vkd3d_acquire_vk_queue(ID3D12CommandQueue* queue);
-extern "C" void vkd3d_release_vk_queue(ID3D12CommandQueue* queue);
-// The LOCK/UNLOCK pair the diagnostic mode-2 arm uses to obtain the handle
-// without running the drain marker (`include/vkd3d.h:128-129`).
-extern "C" void* vkd3d_lock_vk_queue(ID3D12CommandQueue* queue);
-extern "C" void vkd3d_unlock_vk_queue(ID3D12CommandQueue* queue);
 // Same SDK/widl COM ABI as the public pipeline factory; the separate symbol
 // supplies SO origin without reserving a legal application semantic name.
 extern "C" HRESULT helios_vkd3d_create_stream_output_pipeline(ID3D12Device* device,
@@ -400,36 +394,6 @@ struct MemoryIdentityExports {
   std::uint32_t status = HELIOS_VKD3D_IDENTITY_NO_ICD;
 };
 
-// `bool helios_venus_queue_gpu_fence(VkQueue, uint64_t *)` — the ICD's own
-// `__cdecl` export. The VkQueue crosses as `void*`: VkQueue is a dispatchable
-// pointer handle on Windows x64, and naming it would drag vulkan.h across this
-// seam for no gain.
-using QueueGpuFenceFn = bool(__cdecl*)(void*, std::uint64_t*);
-
-struct QueueGpuFenceExport {
-  QueueGpuFenceFn fn = nullptr;
-};
-
-const QueueGpuFenceExport& queue_gpu_fence_export() {
-  static const QueueGpuFenceExport resolved = [] {
-    QueueGpuFenceExport out;
-    void* candidate = helios_bridge::find_venus_icd_module();
-    if (!candidate) return out;
-    void* canonical = helios_bridge::reconcile_icd_anchor(candidate);
-    if (!canonical) return out;
-    out.fn = reinterpret_cast<QueueGpuFenceFn>(reinterpret_cast<void*>(
-        GetProcAddress(static_cast<HMODULE>(canonical), "helios_venus_queue_gpu_fence")));
-    if (!out.fn) {
-      // Not an error: an ICD predating the export means D3D12 packets retire at
-      // worker completion exactly as they did before, and the KMD counts that
-      // separately (`D12Fn0`) instead of trusting a silent zero.
-      umd_log("queue_gpu_fence: venus ICD does not export helios_venus_queue_gpu_fence "
-              "-- D3D12 packets keep retiring at worker completion");
-    }
-    return out;
-  }();
-  return resolved;
-}
 
 
 const MemoryIdentityExports& memory_identity_exports() {
@@ -1106,67 +1070,3 @@ std::int32_t helios_vkd3d_bridge_copy_tiles(std::size_t queue, std::size_t dst,
   });
 }
 
-/* `mode` is `Umd12GpuFenceMode` (knobs12). DEFAULT 0 IS THE MEASURED-GOOD ARM.
- *
- * ⛔⛔ WHY THE DRAIN IS NOT ON THE SHIPPING PATH. Measured 2026-09-13 on `.285`,
- * same binary, same boot, one arm at a time, each read from the UMD12's own log:
- *
- *   mode 1 (drain only, NO escape issued)  stalls at the FIRST ECL: the log ends
- *                                          at `ExecuteCommandLists` + this
- *                                          resolver's line and never grows again
- *   mode 2 (escape only, no drain)         `allocator` reaches a verdict, EXIT=0
- *   mode 0 (drain then escape, the old     stall, same point
- *           shipping shape)
- *
- * Mode 1 convicts the DRAIN, not the escape: it runs `vkd3d_acquire_vk_queue` /
- * `vkd3d_release_vk_queue` and deliberately never calls the export, and it still
- * hangs. The engine issues those as its own submission drain — from the UMD's
- * `pfnExecuteCommandLists`, inside the engine's ECL flow, `vkd3d_acquire_vk_queue`
- * waits for the queue worker to reach a marker pushed by the caller and does not
- * return; the wait is a CPU-idle deadlock, not slowness (0.14 s of CPU over 200 s,
- * measured on `.284`).
- *
- * ⇒ The shipping arm obtains the handle with the lock/unlock pair and escapes
- * WITHOUT the marker. It is the weaker of the two orderings the ICD's contract
- * describes (the seqno cannot be proven to include the ECL's own submission, so
- * the boundary may lag by one submission), and that is stated here rather than
- * hidden: the oracle that exists to catch an early fence (`allocator`'s per-epoch
- * content check) passes on this arm, and the sound-drain design — minting from the
- * engine's submission thread, where the marker is legal — is the follow-up.
- *
- *   0 escape only, no drain   ← DEFAULT, the measured arm
- *   1 drain only, no escape   (diagnostic: the arm that convicts the drain)
- *   2 drain then escape       (the `.282`-`.285` shape, kept reproducible)
- *
- * ⛔ DELETE modes 1/2 (and the lock/unlock declarations if unused) once the
- * sound-drain mint lands. */
-std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue, std::uint32_t mode) noexcept {
-  if (!queue) return 0;
-  const QueueGpuFenceExport& resolved = queue_gpu_fence_export();
-  if (!resolved.fn) return 0;
-
-  auto* command_queue = reinterpret_cast<ID3D12CommandQueue*>(queue);
-
-  /* The escape is issued with NO engine lock held and no drain marker on the
-   * default arm, for the measured reason above. The escape itself is synchronous
-   * only in the sense that the KMD assigns the fence and returns; the wire fence
-   * retires later, when the host reaches the seqno this call read. The ICD takes
-   * no dev_mutex here by design, so it is callable unlocked. */
-  void* vk_queue;
-  if (mode == 0) {
-    vk_queue = vkd3d_lock_vk_queue(command_queue);
-    vkd3d_unlock_vk_queue(command_queue);
-  } else {
-    vk_queue = vkd3d_acquire_vk_queue(command_queue);
-    if (!vk_queue) return 0;
-    vkd3d_release_vk_queue(command_queue);
-  }
-  if (!vk_queue) return 0;
-  if (mode == 1) return 0;
-
-  std::uint64_t fence = 0;
-  // A refusal leaves `fence` at 0 and is not an error: the KMD treats 0 as "no
-  // boundary", which is the pre-existing behaviour rather than a wrong fence.
-  resolved.fn(vk_queue, &fence);
-  return fence;
-}

@@ -102,77 +102,6 @@ pub(crate) static UMD12_TRACE: BoolKnob = BoolKnob::new(c"Umd12Trace", false);
 /// switch is usable in exactly the situation it exists for.
 pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", true);
 
-/// **The D3D12 packet retire-boundary lever's kill switch.** Absent = ON;
-/// explicit `0` = OFF, and OFF means every D3D12 packet reaches the KMD with
-/// wire fence 0, i.e. **exactly the pre-K-F retire domain** (`RetireDomain::
-/// ExcludingGpu`: dxgkrnl retires the packet when the venus *worker* returns
-/// rather than when the host GPU completes).
-///
-/// ⚠ It exists because the ON arm has a measured failure to explain and the
-/// explanation has two candidates that this knob separates on ONE binary: with
-/// 0 the fence path is not merely weaker, it is *absent* (no `SUBMIT_VENUS`
-/// escape is issued, so `EscSubRing` does not move either), so a run that hangs
-/// with 1 and completes with 0 convicts the fence path rather than the KMD or
-/// `umd12` as a whole. That is the control arm for `docs/dx12/KMD_IMPACT.md`
-/// §14a.1 UV1, and it is the cheaper half of a bisection whose other half is a
-/// rebuild.
-///
-/// The question it was born from (`.282`, 2026-09-13): the ON arm wedged the
-/// `allocator` oracle at `TIMEOUT-NOT-A-DATUM` while `vulkan-smoke` and
-/// `d3d11-smoke` passed on the same install, with `QfRet=2` and `WtOut=0` —
-/// i.e. a wedge inside the new path, not a driver-wide failure.
-///
-/// ⛔ Not a shipping default change. It defaults to ON because ON is the
-/// behaviour under test; the lever must not become a quiet way to ship the
-/// defect this project exists to fix (`AGENTS.md` rule 8; read site:
-/// `bridge12::queue_gpu_fence`).
-pub(crate) static UMD12_GPU_FENCE: BoolKnob = BoolKnob::new(c"Umd12GpuFence", true);
-
-/// **How often the D3D12 retire-boundary mint may fire, in milliseconds.** 0 =
-/// unlimited (mint one boundary per producer call, the `.282` behaviour).
-///
-/// ⛔ The measured reason this exists. `.283` kept the per-producer mint with the
-/// ordering corrected and the `allocator` oracle still did not complete in 150 s;
-/// the SAME binary with `Umd12GpuFence=0` — no escape issued at all — reached a
-/// verdict on the same guest and boot. So the cost is the fence cadence, not the
-/// ordering and not the lock: one `SUBMIT_VENUS` escape plus one
-/// in-flight-until-GPU-completion wire fence per producer call. The ICD's own
-/// COST note (`helios_venus_queue_gpu_fence`, `vn_renderer_helios.c`) names the
-/// ceiling at ~1200/s and the lever as *"rate-limiting in the CALLER (one
-/// boundary per frame)"*, which is what this value is.
-///
-/// ⚠ Within the window the last minted fence is REUSED
-/// (`bridge12::queue_gpu_fence`): monotonic, so it can only under-order — never
-/// signal a fence before host completion. The trade is that a packet inside the
-/// window is gated on the window's opening boundary instead of its own work.
-///
-/// ⚠ 0 is the default until a value is measured on the oracle, because
-/// `AGENTS.md` rule 8 makes an unmeasured default a decision nobody took: the
-/// knob reaches the guest as a registry value, so the bisection (0 vs 5 vs 50)
-/// needs no rebuild and the winning value lands in a commit that cites the run.
-pub(crate) static UMD12_GPU_FENCE_INTERVAL_MS: DwordKnob =
-    DwordKnob::new(c"Umd12GpuFenceIntervalMs", 0);
-
-/// **WHICH SHAPE of the mint runs.** 0 = escape only, no drain marker (DEFAULT,
-/// the measured-good arm). 1 = drain only, no escape (returns 0; the diagnostic
-/// arm that convicts the drain). 2 = drain then escape (the `.282`-`.285` shape,
-/// kept reproducible).
-///
-/// ⛔ Measured 2026-09-13 on `.285`, one arm per boot, read from the UMD12's own
-/// log: mode 1 stalls at the FIRST `ExecuteCommandLists` **without ever calling
-/// the export**, mode 2 (drain + escape) stalls at the same point, mode 0 reaches
-/// a verdict (`allocator`, EXIT=0). `vkd3d_acquire_vk_queue` waits for the queue
-/// worker to reach a marker the caller pushed — called from the UMD's ECL DDI,
-/// inside the engine's ECL flow, that wait never returns.
-///
-/// ⚠ Mode 0's boundary may lag the ECL's own submission by one submission (it has
-/// no marker to prove freshness). The oracle built to catch an early fence passes
-/// on it; the sound-drain design is to mint from the engine's submission thread.
-///
-/// ⛔ DELETE modes 1/2 once that lands — an arm that outlives its question is
-/// scaffolding.
-pub(crate) static UMD12_GPU_FENCE_MODE: DwordKnob = DwordKnob::new(c"Umd12GpuFenceMode", 0);
-
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12Trace` (REG_DWORD) != 0, forcing its
 /// `OnceLock`. Read once per process.
 ///
@@ -191,25 +120,6 @@ pub(crate) fn umd12_trace() -> bool {
 /// `adapter12::OpenAdapter12`.
 pub(crate) fn umd_d3d12() -> bool {
     UMD_D3D12.get()
-}
-
-/// Resolve `HKLM\SOFTWARE\Helios!Umd12GpuFence` (REG_DWORD) != 0, forcing its
-/// `OnceLock`. Read once per process, and consulted on every D3D12 producer's
-/// boundary fetch ([`crate::bridge12::queue_gpu_fence`]).
-pub(crate) fn umd12_gpu_fence() -> bool {
-    UMD12_GPU_FENCE.get()
-}
-
-/// Resolve `HKLM\SOFTWARE\Helios!Umd12GpuFenceIntervalMs` (REG_DWORD), forcing
-/// its `OnceLock`. 0 = unlimited; see [`UMD12_GPU_FENCE_INTERVAL_MS`].
-pub(crate) fn umd12_gpu_fence_interval_ms() -> u32 {
-    UMD12_GPU_FENCE_INTERVAL_MS.get()
-}
-
-/// Resolve `HKLM\SOFTWARE\Helios!Umd12GpuFenceMode` (REG_DWORD). See
-/// [`UMD12_GPU_FENCE_MODE`].
-pub(crate) fn umd12_gpu_fence_mode() -> u32 {
-    UMD12_GPU_FENCE_MODE.get()
 }
 
 /// The largest delay either diagnostic arm below will honour, in microseconds.
@@ -380,7 +290,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 12] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 9] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -398,11 +308,5 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 12] {
         ("Umd12EclFence", 1),
         ("Umd12EclDrain", 0),
         ("ExecutionSyncVersion", 2),
-        // APPENDED 2026-09-13 (UV1's control arm). Through the accessor, like the
-        // delay arms, so a capture can never report a configuration the read
-        // site would not have used.
-        ("Umd12GpuFence", umd12_gpu_fence() as u32),
-        ("Umd12GpuFenceIntervalMs", umd12_gpu_fence_interval_ms()),
-        ("Umd12GpuFenceMode", umd12_gpu_fence_mode()),
     ]
 }

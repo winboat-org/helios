@@ -915,12 +915,14 @@ pub(crate) unsafe fn publish_present_producer(
             admission.0 .0 as usize,
         )
     }?;
-    // The host GPU-completion fence for this packet (0 = no boundary). Fetched
-    // ONCE per producer, not per record: the ICD export is a SUBMIT_VENUS escape
-    // whose fences stay in flight until host GPU completion.
-    // SAFETY: `engine_queue` is the live engine queue this state owns.
-    let gpu_wire_fence =
-        unsafe { crate::bridge12::queue_gpu_fence(queue.engine_queue.as_raw() as usize) };
+    // ⛔ WIRE FENCE WITHDRAWN (2026-09-13): the D3D12 record carries
+    // `gpu_wire_fence = 0`, i.e. the pre-lever retire domain. The sampled Venus
+    // wire fence was measured not to fix the early fence (allocator failed 2 of 2
+    // with it and 2 of 3 without) and `EXECUTION_SYNC.md` rejects it by design: a
+    // sampled wire fence can precede worker execution. The gate this packet needs
+    // is the registered producer stream (`ctx`/`value`/`cookie` above), which the
+    // engine signals on ALL_COMMANDS after execution. See KMD_IMPACT §14a.2.
+    let gpu_wire_fence = 0u64;
     // SAFETY: Present's entering DDI thread, exact queue context and complete record.
     let outcome = unsafe {
         submit_wddm_render(
@@ -2468,15 +2470,12 @@ unsafe extern "system" fn destroy_command_signature(
 // ---------------------------------------------------------------------------
 
 /// Exact registered worker boundary for an ECL or Present producer packet.
-/// `gpu_wire_fence` is the KMD-issued wire fence of the queue's own timeline, from
-/// the ICD export `helios_venus_queue_gpu_fence`. It is **0 here** until the
-/// producer lands (the record is version 3 and the KMD accepts both lengths, so
-/// this is deliberately inert rather than a half-change): zero means "no boundary"
-/// and is exactly version-2 behaviour.
-///
-/// ⛔ When the producer fills it, gate the change on a counter of records with a
-/// NONZERO fence: every refusal in that export returns 0 for the caller to absorb,
-/// so an inert wire is indistinguishable from a working one without it.
+/// `gpu_wire_fence` is **always 0** since 2026-09-13: the sampled wire-fence lever
+/// was withdrawn (see the note at each producer), so the field is carried for the
+/// record's version-3 shape and read by the KMD as "no boundary", i.e. exactly
+/// version-2 behaviour. The gate this packet needs is the registered producer
+/// stream (`ctx`/`value`/`cookie`), not a wire fence - `EXECUTION_SYNC.md`
+/// "Contract and ordering", and `docs/dx12/KMD_IMPACT.md` section 14a.2.
 fn ecl_submit_command(
     boundary: (u32, u32, u64),
     gpu_wire_fence: u64,
@@ -3062,10 +3061,14 @@ unsafe extern "system" fn execute_command_lists(
     };
     L2_REFUSALS.ecl_forwarded.bump();
     L2_REFUSALS.ecl_exact_boundary.bump();
-    // One boundary per producer, not per record: see the Present producer's note.
-    // SAFETY: `engine_queue` is the live engine queue this state owns.
-    let gpu_wire_fence =
-        unsafe { crate::bridge12::queue_gpu_fence(queue.engine_queue.as_raw() as usize) };
+    // ⛔ WIRE FENCE WITHDRAWN (2026-09-13): the D3D12 record carries
+    // `gpu_wire_fence = 0`, i.e. the pre-lever retire domain. The sampled Venus
+    // wire fence was measured not to fix the early fence (allocator failed 2 of 2
+    // with it and 2 of 3 without) and `EXECUTION_SYNC.md` rejects it by design: a
+    // sampled wire fence can precede worker execution. The gate this packet needs
+    // is the registered producer stream (`ctx`/`value`/`cookie` above), which the
+    // engine signals on ALL_COMMANDS after execution. See KMD_IMPACT §14a.2.
+    let gpu_wire_fence = 0u64;
     // SAFETY: required runtime callback stays on the entering DDI thread.
     match unsafe {
         submit_wddm_render(
@@ -3769,6 +3772,10 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     ecl_submit_window_too_small: RefusalCounter::new("EclSubmitWindowSmall"),
     ecl_submit_render_failed: RefusalCounter::new("EclSubmitRenderFailed"),
     ecl_drain_failed: RefusalCounter::new("EclDrainFailed"),
+    // ⛔ RETIRED 2026-09-13 with the wire-fence lever: these report 0 forever, kept
+    // only because the exported refusal list is an ordered evidence contract and
+    // renumbering it would break captures that predate the withdrawal. Delete the
+    // whole block when the stream-edge gate lands and the list is re-cut anyway.
     ecl_fence_sampled: RefusalCounter::new("EclFenceSampled"),
     ecl_fence_no_icd: RefusalCounter::new("EclFenceNoIcd"),
     ecl_fence_no_export: RefusalCounter::new("EclFenceNoExport"),
