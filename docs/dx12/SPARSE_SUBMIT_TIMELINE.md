@@ -163,11 +163,16 @@ unchanged: `adapter`, `indirect`, `indirect-ia`, `root-signature`, `raytracing`,
 and `tiling-3d` remains BLOCKED.
 
 ⚠ Failures that remain are **not** this change, but they are not all one thing
-either. The two probes that carry a known open defect (ROADMAP defect 1: the
-D3D12 DMA packet retires on Venus worker completion, not on host GPU completion)
-are `stream-output` and, as this session showed, `allocator` — both are content
-checks read back after a fence wait, and both fail intermittently with text that
-varies run to run:
+either. The two probes that carried the known open defect — `stream-output` and, as
+this session showed, `allocator`, both content checks read back after a fence wait —
+are **fixed as of `.288`** (`allocator` 55/55; `stream-output` 23/25 with two residual
+undiagnosed failures). ⛔ The defect's original description, *"the D3D12 DMA packet
+retires on Venus worker completion, not on host GPU completion"*, was **measured false**
+on `.287` (`WfBStrm=2739`, `WfBReb=0`: the packet blocks on the registered stream and is
+released by real GPU completion). The untruthfulness was in the engine's queue-signal
+path, which waited on a **cached** submission-timeline value that could already be
+retired. Full account: `KMD_IMPACT.md` §14a.2. Both probes fail intermittently with text
+that varies run to run:
 
 | probe | runs | failures | text |
 |---|---|---|---|

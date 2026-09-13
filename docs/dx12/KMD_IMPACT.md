@@ -839,6 +839,11 @@ have bought nothing. ICD-1 changed that by minting exactly such a fence
 gated: that the D3D12 queue's `ring_idx` is ≥ 1 in practice. If it is not, the
 export refuses, the wire stays 0, and the fix is inert — hence the
 `gpu_wire_fence != 0` counter that must land with the plumbing.
+⛔⛔ **SUPERSEDED 2026-09-13: that plumbing was landed and then REMOVED (`.287`), and the
+defect is fixed in `.288` on the engine side — read §14a.2's RESOLVED block instead of
+this paragraph.** The wire-fence carry is not the ring fix; the ring fix was never
+needed, because the packet was already gated on the registered producer stream. The
+`D12Fnc`/`D12Fn0` pair exists and is now permanently `D12Fn0` on a shipping build.
 
 ## ⛔⛔ CORRECTION 2026-08-06 — UV3 IS ANSWERED (✗) FROM SOURCE, AND THE TABLE ABOVE IS UNSOUND
 
@@ -916,97 +921,75 @@ internal producer appears.
 a CPU-side wait for `vkQueueSubmit`, **not** for GPU completion, so it costs no CPU/GPU overlap.
 This is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present path.
 
-#### ⛔⛔ ICD-1's CALLER ORDERING CONTRACT — and why this whole lever is NOT the fix
+#### ⭐⭐ UV1 / ICD-1 / the D3D12 early fence — RESOLVED 2026-09-13 (`.288`)
 
-Measured 2026-09-13, in this order, and the third row is what closed the question:
+**What was true, what was false, and what to do with this section.** It accumulated four
+contradicting revisions in one day (the lever contract, the "solved" claim, the `.287`
+measurement, a correction). This is the single account; the old layers are gone rather
+than stacked.
 
-| arm | shape | result |
+**1. The KMD retire domain was already correct, and that is measured.** On `.287` with
+`DiagLevel=2`, `allocator` x3 gave `D12Rec=2564`, `D12Fn0=2564` (every record carrying a
+zero `gpu_wire_fence`), `WfBStrm=2739` — the FIFO head blocks on the registered-stream
+execution gate — and **`WfBReb=0` with `WfBRebS=0`, `WfBRebB=0`**: not one blocked look
+was given up by the `WddmHeadMs` rebase. A D3D12 ECL packet is therefore released by real
+host GPU completion. The packet's `gpu_completion_fence` is a *separate* wire-fence
+namespace (`wddm_boundary::select`), and the record's execution boundary
+(`decode_execution_boundary` -> `exact_execution = true` -> `execution: Option<Wait>` ->
+`take_one_ready_wddm`'s first check) is the stream gate that actually holds it.
+
+**2. The sampled-wire-fence lever was the wrong mechanism and is REMOVED (`.287`).**
+`EXECUTION_SYNC.md`: *"A sampled Venus wire fence could precede worker execution and
+supplied neither guarantee."* It was also actively harmful to diagnosis:
+`submit_command.rs`'s `note_and_maybe_signal` **prefers** a present D3D12 wire fence over
+the stream edge, so the lever could mask the correct gate. `umd12`'s three producers now
+pass `gpu_wire_fence = 0`, the ICD-export resolver, the bridge entry point and the
+`Umd12GpuFence*` knobs are deleted, and the record keeps its v3 shape with a zero — which
+is byte-for-byte v2 semantics for this KMD. The one durable finding from that work: the
+three-arm bisection that localised a genuine deadlock —
+
+| `Umd12GpuFenceMode` (deleted with the lever) | shape | result |
 |---|---|---|
-| `Umd12GpuFenceMode=1` | `vkd3d_acquire_vk_queue`/`_release` only, the ICD export never called | stalls at the FIRST `ExecuteCommandLists` |
-| mode 2 (`.282`–`.285`) | drain, then `vkd3d_release_vk_queue`, then the escape | stalls, same point |
-| mode 0 (`.286`) | handle via `vkd3d_lock_vk_queue`/`_unlock`, escape with no drain marker | allocator reaches a verdict |
+| 1 | `vkd3d_acquire_vk_queue`/`_release` only; the export never called | stalls at the FIRST `ExecuteCommandLists` |
+| 2 | drain, release, then the escape (the `.282`–`.285` shipping shape) | stalls, same point |
+| 0 | handle via `vkd3d_lock_vk_queue`/`_unlock`, no drain marker | reaches a verdict |
 
-⇒ `vkd3d_acquire_vk_queue` **deadlocks when called from the UMD's `pfnExecuteCommandLists`**
-(it waits for the queue worker to reach a caller-pushed submit marker, from inside the
-engine's own ECL flow). The escape was never the problem; the drain was. `.286` therefore
-obtains the handle with the lock/unlock pair and escapes without the marker.
+⇒ `vkd3d_acquire_vk_queue` **does not return** when called from the UMD's
+`pfnExecuteCommandLists` (it waits for the worker to reach a caller-pushed submit marker,
+from inside the engine's own ECL flow) — CPU-idle, 0.14 s of CPU across 200 s of wall
+clock. The escape was never the problem; the drain was.
 
-⛔ **But the lever does not fix the defect, and that is now measured too.** With
-`Umd12GpuFence=0` — the pre-K-F retire domain, no escape issued anywhere — `allocator`
-failed **2 of 3** runs at 1260–1536 ms on the same `.286` boot, i.e. the early fence the
-oracle hunts is present with and without this lever.
+**3. The actual defect was one layer ABOVE this KMD, in the engine's fence signal.**
+`d3d12_command_queue_signal` waited on `command_queue->last_submission_timeline_value` — a
+**cache** of the last timeline value this queue recorded — and a fence waiting on an
+already-retired value is satisfied with no GPU dependency at all. Measured with an
+instrumented oracle: `WAIT ... us=4` against a normal ~350 us for the same 16 KiB copy,
+immediately followed by a readback holding a previous epoch's bytes (`FAIL,GPU epoch
+pattern`). Fix (fork `vkd3d-proton-helios` `94946175`, shipped in `.288`): the signal path
+bumps the submission timeline and submits one empty batch signalling a **fresh** value —
+the same operation `vkd3d_release_vk_queue` performs for interop callers — and waits on
+that, so the fence is ordered behind everything already submitted on the queue. On a
+submit failure it keeps the cached value, because the consumed value would never arrive.
 
-⛔⛔ **The mechanism itself is rejected by the design this driver was built against.**
-`EXECUTION_SYNC.md` ("Contract and ordering"): *"There are two different edges. ... A
-sampled Venus wire fence could precede worker execution and supplied neither guarantee."*
-The intended edge is the **registered producer stream**: the ECL commits an operation
-whose stream value is reserved in the same FIFO commit as the work, `HeliosD3D12SubmitCmd`
-v2 carries that handle/value/cookie, the worker waits for admission, and after execution
-it submits an `ALL_COMMANDS` signal on that exact stream — host-ordered completion, no
-sampling and no GPU-idle wait. That path already exists and passed the four native
-ordering cases on `.270`.
+Measured on `.288` (guest `oem35.inf`, DWM on the new stack, same guest and probe):
+`allocator` **55/55 PASS** (baseline 2/20 FAIL on `.287`, 4/10 on `.281`);
+`stream-output` **23/25** (was failing in every pair measured); `adapter`, `raytracing`,
+`indirect`, `root-signature` PASS; `tiling-buffer` PASS; no timeouts.
 
-⇒ **The lever has been REMOVED from `umd12` (2026-09-13), not merely disabled.**
-The three producer call sites now pass `gpu_wire_fence = 0`, the ICD-export resolver,
-the knob set and the bridge entry point are deleted, and the record keeps its
-version-3 shape with a zero (exactly version-2 semantics for the KMD). The arm table
-above is kept because it is the only record of how the `.282` deadlock was localised;
-the code that produced it is not kept, because a diagnostic arm that outlives its
-question is scaffolding.
+**4. Open.** 2 of 25 `stream-output` runs still fail and are undiagnosed — the archived
+run aborts after the `gs-*` cases with its buffered stdout truncated, so give
+`tools/d3d12_stream_output_probe.cpp` the failure-surviving diagnostics the allocator
+probe now has, then read it. `tiled`'s `copy-tiles-*` content sub-cases are separate and
+pre-existing.
 
-⇒ **The fix is on the STREAM edge.** `EXECUTION_SYNC.md` names it and describes the
-machinery: the ECL reserves a stream value in the same FIFO commit as the work,
-`HeliosD3D12SubmitCmd` carries that handle/value/cookie, the worker waits for
-admission, and after execution submits an `ALL_COMMANDS` signal on that exact stream.
-That is host-ordered completion with no sampling and no GPU-idle wait, and it already
-passed the four native ordering cases on `.270`.
+**5. ⛔⛔ Instrument preconditions, without which none of the above reproduces:**
+`diag.rs` drops every count when `DiagLevel == 0` (the default; snapshotted at init — set
+it on the KMD service key and **reboot**); a probe that aborts via `std::_Exit` loses
+buffered stdout, so diagnostics belong in a FILE (stdout can also *block* the probe —
+1.8 s → 90 s); per-epoch instrumentation perturbs this race away (24/24 instrumented vs
+2/20 untouched), so write only on the failure path; and the probe wrappers refuse a
+changed source against their captured receipt, so rebuild with `-Mode Build`.
 
-⛔⛔ **SOLVED 2026-09-13 (`.288`): the untruthfulness was in the ENGINE's fence signal,
-one layer above this KMD gate.** `d3d12_command_queue_signal` waited on
-`command_queue->last_submission_timeline_value`, a cached value that may already be
-retired; a fence waiting on a reached value is satisfied with no GPU dependency, which is
-exactly the measured signature (an instrumented oracle recorded `WAIT ... us=4` against a
-normal ~350 us for the same copy, then a readback holding a previous epoch's bytes). The
-signal path now bumps the submission timeline and submits one empty batch signaling a
-fresh value — the same operation `vkd3d_release_vk_queue` performs for interop callers —
-and waits on that, so the fence is ordered behind everything already submitted on the
-queue. Measured: `allocator` 55/55 PASS against 2/20 FAIL on the same guest and probe
-before the fix; `stream-output` 23/25 (2 residual failures, undiagnosed).
-
-⛔⛔ **MEASURED 2026-09-13 on `.287`, `DiagLevel=2` (see the instrument note below): the
-D3D12 ECL packet IS gated on the registered stream and IS released by real retirement.**
-`allocator` x3 produced: `D12Rec = 2564` records, `D12Fn0 = 2564` (every one carried
-`gpu_wire_fence = 0`, the post-withdrawal shape), `D12MrgF = 0` (no boundary was refused),
-**`WfBStrm = 2739`** (the FIFO head blocked on the execution/stream gate) and
-**`WfBReb = 0` with `WfBRebS = 0`, `WfBRebB = 0`** — i.e. not one of those blocks was
-given up on by the `WddmHeadMs` rebase. Every block was satisfied.
-
-⇒ **Everything this section previously concluded about the retire domain is WRONG and must
-not be acted on**: the packet is not retiring on a worker/decode boundary, the wire-fence
-lever was not needed for this, and "add a stream gate" or "the watermark never names the
-stream value" were both false readings of code I had not finished tracing. What is true:
-`decode_execution_boundary` -> `note_and_maybe_signal` (`exact_execution = true`,
-`execution_boundary_value = Some(...)`) -> `note_wddm_submission` (`execution: Option<Wait>`)
--> `take_one_ready_wddm`'s first check, released by `Wait::observe` when the registered
-stream reports `retired_value >= value`.
-
-⛔⛔ **AND THE INSTRUMENT WAS OFF, which is why every earlier reading of this was empty.**
-`kmd_render/src/diag.rs:120` — `record` returns early when `DiagLevel == 0`, and `DiagLevel`
-is absent (0) on a default guest; it is snapshotted at `VirtioGpu::init`, so it needs a
-**reboot**, not `pnputil`. Every counter read before this one (`D12Rec`, `D12Fnc`, `D12Fn0`,
-`WfB*`) returned 0 because it was never written, not because the event did not happen. The
-instrument now requires: `DiagLevel=2` on `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render`,
-reboot, then read. A zero counter on a `DiagLevel=0` guest is a false negative.
-
-⇒ **So the `stream-output` / `allocator` content mismatches are still unexplained, and the
-retire-domain theory that has driven this workstream for weeks does not survive this
-measurement.** The next question is a different one: with the packet provably retiring at
-GPU completion, what else can let a map/readback see a previous epoch's bytes? Candidates
-to test with the working instrument: whether the *runtime* fence the app waits on is the
-packet's DMA fence at all for the D3D12 path, the `HELIOS_SO_DIAG_DELAY_MS` result (11/11
-pass with a 500 ms delay after the wait — a delay fixing it is consistent with a fence
-completing BEFORE the packet's DMA completion, which is now the leading shape), and the
-copy-tiles content failures.
 
 | # | Item | Where | Size | Class |
 |---|---|---|---|---|

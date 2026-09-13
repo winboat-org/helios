@@ -44,358 +44,78 @@ the probe runs on past it (`tiling-2d`, `mappings`, `copy-mappings`,
 of the suite is unchanged: `adapter`, `indirect`, `indirect-ia`,
 `root-signature`, `raytracing`, `sync` and `draw` PASS throughout;
 `copy-tiles-predicated` and `copy-tiles-msaa4x` failed in one pass each with
-content mismatches (below), and the diagnostic build used to localise the crash
-reproduces the crash case exactly.
+content mismatches in the `copy-tiles-*` family (still open — see the defect list
+below), and the diagnostic build used to localise the crash reproduces the crash
+case exactly.
 
-One defect that admission had been hiding remains open:
-- `stream-output`: **the D3D12 `ExecuteCommandLists` path retires its WDDM DMA
-  packet on Venus *worker* completion, not on host GPU completion.** A raw stride
-  dump shows a correct 32-byte stride with gap and padding intact on a passing
-  run, the failing check differs every run (`32-bit counter guards overwritten`,
-  `stride padding overwritten`, `counter32 guard changed`), and the probe does
-  wait on a queue fence before `Map` — so the fence is advancing early. Measured:
-  3 of 11 runs fail without help; with `HELIOS_SO_DIAG_DELAY_MS=500` between the
-  fence wait and the readback, 11 of 11 pass (delay hook is a local diagnostic
-  build only, not committed). The same hazard now has a second, content-oracle
-  reproducer: over the `.281` session the `allocator` probe failed 4 of 10 runs
-  with `FAIL,GPU epoch pattern` — its 256-epoch reuse loop maps a readback after a
-  fence wait and found a previous epoch's pattern — while `stream-output` failed 5
-  of 10 with its usual varying text (`counter32 guard changed`, `NULL SO
-  padding/tail overwritten`, `32-bit counter guards overwritten`). The rate is
-  batch-dependent, not case-dependent: one 12-run batch of
-  `allocator`/`stream-output`/`raytracing` had zero failures and the next had six,
-  which is what an early fence looks like from the outside. `allocator`'s oracle
-  (exact content, known epoch, one second per run) is the sharper of the two and
-  is worth keeping for the K-F verification.
-  Cause, located: `kmd_render/src/ddi/submit_command.rs:688` derives
-  `gpu_completion_fence` **only from the Present BLT marker**
-  (`present_packet.rs`'s `gpu_fence_id`). For D3D12 the KMD receives only
-  `execution_boundary` — `HeliosD3D12SubmitCmd`'s worker-completion `value`
-  (`protocol/src/wddm.rs:579`, 24 bytes, `{magic, version, ctx_id, value,
-  cookie}`; no fence id exists in the record). So Present is gated on real GPU
-  completion and D3D12 is not. This is the documented `D12-G8` rung 0 /
-  `KMD_IMPACT.md` §14a.1 **UV1** gap, and it is why the fence returns in
-  ~1 µs while the pixels land seconds later.
-  Proper fix, cross-stack (the designed K-F workstream): mint a per-queue
-  GPU-completion wire fence with the ICD export `helios_venus_queue_gpu_fence`
-  (ICD-1, **already landed** in `vn_renderer_helios.c:2024`) after the engine's
-  submission drain, carry it on a **versioned** `HeliosD3D12SubmitCmd`, and pass
-  it to `note_wddm_submission` as `gpu_completion_fence` so the existing
-  `wddm_boundary::select` D3D12 arm gates the DMA packet on host completion.
-  Today nothing calls that export and the record has no field for it.
-  **UV1 reading, clean re-run 2026-09-13 on `.281` (`oem28.inf`): UV1 ✓
-  ESTABLISHED.** dxgkrnl does release the runtime's monitored fence behind our DMA
-  packet, so the submission path is sound and the fence bridge is the right lever.
-  Six samples over two boots, arms strictly sequential (the instrument now refuses
-  to start while another probe runs), **all six are valid latency samples**
-  (`WtOut` Δ 0 — no fence-wait timeout) and both arms did the same work
-  (Δ`D12Rec` = 770):
-  ```
-  hold 0   :   2120 / 1619 / 1615 ms        WfBHold Δ 0            WtOut Δ 0
-  hold 100 : 117297 / 116897 / 116960 ms    WfBHold Δ ~9.7-10.1k   WtOut Δ 0
-  graded by the instrument: ratio 72.4x -> "UV1-YES: the app fence waits on our packet"
-  ```
-  This replaces the first attempt, which was invalid and is kept here as the reason
-  the instrument checks what it checks: its two held runs **overlapped** over
-  adapter-global counters, and 11.4 s / 23.0 s were ~1×/~2× the probe's own 10 s
-  fence-wait timeout while doing 1–10 % of a run's work (`D12Rec` Δ 68/11). The
-  instrument now enforces per run, in the JSON: no concurrent probe; no fence-wait
-  timeouts (`WtOut`); `DiagLevel` proven live by hazard-counter movement rather
-  than by reading the knob back; the ECL path proven live; the hold proven
-  attached; plus instrument revision, boot time/uptime, probe exit code and the
-  probe archive. Evidence `tmp/uv1-20260913/evidence2/` (six arm JSONs + the
-  grade), instrument `tools/uv1-fence-latency.ps1`.
+- `stream-output` / `allocator` — the D3D12 early-fence defect — ⭐ **FIXED in `.288`**
+  (fork `vkd3d-proton-helios` `94946175`, parent `cdcdb90`, package
+  `helios-windows-x64-22.22.288.0-cdcdb903.zip`, guest `oem35.inf`). Full mechanism and
+  the measurement table are in `docs/dx12/KMD_IMPACT.md` §14a.2; the short version:
 
-  ⚠ The lever question the table poses ("UV1 ✓ / UV3 ✗ ⇒ *Fix the ring, not the
-  submission*") is resolved in **mechanism**, and this reading is not what resolves
-  it: UV3 ✗ was answered from source *before* ICD-1 landed, when nothing on the
-  D3D12 path could name a ring≥1 GPU-completion fence, so a perfect packet would
-  still have retired at decode. ICD-1 mints exactly that fence — `ring_idx =
-  queue->ring_idx`, ring 0 refused loudly — which is why piece (1) below **is** the
-  ring fix, delivered through the submission path rather than instead of it. What
-  remains unproven and must be gated: that the D3D12 queue's `ring_idx` is ≥ 1 in
-  practice. If it is not, the export refuses, the wire stays 0 and the fix is inert
-  — which is what the nonzero-fence counter in piece (4) exists to catch.
-  **Piece (1) LANDED (`5d81437` + `c94e299`), compiling on the slave
-  (`C:\src\out\kf-20260913\driver`, INF valid) and deliberately inert:**
-  `HeliosD3D12SubmitCmd` is version 3 with `gpu_wire_fence` appended (24 → 32 bytes,
-  24-byte prefix unchanged, `HeliosD3D12SubmitCmdV2` still readable and widened
-  with a zero fence so a process holding the previous package's UMD is not broken);
-  `kmd_logic::execution_completion::Record` carries the fence (16 → 24 bytes, with
-  `with_gpu_wire_fence` = max and `gpu_wire_fence_for` requiring a valid boundary
-  for that stream — deliberately NOT merged into `boundary`); `Render` accepts both
-  record lengths; `decode_execution_boundary` returns the worker boundary plus the
-  fence; `note_and_maybe_signal` gates the packet on it and falls back to Present's
-  BLT marker; and `D12Fnc`/`D12Fn0` count records that did and did not carry a
-  nonzero fence. `PRESENT_DMA_PRIVATE_DATA_BYTES` 104 → 112 (88 + 24, still pinned
-  to the record by the existing assert). 217 `kmd_logic` + 14 `protocol` tests pass.
-  ⭐ **There are THREE producers that must each carry the fence, not two:**
-  `umd12/src/forward12/queue.rs` twice (ExecuteCommandLists and the Present producer
-  packet) **and `umd12/src/forward12/tiles.rs` (tile mappings)** — the last one is
-  the sparse path this stage already fixed, it was missed by a grep scoped to
-  queue.rs, and the slave build caught it as an E0061.
-  **Piece (2) LANDED AND COMPILING (`73f4e0f` + `c1c5e59` + `87f3ab8`) — the wire
-  is now LIVE, and has never run.** `umd12/bridge/vkd3d_bridge.cpp` resolves
-  `helios_venus_queue_gpu_fence` from the loaded venus ICD module by name through
-  the same `find_venus_icd_module`/`reconcile_icd_anchor` path as
-  `memory_identity_exports` (cached; a missing export logs and stays null), and
-  `helios_umd12_queue_gpu_fence` takes the `VkQueue` through vkd3d's public
-  `vkd3d_acquire_vk_queue`/`vkd3d_release_vk_queue` and calls it. All three
-  producers (`queue.rs` ×2, `tiles.rs`) fetch it **once per producer** and stamp it
-  into the record. Verified by a slave driver build only (`KMD BUILD PASS`, INF
-  valid, `C:\src\out\kf-20260913\driver`): nothing has been installed or run.
-  ⛔ Two build lessons worth keeping: a bridge definition inserted inside the file's
-  anonymous `namespace {` gets INTERNAL linkage, which the cxx glue reports as
-  LNK2019 on the decorated name plus a `-Wunused-function` warning (the definition
-  must sit at top level, after the resolver it calls); and matching a namespace
-  comment with a prefix (`}  // namespace`) splits the word that follows it.
-  ⛔⛔ **First measurement on `.282` (`oem29.inf`, Code 0, DWM on the new stack):
-  THE FIX IS TOO EXPENSIVE AS LANDED. Not a correctness verdict — a stop.** A single
-  `allocator` run went from ~2 s on `.281` to over five minutes and was killed; the
-  child produced no verdict inside its 300 s timeout, and its archive directory was
-  never created. Counters while it ran: `EscSubRing` +2267 over ~2 runs (≈1100
-  escapes per run, against an idle-window baseline of ~5/s), **`QfRet` = 2** — the
-  control queue hit `QUEUE_FULL` and the KMD retried — and `WtOut` = 0, so this is
-  not a fence-wait timeout being wrongly reported: the work is simply crawling.
-  This is exactly the performance review's P2-1/P2-2 pair (one SUBMIT_VENUS escape
-  per producer at the ICD's own ~1200/s ceiling; QueueFull retries while `umd12`
-  holds vkd3d's queue mutex), which is why those risks were written down before the
-  code was.
-  **Isolated the same session, without a rollback**: D3D11 and Vulkan smoke on the
-  SAME `.282` install both pass in under a second (`d3d11-smoke.exe` exit 0, 806 ms,
-  527 pixels match; `vulkan-smoke.exe` exit 0, 588 ms, Venus on RADV NAVI23). D3D11
-  never builds a `HeliosD3D12SubmitCmd`, so the install, the host, the ICD and the
-  D3D12-less paths are all healthy and the failure is inside the D3D12 fence path
-  this change added. Two more facts from the hung run: the probe process survived
-  two `Stop-Process -Force` attempts (a wedge inside a GPU wait, not a busy loop),
-  and a clean reboot does not change it — a single allocator run still failed to
-  complete in 240 s on a fresh boot (`TIMEOUT-NOT-A-DATUM`), against ~1.6–2.1 s for
-  the same probe on `.281`.
-  ⛔ **ROOT CAUSE FOUND AND PROVEN, `.283`→`.286`, and it is neither the ordering,
-  the lock, nor the cost: `vkd3d_acquire_vk_queue` DEADLOCKS when it is called from
-  the UMD's `pfnExecuteCommandLists`.** Read off the UMD12's own log (which is how
-  this was localised in 24 s per arm instead of waited for — a timeout cannot tell a
-  stall from slowness): the log grows to ~290 KB in two seconds, stops inside the
-  FIRST `ExecuteCommandLists` immediately after the bridge resolves the ICD module,
-  and never grows again. Three arms, one per boot, `.285` (mode knob):
-  * mode 1 — **drain only, the export never called**: stalls at the identical point.
-    ⇒ the escape is exonerated; the wait is in acquire/release.
-  * mode 2 — drain then escape (the `.282`–`.285` shipping shape): stalls, same point.
-  * mode 0 — escape only, handle via `vkd3d_lock_vk_queue`/`_unlock`, no drain marker:
-    **`allocator` reaches a verdict, `EXIT=0`.**
-  The acquire waits for the queue worker to reach a caller-pushed submit marker; from
-  inside the engine's own ECL flow that wait never returns, and it is CPU-idle (0.14 s
-  of CPU across 200 s of wall clock on `.284`), which is why the earlier cadence and
-  latency readings could never have fixed it. `.286` ships mode 0 as the default.
-  ⛔⛔ **`.286` ACCEPTANCE: the HANG is fixed, the DEFECT is NOT yet.** `allocator`
-  now runs to a verdict in 1423–1999 ms (`.281` baseline 1260–2364 ms) where it
-  previously never finished at all, so the re-entrancy deadlock is gone — but the
-  oracle still failed 1 of 2 runs and `stream-output` failed both (its runner throws
-  `Native SO acceptance failed`), i.e. an early fence is still reachable.
-  ⚠ **That is exactly the weakness mode 0 documents**: with no drain marker the seqno
-  cannot be proven to include the ECL's own submission, so for a serialized workload
-  (one ECL per epoch) the boundary lags the very work it is meant to cover. The
-  measured-good *shape* (no drain from the DDI) and the *effective* gate (a boundary
-  that provably covers this ECL) are two different things, and `.286` only has the
-  first.
-  ⇒ **The lever is now REMOVED (`.287`, not defaulted off)**: the three producers pass
-  `gpu_wire_fence = 0`, the ICD-export resolver, the knobs and the bridge entry point are
-  deleted, and the record keeps its v3 shape with a zero.
-  ⛔⛔ **And the plan that stood here — "mint from the ENGINE's submission thread" — was
-  the wrong path too**, for the reason `EXECUTION_SYNC.md` states outright: a *sampled*
-  wire fence can precede worker execution, so no mint site rescues it.
-  ⛔⛔ **AND THE RETIRE-DOMAIN THEORY ITSELF DOES NOT SURVIVE MEASUREMENT (`.287`,
-  `DiagLevel=2`, 2026-09-13).** `allocator` x3: `D12Rec=2564`, `D12Fn0=2564` (the withdrawn
-  `gpu_wire_fence=0` shape), `WfBStrm=2739` (the head DOES block on the execution/stream
-  gate) and **`WfBReb=0`** — no block was ever rebased, so every one was satisfied by a real
-  stream retirement. The packet is therefore already gated on host GPU completion, and the
-  "it retires on the worker boundary" premise that this whole workstream was built on is
-  **not true on `.287`**. What remains unexplained is why the content oracles still fail
-  occasionally with a truthful gate — starting with the `HELIOS_SO_DIAG_DELAY_MS` result
-  (500 ms after the wait makes 11/11 pass), which now points at the app-visible fence
-  completing before the packet's DMA completion rather than at the KMD retire domain.
-  ⛔ **INSTRUMENT PRECONDITION, and this is why earlier readings in this file are empty:**
-  `diag.rs:120` drops every count when `DiagLevel == 0`, the default, and it is snapshotted
-  at init - so set `DiagLevel=2` on the KMD service key and REBOOT before believing any
-  `D12*`/`WfB*` value. A zero there on a `DiagLevel=0` guest is a false negative.
+  **The defect was NOT in this driver's retire domain.** A D3D12 packet is gated on the
+  registered producer stream and is released by real host GPU completion — measured on
+  `.287`: `D12Rec=2564`, `WfBStrm=2739` (the FIFO head blocks on the stream gate) and
+  **`WfBReb=0`** (not one block was given up by the `WddmHeadMs` rebase). The
+  untruthfulness was one layer up: the engine's `d3d12_command_queue_signal` waited on
+  `last_submission_timeline_value`, a **cached** value that may already be retired, and a
+  fence waiting on a reached value is satisfied with no GPU dependency at all. An
+  instrumented oracle recorded `WAIT ... us=4` against a normal ~350 us for the same
+  16 KiB copy, then a readback holding a previous epoch's bytes. The signal path now
+  bumps the submission timeline and submits one empty batch signalling a **fresh** value
+  (the operation `vkd3d_release_vk_queue` already performs for interop callers) and waits
+  on that, so the fence is ordered behind everything already submitted on the queue.
 
-  ⭐⭐ **FIXED IN `.288`, and measured.** The defect was one layer ABOVE the KMD: the
-  application's fence. `d3d12_command_queue_signal` waited on
-  `command_queue->last_submission_timeline_value` — a CACHE of the last timeline value
-  this queue happened to record — and a fence waiting on an already-retired value is
-  satisfied with no GPU dependency at all. Measured directly with an instrumented
-  oracle: `WAIT ... us=4` against a normal ~350 us for the same 16 KiB copy, followed by
-  a readback holding a previous epoch's bytes. The signal path now performs what
-  `vkd3d_release_vk_queue` performs for interop callers — bump the submission timeline
-  and submit one empty batch signaling a FRESH value — and waits on that, so the fence is
-  ordered behind everything already submitted on that queue by construction. Reported
-  from the engine's own refutation path: if that submit fails the cached value is kept,
-  because the consumed value would never arrive.
+  Evidence on `.288`, same guest/probe, `DiagLevel=2`, DWM on the new stack:
 
-  Measured on `.288`/`oem35.inf`, DWM on the new stack, `DiagLevel=2`:
-  * `allocator` (the 256-epoch content oracle): **55/55 PASS** across two series
-    (30 + 25). Baseline on the same guest and probe immediately before the fix: **2/20
-    FAIL**, and `.281` recorded 4-of-10.
-  * `stream-output`: **23/25 PASS** (was failing in every pair measured this session,
-    and 5-of-10 on `.281`) — ⚠ **2 failures remain and are NOT yet diagnosed**; they are
-    the next thing to look at, and the archived run shows the probe aborting after the
-    `gs-*` cases with its buffered stdout truncated, so the SO probe needs the same
-    failure-surviving diagnostics the allocator probe now has.
-  * Regression check on the same boot: `adapter`, `raytracing`, `indirect`,
-    `root-signature` PASS; `tiling-buffer` PASS (the `.281` crash fix intact) with only
-    the known `copy-tiles-*` content sub-cases failing; no timeouts anywhere.
-  ⚠ Still owed before any claim: the `allocator` failure rate over ≥10 runs against
-  the `.281` 4-of-10 baseline, `WtOut`=0, `QfRet`=0, `WfBWire` flat, and the rest of the
-  suite (`tiled`, `raytracing`, `stream-output`).
-  ⛔ **WITHDRAWN DESIGN, kept for provenance only — do NOT implement from this block.**
-  It is the rationale for the sampled-wire-fence lever, which `.287` removed: the whole
-  approach is rejected by `EXECUTION_SYNC.md`'s ordering contract (see directly above).
-  The producer goes in the **UMD12**, not the engine, and the reasons were checked, not
-  assumed:
-  * `vkd3d_acquire_vk_queue(ID3D12CommandQueue *) -> VkQueue` is already **public**
-    (`vkd3d-proton-helios/include/vkd3d.h:126`), so the UMD12 can obtain the
-    `VkQueue` the ICD export needs without reaching into `vkd3d_private.h`. The
-    engine-side alternative would have to convert `ID3D12CommandQueue*` with
-    `impl_from_ID3D12CommandQueue` and grow a new ICD-resolution mechanism inside
-    the fork — more surface for no gain.
-  * The ICD export is `bool helios_venus_queue_gpu_fence(VkQueue, uint64_t *)`
-    (`icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:728` decl, `:2071` def); it
-    returns 0 on every refusal, which is why `D12Fnc`/`D12Fn0` exist.
-  * Resolving it by NAME is the established discipline and the name is the ABI, not
-    the DLL: `umd/bridge/bridge_icd_exports.cpp` already does exactly this for the
-    D3D11 UMD (`GetProcAddress` over a `TH32CS_SNAPMODULE` snapshot, cached, with
-    the module pinned so the ICD cannot unload under a cached pointer), and
-    `dxvk-helios/src/dxvk/dxvk_helios_scanout_acquire.cpp:90-113` is the same scan
-    written out in full. ⛔ The UMD12 cannot share that file: it has its own cxx
-    bridge (`umd12/bridge/vkd3d_bridge.cpp` + `src/bridge12.rs`), so the resolver is
-    a self-contained ~60-line addition there, mirroring the discipline.
-  * Touch points: the resolver + `queue_gpu_fence(queue) -> u64` in the bridge, one
-    `extern` in `bridge12.rs`, and the three producers
-    (`queue.rs` ×2, `tiles.rs`) passing it instead of `0`. Rate-limit per the risk
-    list below (one boundary per frame) and count nonzero fences.
-  (2) the producer: call `helios_venus_queue_gpu_fence` per submission and get the wire
-  fence back to whoever fills the D3D12 record. The ICD export exists and is
-  uncalled; the caller must hold a `VkQueue`, so this lands in the engine
-  (`vkd3d-proton-helios`) with an interop accessor the UMD12 reads. (2) the wire
-  record: `HeliosD3D12SubmitCmd` gains a `gpu_wire_fence` (24 → 32 bytes, 24-byte
-  prefix unchanged, so accept the v2 length too — a long-lived process can still
-  hold the previous package's `helios_umd12.dll` across an upgrade). (3) the KMD
-  path: `Render`'s D3D12 branch merges that fence into the execution record
-  (`kmd_logic::execution_completion::Record`, 16 bytes today and
-  `PRESENT_DMA_PRIVATE_DATA_BYTES` is pinned to it *exactly* by the layout assert,
-  so growing it is a declared-private-data-size change), `decode_execution_boundary`
-  returns it, and `note_and_maybe_signal` passes it as `gpu_completion_fence`
-  instead of deriving that only from the Present BLT marker
-  (`submit_command.rs:688`). The decision to extend that record rather than reuse
-  Present's `gpu_fence_id` is deliberate: `present_packet.rs` records why the two
-  must not be conflated. (4) verification: the `allocator` oracle must go from its measured failure
-  rate to 0/10 and `elapsed_ms` must stop being bimodal; `stream-output` must stop
-  varying. ⛔ Gate the whole thing on a nonzero `gpu_wire_fence` actually reaching
-  the KMD (count it) — an inert wire is the fake-success shape this defect already
-  punished once.
-  **Risks the reviews attached to this plan — address them as the pieces land, not
-  after.** (a) *Escape rate*: the export is one SUBMIT_VENUS escape + one wire
-  fence per call with no cache, and the ICD's own header states the ceiling
-  (`vn_renderer_helios.c:2058-2065`: 3 queues × 2 ECLs × 200 fps ⇒ ~1200
-  in-flight-until-GPU-completion fences/s), so the caller should rate-limit to one
-  boundary per frame unless a *differenced* `EscSubRing` (it also counts venus
-  external-semaphore batches) says per-submission is affordable. (b)
-  *Backpressure*: 64 control descriptors at ≥2 per chain ⇒ ~32 concurrent, every
-  QGF fence stays in flight until host GPU completion, and the enqueue retries for
-  `ENQUEUE_RETRY_MAX_MS = 5000` (`ctrl.rs:100`) while `umd12` holds vkd3d's queue
-  mutex across the escape on the shipping default arm (`PENDING.md` A3) — so
-  `QfRet` must stay 0 on the acceptance run, and this escape wants its own smaller
-  retry bound, not the shared 5 s budget. (c) *Inert wire*: refusals return 0 for
-  the caller to absorb and the ICD's refusal counters are process-local, so the
-  nonzero-fence counter must land in the same commit as the plumbing and
-  `D12Zero`/`D12Clr`/`GpuFncClamp` must not move. (d) *The intended cost is real*:
-  the D3D12 WDDM fence then retires at host GPU completion (producer floor ~3.7
-  ms/frame per WS2 above) instead of ~1 µs — land with a `gpu_wire_fence == 0`
-  control arm and require `WfBWire` not to climb on a healthy session.
-- ~~`raytracing` FAIL "uncompacted current/prebuild size agreement"~~ — **FIXED in
-  22.22.280.0 (`ef9c6586`); design record `docs/dx12/ACCELERATION_STRUCTURE_CURRENT_SIZE.md`.**
-  It was never a D3D12 admission problem: `CURRENT_SIZE` was answered with
-  `VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR`, and RADV's `bvh/header.comp`
-  reports the packed size **plus the 128-byte serialization-header alignment
-  padding**, a quantity that for a small structure exceeds the prebuild
-  requirement and for a compacted or cloned one exceeds the allocation itself.
-  Measured on bare RADV in the WinBoat container (Mesa 25.0.7, RX 6600, no Venus
-  or guest in the loop) with `tools/host_as_size_probe.c`, which reproduces the
-  guest's 72/72/56-byte deltas exactly. The engine now records the D3D12 answer
-  per structure — through the same helper the prebuild uses, so the two cannot
-  disagree — and replays it: built structures get the recorded constant,
-  compacted and cloned ones follow the `COMPACTED_SIZE` query, and unrecorded
-  (deserialized) ones keep the old host fallback. Cost: one extra
-  `vkGetAccelerationStructureBuildSizesKHR` (a synchronous Venus round trip) per
-  D3D12 AS build; a content-keyed prebuild cache is the follow-up if that ever
-  shows up in a profile.
-  Original characterisation, kept for provenance: the check is a legitimate D3D12
-  invariant — an uncompacted structure's `CURRENT_SIZE` **is** the
-  `ResultDataMaxSizeInBytes` prebuild reported, not merely at most it — and the
-  diagnostic probe build that dumped the raw postbuild-info buffer reported
-  ```
-  compacted [320, 320, 0]   current [392, 392, 568]   prebuild max [320, 320, 512]
-  ```
-  Both numbers come from Vulkan: the prebuild is
-  `vkGetAccelerationStructureBuildSizesKHR`'s `accelerationStructureSize`
-  (`device.c:8993`) and current was `VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR`
-  (`acceleration_structure.c:459`). The guest ICD translated that query correctly
-  and forwarded it (`vn_query_pool.c:103`), which is what the host-side probe then
-  confirmed: the disagreement is in the host's answer, not in the translation.
-- ~~`tiled` `tiling-buffer` FAIL with 0xC0000005~~ — **FIXED in 22.22.281.0
-  (`7bd1231`), Mesa fork `913491b0394`; design record
-  `docs/dx12/SPARSE_SUBMIT_TIMELINE.md`.** It was never a D3D12 admission problem
-  and never a KMD problem. `tiling-buffer` maps tiles, so vkd3d reaches the host
-  through `vkQueueBindSparse` (`d3d12_command_queue_flush_bind_sparse`, one wait
-  and one signal, both the queue's own timeline), and the guest ICD prepared that
-  sparse submission through the semaphore-feedback path. The two timeline
-  **counter** accessors had cases for `VkSubmitInfo`/`VkSubmitInfo2` only, so the
-  sparse batch fell into `default: UNREACHABLE("unexpected batch type")` — which
-  in a release build is `__builtin_unreachable()`, not an error return, so the
-  sparse batch got whatever the optimizer laid out. That is the WER-minidump read
-  at `0x18` in `vulkan_virtio.dll` RVA `0x379205` =
-  `vn_queue_submission_prepare + 0x325`. The fix is the two missing
-  `VK_STRUCTURE_TYPE_BIND_SPARSE_INFO` cases (17 lines), the same shape current
-  upstream Mesa carries; the neighbouring count and handle accessors already had
-  it, and only the counter accessors — added later by the feedback work — did not.
-  The probe that faulted now reports `PASS,tiled,tiling-buffer,case-completed`
-  (`TILING,total,4`) both from the diagnostic build and from the shipped `.281`
-  package, and `tiling-2d`, `mappings`, `copy-mappings` and `copy-tiles-2d` pass
-  after it.
-- `tiled` `copy-tiles-predicated` / `copy-tiles-msaa4x` FAIL with content
-  mismatches (`CopyTiles input differs from independent CopyTextureRegion
-  witness`; `MSAA CopyTiles sample roundtrip mismatch`) are **newly reachable, not
-  new**: the probe stops at the first failing case, so neither had ever run.
-  They are also intermittent — pass 1 failed `copy-tiles-predicated` (the
-  diagnostic build did too), pass 2 passed it and failed `copy-tiles-msaa4x`
-  instead — and both are content read back after a fence wait, i.e. the shape of
-  the open defect below. This work does not attribute them: recorded so the next
-  pass does not read them as a regression, and `SPARSE_COMPATIBILITY.md` remains
-  the governing record for what tiled behaviour is claimed.
+  | case | before `.288` | on `.288` |
+  |---|---|---|
+  | `allocator` (256-epoch content oracle) | 2/20 FAIL (`.281`: 4/10) | **55/55 PASS** |
+  | `stream-output` | failing in every pair measured | **23/25 PASS** |
+  | `adapter`, `raytracing`, `indirect`, `root-signature` | PASS | PASS |
+  | `tiling-buffer` (the `.281` crash fix) | PASS | PASS |
+  | hangs / `TIMEOUT-NOT-A-DATUM` | yes | none |
 
-`no-output-msaa` and `tiled-format-caps` stay BLOCKED on this guest by the absent
-D3D12 debug layer (Graphics Tools FoD, `0x887a002d`); DISM is denied in this
-environment. A diagnostic build with the debug-layer gate relaxed measured the
-approximation directly: 15 cases / 8,640 words, 320 mismatches, all on the
-16-sample case (`got 000000ff, want 0000ffff`). RADV cannot rasterize 16 samples,
-so a 16x no-output PSO is accepted but produces 8-sample coverage. That is the
-documented boundary, not an implementation error.
+  **Open, in priority order.** (1) 2 of 25 `stream-output` runs still fail; the archived
+  run aborts after the `gs-*` cases with its buffered stdout truncated, so the first step
+  is to give `tools/d3d12_stream_output_probe.cpp` the same failure-surviving diagnostics
+  the allocator probe now has (`tools/d3d12_allocator_probe.cpp`), *then* read it — not to
+  theorise. (2) `tiled`'s `copy-tiles-*` content sub-cases (pre-existing, unaffected).
 
-Evidence: `tmp/integration-20260912/` (`verify-loaded279.json`, `results279.txt`,
-`nooutput-task.out`, `driver279-build.log`, `assemble279.log`) for `.279`, and
-`tmp/rtas-size-20260913/` for the `.280` CURRENT_SIZE fix and the `.281` sparse
-fix (`helios-windows-x64-22.22.280.0-ef9c6586.zip` sha256
-`ef77e4cf0ab16e43fcefa47c5f891e8527d8a3439c6b37b066270e5282eb7f5e`,
-`helios-windows-x64-22.22.281.0-7bd12310.zip` sha256
-`922b9f0f3c64719066b44731ddcf5f8240647652790d2c7b09fe69a6e66c3a72`,
-`evidence/verify-loaded280.out`, `evidence/verify-loaded281.out`,
-`evidence/verdicts281.txt`, `evidence/results281-summary.txt`,
-`evidence/raytracing/`, `evidence/verdict-*.txt`, `evidence/recover280.log`,
-`evidence/build280c.log`, `evidence/assemble280b.log`,
-`evidence/build281c.log`, `evidence/assemble281.log`,
-`evidence/engine-inputs281.json`, `evidence/validation281.json` and
-`evidence/manifest281.json`; host-side attribution output and the probe source
-are `tools/host_as_size_probe.c`).
+  ⛔ **PATHS ALREADY REJECTED — do not re-tread any of these** (each cost real time):
+  * **The wire-fence lever** (`HeliosD3D12SubmitCmd.gpu_wire_fence`, the ICD export call,
+    `Umd12GpuFence*`) — withdrawn in `.287`, −363 lines. `EXECUTION_SYNC.md` rejects a
+    sampled Venus fence by construction, and `submit_command.rs`'s `note_and_maybe_signal`
+    *prefers* a present D3D12 wire fence over the registered-stream edge — so it could
+    mask the correct gate while looking like progress. The record keeps its v3 shape with
+    a zero (exactly v2 semantics).
+  * **The retire-domain theory itself** — see the `WfBStrm`/`WfBReb` measurement above.
+  * **`vkd3d_acquire_vk_queue` from the UMD's ECL DDI** — a genuine deadlock (the
+    drain-only arm never calls the export and still stalls at the first ECL). The
+    no-drain shape it forced is retained in the engine.
+  * **"Mint from the engine's submission thread"** — no mint site rescues a *sampled*
+    fence.
+  * **Fallback-queue / `deviceMask` cross-queue routing** — the ICD passes `deviceMask`
+    through as a device-group struct and ignores it entirely when `device_mask <= 1`
+    (`vn_queue.c`), so no work is routed to a second VkQueue.
+
+  ⛔⛔ **INSTRUMENT PRECONDITIONS — every earlier reading in this file was a false
+  negative without them:**
+  * `kmd_render/src/diag.rs` drops every count when `DiagLevel == 0` (the default), and
+    it is snapshotted at init: set `DiagLevel=2` on
+    `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render` and **reboot**, or a
+    `D12*`/`WfB*` zero means nothing.
+  * A probe that aborts through `std::_Exit` loses buffered stdout: diagnostics must go to
+    a FILE (the wrapper drains stdout only at exit, so per-epoch stdout can also *block*
+    the probe — measured, 1.8 s → 90 s timeouts).
+  * Per-epoch instrumentation **perturbs this race away** (24/24 passes instrumented vs
+    2/20 untouched): write only on the failure path, and decode *which* epoch's bytes were
+    present (`pattern(e,0) = 0x9e3779b9*(e+1)` names the observed epoch).
+  * The probe wrappers refuse a changed source against a captured receipt; rebuild with
+    `-Mode Build` before `-Mode Run`.
+  * Evidence: `tmp/uv1-20260913/{fix288,fix288b,suite288,pris1}` and the instrumented
+    scripts (`run-cases.ps1`, `register-cases.ps1`, `watch-arm.ps1`, `probe-progress.ps1`,
+    `analyze-trace.ps1`).
 
 The `.280` install is the same package flow as `.279`, with one wrinkle worth
 recording: the ring-3 upgrade driven from a scheduled task was killed by

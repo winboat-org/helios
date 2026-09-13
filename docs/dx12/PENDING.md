@@ -544,7 +544,13 @@ Also: the five unrunnable `kmd_render` tests recovered into `kmd_logic`.
    LOAD-BEARING for the drain.** Forwarding waits above the watermark — the obvious fix for
    `FenceWaitNotForwarded` — destroys that acyclicity and makes the hang genuinely reachable. ⇒ that
    change and a bounded/WAIT-skipping acquire **must land together**.
-2. ⛔ **A1's containment costs more than this document said.** *"Default the drain OFF"* does not
+2. ⛔⛔ **SUPERSEDED 2026-09-13 (`.288`) — read `KMD_IMPACT.md` §14a.2 first.** The whole
+   sampled-wire-fence lever this item is about was **removed** (`umd12` passes
+   `gpu_wire_fence = 0`; the ICD-export resolver, bridge entry point and `Umd12GpuFence*`
+   knobs are deleted), because `EXECUTION_SYNC.md` rejects a sampled fence by
+   construction and it could mask the registered-stream gate the KMD actually uses. The
+   analysis below is kept only as the record of why the containment question was asked.
+2b. ⛔ **A1's containment costs more than this document said.** *"Default the drain OFF"* does not
    shrink the boundary — it **removes** it. The wire fence is sampled from the `VkQueue` that only
    `vkd3d_acquire_vk_queue` returns, *inside* the drain function, so with the drain off
    `gpu_wire_fence = 0` always and the whole fence bridge is inert. ⇒ a **sample-only** bridge path
