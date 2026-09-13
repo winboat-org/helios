@@ -1106,25 +1106,40 @@ std::int32_t helios_vkd3d_bridge_copy_tiles(std::size_t queue, std::size_t dst,
   });
 }
 
-/* `mode` is `Umd12GpuFenceMode` (knobs12) and exists to split ONE measurement:
- * which half of this sequence stalls the first D3D12 `ExecuteCommandLists`.
- * Measured 2026-09-13 on `.284` (fence ON, interval 0): the UMD12 log stops
- * growing inside that first ECL, immediately after this bridge resolved the ICD
- * module, and never resumes — while the same binary with the whole fetch skipped
- * (`Umd12GpuFence=0`) passes `allocator` in 2.19 s. The engine's own ECL runs in
- * BOTH arms, so the difference is everything below, and there are exactly two
- * candidates: the drain handshake and the escape.
+/* `mode` is `Umd12GpuFenceMode` (knobs12). DEFAULT 0 IS THE MEASURED-GOOD ARM.
  *
- *   0 (default) full: drain, then the escape.
- *   1 drain only: run the drain, skip the escape. Returns 0, i.e. no boundary —
- *     so a stall here convicts `vkd3d_acquire_vk_queue`/`vkd3d_release_vk_queue`.
- *   2 escape only: obtain the handle with the lock/unlock pair (NO drain marker)
- *     and escape. Weaker than mode 0 on purpose — the fence then covers work the
- *     caller cannot prove reached the host — so a stall here convicts the escape,
- *     and a pass here with a stall in 0/1 convicts the drain.
+ * ⛔⛔ WHY THE DRAIN IS NOT ON THE SHIPPING PATH. Measured 2026-09-13 on `.285`,
+ * same binary, same boot, one arm at a time, each read from the UMD12's own log:
  *
- * ⛔ DIAGNOSTIC SCAFFOLDING: delete this parameter, mode 2 and the lock/unlock
- * declarations in the commit that lands the real fix. */
+ *   mode 1 (drain only, NO escape issued)  stalls at the FIRST ECL: the log ends
+ *                                          at `ExecuteCommandLists` + this
+ *                                          resolver's line and never grows again
+ *   mode 2 (escape only, no drain)         `allocator` reaches a verdict, EXIT=0
+ *   mode 0 (drain then escape, the old     stall, same point
+ *           shipping shape)
+ *
+ * Mode 1 convicts the DRAIN, not the escape: it runs `vkd3d_acquire_vk_queue` /
+ * `vkd3d_release_vk_queue` and deliberately never calls the export, and it still
+ * hangs. The engine issues those as its own submission drain — from the UMD's
+ * `pfnExecuteCommandLists`, inside the engine's ECL flow, `vkd3d_acquire_vk_queue`
+ * waits for the queue worker to reach a marker pushed by the caller and does not
+ * return; the wait is a CPU-idle deadlock, not slowness (0.14 s of CPU over 200 s,
+ * measured on `.284`).
+ *
+ * ⇒ The shipping arm obtains the handle with the lock/unlock pair and escapes
+ * WITHOUT the marker. It is the weaker of the two orderings the ICD's contract
+ * describes (the seqno cannot be proven to include the ECL's own submission, so
+ * the boundary may lag by one submission), and that is stated here rather than
+ * hidden: the oracle that exists to catch an early fence (`allocator`'s per-epoch
+ * content check) passes on this arm, and the sound-drain design — minting from the
+ * engine's submission thread, where the marker is legal — is the follow-up.
+ *
+ *   0 escape only, no drain   ← DEFAULT, the measured arm
+ *   1 drain only, no escape   (diagnostic: the arm that convicts the drain)
+ *   2 drain then escape       (the `.282`-`.285` shape, kept reproducible)
+ *
+ * ⛔ DELETE modes 1/2 (and the lock/unlock declarations if unused) once the
+ * sound-drain mint lands. */
 std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue, std::uint32_t mode) noexcept {
   if (!queue) return 0;
   const QueueGpuFenceExport& resolved = queue_gpu_fence_export();
@@ -1132,28 +1147,13 @@ std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue, std::uint32_t mode
 
   auto* command_queue = reinterpret_cast<ID3D12CommandQueue*>(queue);
 
-  /* ORDER IS CORRECTNESS, and the ICD's caller contract is explicit about it
-   * (icd/mesa vn_renderer_helios.c: "call this AFTER the submission to be
-   * covered has reached the host driver, i.e. after the engine's own
-   * vkQueueSubmit returned (for vkd3d: after the VKD3D_SUBMISSION_DRAIN
-   * handshake inside vkd3d_acquire_vk_queue) ... reading a stale smaller
-   * [seqno] is the correctness hazard").
-   *
-   * `vkd3d_release_vk_queue` is that handshake: it issues the pending
-   * `vkQueueSubmit2` and bumps the submission timeline. So the acquire/release
-   * pair must COMPLETE before the escape reads the ring seqno, or the fence
-   * covers less than the packet it is about to gate — the packet would retire
-   * before host completion, which is the pre-fix behaviour bought at full price.
-   *
-   * Releasing the engine's queue lock BEFORE the escape is the second half of
-   * the same ordering. The escape is a synchronous SUBMIT_VENUS whose wire fence
-   * retires only when the host reaches that seqno; holding the lock that the
-   * engine's own submission/completion machinery needs while waiting on host
-   * progress on the same queue is a self-deadlock. The ICD takes no dev_mutex
-   * here by design, so it is callable unlocked — and this is the only place a
-   * D3D12 packet's retire boundary is minted. */
+  /* The escape is issued with NO engine lock held and no drain marker on the
+   * default arm, for the measured reason above. The escape itself is synchronous
+   * only in the sense that the KMD assigns the fence and returns; the wire fence
+   * retires later, when the host reaches the seqno this call read. The ICD takes
+   * no dev_mutex here by design, so it is callable unlocked. */
   void* vk_queue;
-  if (mode == 2) {
+  if (mode == 0) {
     vk_queue = vkd3d_lock_vk_queue(command_queue);
     vkd3d_unlock_vk_queue(command_queue);
   } else {

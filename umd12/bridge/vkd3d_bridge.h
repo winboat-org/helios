@@ -44,9 +44,10 @@ struct HeliosVkd3dDeviceImpl;
 // `queue` is an `ID3D12CommandQueue*` as a `std::size_t`. Takes and releases the
 // engine's queue lock to run the submission drain, then escapes WITHOUT the lock.
 //
-// `mode` is `Umd12GpuFenceMode`: 0 full (drain then escape), 1 drain only (no
-// escape, returns 0), 2 escape only (no drain marker). ⛔ DIAGNOSTIC — see the
-// table at the definition; delete with the fix.
+// `mode` is `Umd12GpuFenceMode`: 0 escape only, no drain marker (DEFAULT, the
+// measured arm), 1 drain only (no escape, returns 0), 2 drain then escape (the
+// pre-.286 shape). ⛔ See the table at the definition: the drain deadlocks when
+// called from this DDI, which is why it is off the shipping path.
 std::uint64_t helios_umd12_queue_gpu_fence(std::size_t queue, std::uint32_t mode) noexcept;
 
 struct HeliosVkd3dDevice {

@@ -153,16 +153,24 @@ pub(crate) static UMD12_GPU_FENCE: BoolKnob = BoolKnob::new(c"Umd12GpuFence", tr
 pub(crate) static UMD12_GPU_FENCE_INTERVAL_MS: DwordKnob =
     DwordKnob::new(c"Umd12GpuFenceIntervalMs", 0);
 
-/// **WHICH HALF of the mint runs. Diagnostic; see the table in
-/// `umd12/bridge/vkd3d_bridge.cpp`.** 0 = full (drain then escape). 1 = drain
-/// only, no escape (returns 0 = no boundary). 2 = escape only, no drain marker.
+/// **WHICH SHAPE of the mint runs.** 0 = escape only, no drain marker (DEFAULT,
+/// the measured-good arm). 1 = drain only, no escape (returns 0; the diagnostic
+/// arm that convicts the drain). 2 = drain then escape (the `.282`-`.285` shape,
+/// kept reproducible).
 ///
-/// ⛔ One question, asked once: the first `ExecuteCommandLists` stalls inside the
-/// mint (`umd12-<pid>.log` stops growing right after the ICD module line) while
-/// `Umd12GpuFence=0` passes `allocator` in 2.19 s on the same binary and boot.
-/// The engine's own ECL runs in both arms, so the stall is the drain handshake or
-/// the escape, and this knob is the split. ⛔ DELETE IT in the commit that lands
-/// the real fix — an arm that outlives its question is scaffolding.
+/// ⛔ Measured 2026-09-13 on `.285`, one arm per boot, read from the UMD12's own
+/// log: mode 1 stalls at the FIRST `ExecuteCommandLists` **without ever calling
+/// the export**, mode 2 (drain + escape) stalls at the same point, mode 0 reaches
+/// a verdict (`allocator`, EXIT=0). `vkd3d_acquire_vk_queue` waits for the queue
+/// worker to reach a marker the caller pushed — called from the UMD's ECL DDI,
+/// inside the engine's ECL flow, that wait never returns.
+///
+/// ⚠ Mode 0's boundary may lag the ECL's own submission by one submission (it has
+/// no marker to prove freshness). The oracle built to catch an early fence passes
+/// on it; the sound-drain design is to mint from the engine's submission thread.
+///
+/// ⛔ DELETE modes 1/2 once that lands — an arm that outlives its question is
+/// scaffolding.
 pub(crate) static UMD12_GPU_FENCE_MODE: DwordKnob = DwordKnob::new(c"Umd12GpuFenceMode", 0);
 
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12Trace` (REG_DWORD) != 0, forcing its
