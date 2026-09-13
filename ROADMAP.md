@@ -101,6 +101,27 @@ One defect that admission had been hiding remains open:
   host GPU). That is the precondition K-F3..K-F9 was waiting on. ⚠ The held runs
   still FAIL the probe's content check, so this reading *licenses* the fix; it does
   not fix it. Instrument `tools/uv1-fence-latency.ps1`, evidence `tmp/uv1-20260913/`.
+  **Next (the fix this licenses) — four pieces, in dependency order.** (1) the
+  producer: call `helios_venus_queue_gpu_fence` per submission and get the wire
+  fence back to whoever fills the D3D12 record. The ICD export exists and is
+  uncalled; the caller must hold a `VkQueue`, so this lands in the engine
+  (`vkd3d-proton-helios`) with an interop accessor the UMD12 reads. (2) the wire
+  record: `HeliosD3D12SubmitCmd` gains a `gpu_wire_fence` (24 → 32 bytes, 24-byte
+  prefix unchanged, so accept the v2 length too — a long-lived process can still
+  hold the previous package's `helios_umd12.dll` across an upgrade). (3) the KMD
+  path: `Render`'s D3D12 branch merges that fence into the execution record
+  (`kmd_logic::execution_completion::Record`, 16 bytes today and
+  `PRESENT_DMA_PRIVATE_DATA_BYTES` is pinned to it *exactly* by the layout assert,
+  so growing it is a declared-private-data-size change), `decode_execution_boundary`
+  returns it, and `note_and_maybe_signal` passes it as `gpu_completion_fence`
+  instead of deriving that only from the Present BLT marker
+  (`submit_command.rs:688`). The decision to extend that record rather than reuse
+  Present's `gpu_fence_id` is deliberate: `present_packet.rs` records why the two
+  must not be conflated. (4) verification: the `allocator` oracle must go 4/10 fail
+  → 0/10 and `elapsed_ms` must stop being bimodal; `stream-output` must stop
+  varying. ⛔ Gate the whole thing on a nonzero `gpu_wire_fence` actually reaching
+  the KMD (count it) — an inert wire is the fake-success shape this defect already
+  punished once.
 - ~~`raytracing` FAIL "uncompacted current/prebuild size agreement"~~ — **FIXED in
   22.22.280.0 (`ef9c6586`); design record `docs/dx12/ACCELERATION_STRUCTURE_CURRENT_SIZE.md`.**
   It was never a D3D12 admission problem: `CURRENT_SIZE` was answered with
