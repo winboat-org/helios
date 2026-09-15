@@ -2,7 +2,13 @@ param(
     [switch]$EnableTestSigning,
     [switch]$RunSmokeTests,
     [Alias("Unattended")]
-    [switch]$Automatic
+    [switch]$Automatic,
+    # Re-apply the whole package over an existing installation without the
+    # "already managed" refusal, preserving the original pre-Helios rollback
+    # snapshots rather than capturing Helios's own values as the restore point.
+    [switch]$Repair,
+    # Overwrite semantics for unattended callers: identical to -Repair.
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -59,39 +65,54 @@ function Complete-HeliosAutomaticProvisioning {
 }
 
 trap {
-    if ($Automatic) {
-        try { Write-HeliosProvisioningStatus "failed" $_.Exception.Message } catch {
-            Write-Warning "Could not publish the automatic provisioning failure: $($_.Exception.Message)"
-        }
+    # The status file is the machine-readable contract any orchestrator (not
+    # only WinBoat) can watch, so it is written on every path, not just
+    # -Automatic.
+    try { Write-HeliosProvisioningStatus "failed" $_.Exception.Message } catch {
+        Write-Warning "Could not publish the provisioning failure: $($_.Exception.Message)"
     }
-    throw
+    # A bare `throw` here would replace the real error with a generic
+    # "ScriptHalted" RuntimeException at this line, which is exactly as useful
+    # as no error at all. Surface the message and rethrow the original record.
+    Write-Warning "Helios setup failed: $($_.Exception.Message)"
+    throw $_
 }
 
 Assert-HeliosAdministrator
 if (-not [Environment]::Is64BitProcess) {
     throw "Run the installer with native 64-bit Windows PowerShell to manage both registry views and system directories."
 }
+if ($Force) { $Repair = $true }
+Write-HeliosProgress 3 "Checking administrator rights"
 
 $bundleRoot = $PSScriptRoot
 $manifest = Read-HeliosManifest $bundleRoot
 Write-Host "Verifying $(@($manifest.files).Count) package files..."
 Test-HeliosManifest $bundleRoot $manifest
+Write-HeliosProgress 7 "Verified $($manifest.version) package files"
 
-if ($Automatic) {
-    Initialize-HeliosAutomaticProvisioning $bundleRoot
-    if (-not (Test-Path -LiteralPath $provisioningStatusPath -PathType Leaf)) {
-        Write-HeliosProvisioningStatus "waiting"
-    }
+if ($Automatic) { Initialize-HeliosAutomaticProvisioning $bundleRoot }
+# Publish `waiting` for a fresh run, but never overwrite a terminal `finished`:
+# an observer (WinBoat) that has already completed must not be pulled back.
+if (-not (Test-Path -LiteralPath $provisioningStatusPath -PathType Leaf)) {
+    Write-HeliosProvisioningStatus "waiting"
 }
 
+$previousState = $null
 if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-    if ($Automatic) {
+    if ($Repair) {
+        Write-Host "Re-applying $($manifest.version) over the existing Helios installation."
+        $previousState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        Write-HeliosProgress 12 "Preparing to overwrite the existing installation"
+    } elseif ($Automatic) {
         & (Join-Path $stateRoot "Verify-Helios.ps1")
         Complete-HeliosAutomaticProvisioning
         exit 0
+    } else {
+        throw "Helios is already managed by this package installer. Run $stateRoot\Uninstall-Helios.ps1 before installing another bundle."
     }
-    throw "Helios is already managed by this package installer. Run $stateRoot\Uninstall-Helios.ps1 before installing another bundle."
 }
+if (-not $previousState) { Write-HeliosProgress 12 "Preparing the installation" }
 
 if ($manifest.signing.mode -eq "test" -and -not (Test-HeliosTestSigningEnabled)) {
     if (-not $EnableTestSigning -and -not $Automatic) {
@@ -102,7 +123,7 @@ if ($manifest.signing.mode -eq "test" -and -not (Test-HeliosTestSigningEnabled))
     }
     Write-Host "Enabling Windows test-signing..."
     Invoke-HeliosNative "bcdedit.exe" @("/set", "testsigning", "on")
-    if ($Automatic) { Write-HeliosProvisioningStatus "test-signing-restart-required" }
+    Write-HeliosProvisioningStatus "test-signing-restart-required"
     Write-Warning "Test-signing was enabled in the boot configuration. Reboot Windows, then run this installer again."
     exit 3010
 }
@@ -120,7 +141,12 @@ $activeInfBeforeInstall = Get-HeliosActiveInf $instanceId
 # Snapshot before any PnP change: an older native-only INF cannot delete a
 # UserModeDriverNameWoW value that a newer package introduces into its key.
 $previousDirect3D = [ordered]@{ activeInf = $activeInfBeforeInstall; infSha256 = ""; values = [ordered]@{} }
-if ($activeInfBeforeInstall) {
+if ($previousState -and $previousState.PSObject.Properties["previousDirect3D"] -and $previousState.previousDirect3D) {
+    # A repair must keep the ORIGINAL pre-Helios Direct3D registration. Capturing
+    # the registry now would record Helios's own values as the restore point, so
+    # a later uninstall would "restore" Helios over itself.
+    $previousDirect3D = $previousState.previousDirect3D
+} elseif ($activeInfBeforeInstall -and -not $previousState) {
     $previousDirect3D.infSha256 = Get-HeliosSha256 (Join-Path $env:windir "INF\$activeInfBeforeInstall")
     $previousClassKey = Get-HeliosDisplayClassKey $instanceId
     foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW", "InstalledDisplayDrivers")) {
@@ -190,42 +216,61 @@ $previousOpenGL = [ordered]@{
     OpenGLFlagsWow = [ordered]@{ exists = $false; kind = $null; value = $null }
 }
 
+# -Repair must preserve the pre-Helios rollback state and the recorded loader
+# ownership; only a fresh install captures the live values.
+if ($previousState -and $previousState.PSObject.Properties["previousOpenGL"] -and $previousState.previousOpenGL) {
+    $previousOpenGL = $previousState.previousOpenGL
+}
+function Get-PreviousStateValue([string]$Name, $Default) {
+    if ($previousState -and $previousState.PSObject.Properties[$Name]) { return $previousState.$Name }
+    return $Default
+}
+$installedAtUtc = Get-PreviousStateValue "installedAtUtc" ([DateTime]::UtcNow.ToString("o"))
+$signingThumbprint = [string](Get-PreviousStateValue "signingCertificateThumbprint" "")
+$hadVulkanLoader = [bool](Get-PreviousStateValue "installedVulkanLoader" $false)
+$hadVulkanLoaderX86 = [bool](Get-PreviousStateValue "installedVulkanLoaderX86" $false)
+$hadOpenClLoader = [bool](Get-PreviousStateValue "installedOpenClLoader" $false)
+$vulkanLoaderHash = [string](Get-PreviousStateValue "systemVulkanLoaderHash" "")
+$vulkanLoaderX86Hash = [string](Get-PreviousStateValue "systemVulkanLoaderX86Hash" "")
+$openClLoaderHash = [string](Get-PreviousStateValue "systemOpenClLoaderHash" "")
+$replacedViogpudoBefore = [bool](Get-PreviousStateValue "replacedViogpudo" $replacedViogpudo)
+
 $state = [ordered]@{
     schemaVersion = 1
     packageId = [string]$manifest.packageId
     publisher = Get-HeliosPackagePublisher $manifest
     version = [string]$manifest.version
-    installedAtUtc = [DateTime]::UtcNow.ToString("o")
+    installedAtUtc = $installedAtUtc
     installRoot = $installRoot
     instanceId = $instanceId
     classKey = $classKey
     activeInf = ""
     activeInfSha256 = ""
-    signingCertificateThumbprint = ""
+    signingCertificateThumbprint = $signingThumbprint
     vulkanManifest = $vulkanManifestPath
     vulkanManifestX86 = $vulkanManifestX86Path
     openClVendor = $clvkPath
-    installedVulkanLoader = $false
-    installedVulkanLoaderX86 = $false
-    installedOpenClLoader = $false
-    systemVulkanLoaderHash = ""
-    systemVulkanLoaderX86Hash = ""
-    systemOpenClLoaderHash = ""
+    installedVulkanLoader = $hadVulkanLoader
+    installedVulkanLoaderX86 = $hadVulkanLoaderX86
+    installedOpenClLoader = $hadOpenClLoader
+    systemVulkanLoaderHash = $vulkanLoaderHash
+    systemVulkanLoaderX86Hash = $vulkanLoaderX86Hash
+    systemOpenClLoaderHash = $openClLoaderHash
     previousOpenGL = $previousOpenGL
     previousDirect3D = $previousDirect3D
     installedDirect3D = [ordered]@{}
-    replacedViogpudo = $replacedViogpudo
+    replacedViogpudo = $replacedViogpudoBefore
     runtimeFiles = @()
     driverFiles = @()
 }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot,$stateRoot | Out-Null
 
-Copy-Item -Path (Join-Path $payloadRoot "mesa") -Destination $runtimeRoot -Recurse -Force
-Copy-Item -Path (Join-Path $payloadRoot "opencl") -Destination $runtimeRoot -Recurse -Force
-Copy-Item -Path (Join-Path $payloadRoot "loaders") -Destination $runtimeRoot -Recurse -Force
+Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "mesa") (Join-Path $runtimeRoot "mesa")
+Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "opencl") (Join-Path $runtimeRoot "opencl")
+Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "loaders") (Join-Path $runtimeRoot "loaders")
 if (Test-Path -LiteralPath (Join-Path $payloadRoot "smoke")) {
-    Copy-Item -Path (Join-Path $payloadRoot "smoke") -Destination $runtimeRoot -Recurse -Force
+    Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "smoke") (Join-Path $runtimeRoot "smoke")
 }
 
 foreach ($file in Get-ChildItem -LiteralPath $runtimeRoot -File -Recurse) {
@@ -244,6 +289,7 @@ Write-HeliosJson $state $statePath
 
 $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certificatePath)
 $state.signingCertificateThumbprint = $certificate.Thumbprint
+Write-HeliosProgress 25 "Installing the Helios signing certificate"
 
 function Test-HeliosCertificateStoreThumbprint(
     [Parameter(Mandatory)][string]$StoreName,
@@ -289,34 +335,12 @@ foreach ($store in @("Root", "TrustedPublisher")) {
 }
 Write-HeliosJson $state $statePath
 
-# Both D3D12 UMDs retain the dynamic CRT. Installing x64 does not satisfy
-# an x86 process, so independently preserve-or-update each architecture.
-foreach ($architecture in @("x64", "x86")) {
-    Write-Host "Installing/updating the Microsoft Visual C++ $architecture runtime..."
-    $redistPath = Join-Path $payloadRoot "prerequisites\vc_redist.$architecture.exe"
-    $requiredRuntimeVersion = [version](Get-Item -LiteralPath $redistPath).VersionInfo.FileVersion
-    $installedRuntimeVersion = [version]"0.0"
-    # Avoid ERROR_PRODUCT_VERSION (1638) when a newer runtime is installed.
-    foreach ($runtimeKey in @(
-        "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\$architecture",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\$architecture"
-    )) {
-        $runtime = Get-Item -LiteralPath $runtimeKey -ErrorAction SilentlyContinue
-        $version = [version]"0.0"
-        if ($runtime -and $runtime.GetValue("Installed", 0) -eq 1 -and
-            [version]::TryParse(([string]$runtime.GetValue("Version", "")).TrimStart("v", "V"), [ref]$version) -and
-            $version -gt $installedRuntimeVersion) {
-            $installedRuntimeVersion = $version
-        }
-    }
-    if ($installedRuntimeVersion -ge $requiredRuntimeVersion) {
-        Write-Host "Keeping installed Visual C++ $architecture runtime $installedRuntimeVersion (bundle: $requiredRuntimeVersion)."
-    } else {
-        Invoke-HeliosNative $redistPath @("/install", "/quiet", "/norestart") -SuccessExitCodes @(0, 3010) -WaitForProcess
-    }
-}
+# Both UMDs link the static CRT, so no Visual C++ runtime is installed or
+# required. (The D3D11 UMD has always been static; the D3D12 UMD switched with
+# vkd3d built `-Db_vscrt=mt`.)
 
 $systemVulkanLoader = Join-Path $env:windir "System32\vulkan-1.dll"
+Write-HeliosProgress 52 "Registering the Khronos loaders"
 if (-not (Test-Path -LiteralPath $systemVulkanLoader -PathType Leaf)) {
     Copy-Item -LiteralPath (Join-Path $runtimeRoot "loaders\vulkan-1.dll") -Destination $systemVulkanLoader -Force
     $state.installedVulkanLoader = $true
@@ -337,6 +361,7 @@ if (-not (Test-Path -LiteralPath $systemOpenClLoader -PathType Leaf)) {
 Write-HeliosJson $state $statePath
 
 Write-Host "Installing the Helios WDDM driver package..."
+Write-HeliosProgress 64 "Installing the Helios WDDM driver package"
 # pnputil returns ERROR_NO_MORE_ITEMS (259) when this exact package is already
 # staged/active. The active-INF checks below still reject an outranking driver.
 Invoke-HeliosNative "pnputil.exe" @("/add-driver", $driverInf, "/install") -SuccessExitCodes @(0, 259, 3010)
@@ -352,13 +377,17 @@ if ($activeInfText -notmatch "helios_kmd_render") {
 }
 $classKey = Get-HeliosDisplayClassKey $instanceId
 $state.classKey = $classKey
-$state.previousOpenGL = [ordered]@{
-    OpenGLDriverName = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverName"
-    OpenGLVersion = Get-HeliosRegistrySnapshot $classKey "OpenGLVersion"
-    OpenGLFlags = Get-HeliosRegistrySnapshot $classKey "OpenGLFlags"
-    OpenGLDriverNameWow = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverNameWow"
-    OpenGLVersionWow = Get-HeliosRegistrySnapshot $classKey "OpenGLVersionWow"
-    OpenGLFlagsWow = Get-HeliosRegistrySnapshot $classKey "OpenGLFlagsWow"
+if (-not $previousState) {
+    $state.previousOpenGL = [ordered]@{
+        OpenGLDriverName = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverName"
+        OpenGLVersion = Get-HeliosRegistrySnapshot $classKey "OpenGLVersion"
+        OpenGLFlags = Get-HeliosRegistrySnapshot $classKey "OpenGLFlags"
+        OpenGLDriverNameWow = Get-HeliosRegistrySnapshot $classKey "OpenGLDriverNameWow"
+        OpenGLVersionWow = Get-HeliosRegistrySnapshot $classKey "OpenGLVersionWow"
+        OpenGLFlagsWow = Get-HeliosRegistrySnapshot $classKey "OpenGLFlagsWow"
+    }
+} else {
+    Write-Host "Keeping the recorded pre-Helios OpenGL registration as the restore point."
 }
 $state.activeInf = $activeInf
 $state.activeInfSha256 = Get-HeliosSha256 $activeInfPath
@@ -368,6 +397,7 @@ foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW", "InstalledDis
 Write-HeliosJson $state $statePath
 
 $vulkanDll = Join-Path $runtimeRoot "mesa\vulkan_virtio.dll"
+Write-HeliosProgress 82 "Registering Vulkan, OpenGL and OpenCL"
 $vulkanJson = [ordered]@{
     file_format_version = "1.0.1"
     ICD = [ordered]@{
@@ -403,18 +433,57 @@ New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlagsWow" -Value 1 -Propert
 Ensure-HeliosRegistryKey $openClRegistry
 New-ItemProperty -LiteralPath $openClRegistry -Name $clvkPath -Value 0 -PropertyType DWord -Force | Out-Null
 
+# A version change installs under a new packageId/installRoot, so the previous
+# version's Khronos registrations and runtime tree would otherwise be orphaned
+# forever: the Vulkan loader would see two Helios ICDs and the old tree would
+# never be removed (uninstall only knows the current paths). Retire them now
+# that the new registrations exist.
+if ($previousState -and [string]$previousState.installRoot -and
+    ([string]$previousState.installRoot -ine $installRoot)) {
+    foreach ($entry in @(
+        [ordered]@{ Path = $vulkanRegistry;    Name = [string]$previousState.vulkanManifest },
+        [ordered]@{ Path = $vulkanRegistryX86; Name = [string]$previousState.vulkanManifestX86 },
+        [ordered]@{ Path = $openClRegistry;    Name = [string]$previousState.openClVendor }
+    )) {
+        if ($entry.Name -and (Test-Path -LiteralPath $entry.Path)) {
+            Remove-ItemProperty -LiteralPath $entry.Path -Name $entry.Name -ErrorAction SilentlyContinue
+        }
+    }
+    $previousRoot = [string]$previousState.installRoot
+    if (Test-Path -LiteralPath $previousRoot) {
+        try {
+            Remove-Item -LiteralPath $previousRoot -Recurse -Force
+            Write-Host "Removed the previous runtime $previousRoot."
+        } catch {
+            Write-Warning "The previous runtime $previousRoot is still loaded and was not removed: $($_.Exception.Message)"
+        }
+    }
+}
+
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Helios-PackageCommon.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Uninstall-Helios.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Verify-Helios.ps1") -Destination $stateRoot -Force
+# Persist a usable uninstaller beside the copied scripts so Helios can be
+# removed later without the original bundle. The GUI detects the absent payload
+# in this copy and offers uninstall only.
+$setupExe = Join-Path $bundleRoot "HeliosSetup.exe"
+if (Test-Path -LiteralPath $setupExe -PathType Leaf) {
+    Copy-Item -LiteralPath $setupExe -Destination (Join-Path $stateRoot "HeliosSetup.exe") -Force
+}
+if (Test-Path -LiteralPath (Join-Path $bundleRoot "manifest.json") -PathType Leaf) {
+    Copy-Item -LiteralPath (Join-Path $bundleRoot "manifest.json") -Destination $stateRoot -Force
+}
 Write-HeliosJson $state $statePath
 
 Write-Host ""
 Write-Host "Helios $($manifest.version) is installed system-wide with x64 and WoW64 Direct3D 11/12, OpenGL, and Vulkan support."
+Write-HeliosProgress 94 "Verifying the installation"
 if ($RunSmokeTests) {
     & (Join-Path $stateRoot "Verify-Helios.ps1") -RunSmokeTests
 } else {
     & (Join-Path $stateRoot "Verify-Helios.ps1") -AllowPendingReboot
 }
-if ($Automatic) { Write-HeliosProvisioningStatus "driver-restart-required" }
+Write-HeliosProvisioningStatus "driver-restart-required"
+Write-HeliosProgress 100 "Installation complete"
 Write-Warning "Reboot Windows before judging driver or desktop behavior."
 exit 3010

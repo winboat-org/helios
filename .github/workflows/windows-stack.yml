@@ -33,9 +33,13 @@ env:
 
 jobs:
   driver:
-    name: WDDM driver and x64/x86 Direct3D 11/12 UMDs
+    name: WDDM driver and x64/x86 Direct3D 11/12 UMDs (${{ matrix.configuration }})
     runs-on: windows-2022
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -99,14 +103,20 @@ jobs:
         run: ./ci/windows/Install-WindowsDriverKit.ps1
       - name: Build driver package
         shell: pwsh
-        run: ./ci/windows/Build-Driver.ps1 -RepoRoot $env:GITHUB_WORKSPACE -OutputDir "$env:RUNNER_TEMP/helios-driver"
+        run: ./ci/windows/Build-Driver.ps1 -RepoRoot $env:GITHUB_WORKSPACE -OutputDir "$env:RUNNER_TEMP/helios-driver" -Configuration ${{ matrix.configuration }}
       - uses: actions/upload-artifact@v7
         with:
-          name: helios-driver
+          name: helios-driver-${{ matrix.configuration }}
           path: ${{ runner.temp }}/helios-driver
           if-no-files-found: error
           retention-days: 14
 
+  # Mesa, CLVK and the Khronos loaders are built once (release) and shared by
+  # both bundles: they are externally-maintained native libraries, and a debug
+  # variant of them is not what a "debug Helios build" is for. The debug bundle
+  # is the first-party code — KMD, both UMDs, and the installer — with symbols.
+  # To make a component configuration-aware, give it a -Configuration parameter
+  # and add it to the package job's per-configuration download list.
   mesa:
     name: Mesa Venus Vulkan and Zink OpenGL (x64)
     runs-on: windows-2022
@@ -276,12 +286,14 @@ jobs:
           retention-days: 14
 
   package:
-    name: Sign and assemble installable bundle
+    name: Sign and assemble installable bundle (${{ matrix.configuration }})
     needs: [driver, mesa, mesa_x86, opencl, loaders, compatibility]
     runs-on: windows-2022
     timeout-minutes: 30
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -289,7 +301,7 @@ jobs:
           fetch-depth: 1
       - uses: actions/download-artifact@v8
         with:
-          name: helios-driver
+          name: helios-driver-${{ matrix.configuration }}
           path: ${{ runner.temp }}/artifacts/driver
       - uses: actions/download-artifact@v8
         with:
@@ -314,6 +326,20 @@ jobs:
       - name: Ensure Windows Driver Kit is installed
         shell: pwsh
         run: ./ci/windows/Install-WindowsDriverKit.ps1
+      # The installer is built here, not in a separate job: it is fast, and the
+      # final self-contained exe must be produced after the payload is assembled.
+      - name: Install LLVM
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: ${{ env.LLVM_VERSION }}
+          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Build the self-contained installer skeleton
+        shell: pwsh
+        run: ./ci/windows/Build-Installer.ps1 -RepoRoot $env:GITHUB_WORKSPACE -OutputDir "$env:RUNNER_TEMP/helios-installer" -Configuration ${{ matrix.configuration }}
       - name: Read package metadata
         id: metadata
         shell: pwsh
@@ -334,7 +360,9 @@ jobs:
           -OpenClArtifact "$env:RUNNER_TEMP/artifacts/opencl"
           -LoadersArtifact "$env:RUNNER_TEMP/artifacts/loaders"
           -CompatibilityArtifact "$env:RUNNER_TEMP/artifacts/compatibility"
+          -InstallerArtifact "$env:RUNNER_TEMP/helios-installer"
           -OutputDir "$env:RUNNER_TEMP/helios-package"
+          -Configuration '${{ matrix.configuration }}'
           -Version '${{ steps.metadata.outputs.version }}'
           -RepositoryCommit $env:GITHUB_SHA
           -MesaCommit '${{ steps.metadata.outputs.mesa }}'
@@ -347,22 +375,35 @@ jobs:
           -OpenClHeadersCommit $env:OPENCL_HEADERS_COMMIT
       - uses: actions/upload-artifact@v7
         with:
-          name: helios-windows-x64-${{ steps.metadata.outputs.version }}
+          name: helios-windows-x64-${{ steps.metadata.outputs.version }}-${{ matrix.configuration }}
           path: |
             ${{ runner.temp }}/helios-package/*.zip
             ${{ runner.temp }}/helios-package/*.sha256
           if-no-files-found: error
           retention-days: 30
-      - name: Publish tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: helios-windows-x64-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/helios-package
+      - name: Publish all bundles
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $files = Get-ChildItem "$env:RUNNER_TEMP/helios-package" -File | Where-Object { $_.Extension -in @('.zip', '.sha256') } | ForEach-Object FullName
-          gh release view $env:GITHUB_REF_NAME 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:GITHUB_REF_NAME @files --clobber
-          } else {
-            gh release create $env:GITHUB_REF_NAME @files --generate-notes --title $env:GITHUB_REF_NAME
-          }
+          set -euo pipefail
+          cd "$RUNNER_TEMP/helios-package"
+          ls -la
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" ./*.zip ./*.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" ./*.zip ./*.sha256 --generate-notes --title "$GITHUB_REF_NAME"
+          fi

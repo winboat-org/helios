@@ -11,6 +11,7 @@ if (-not [Environment]::Is64BitProcess) {
 }
 
 Assert-HeliosAdministrator
+Write-HeliosProgress 5 "Preparing to remove Helios"
 $stateRoot = Join-Path $env:ProgramData "Helios"
 $statePath = Join-Path $stateRoot "install-state.json"
 $resolveCompatibilityState = Join-Path $stateRoot "compatibility\DaVinci Resolve\install-state.json"
@@ -76,6 +77,7 @@ try {
 $driverRemovalFailed = $false
 if (-not $KeepDriver -and [string]$state.activeInf) {
     Write-Host "Removing driver package $($state.activeInf)..."
+    Write-HeliosProgress 40 "Removing the Helios driver package"
     try {
         $publishedInfPath = Join-Path $env:windir "INF\$($state.activeInf)"
         $published = Test-Path -LiteralPath $publishedInfPath -PathType Leaf
@@ -116,6 +118,7 @@ if (-not $KeepDriver -and -not $driverRemovalFailed) {
 }
 
 if ($RemoveKhronosLoaders) {
+    Write-HeliosProgress 70 "Removing package-installed loaders"
     $loaderCandidates = @(
         [ordered]@{
             installed = [bool]$state.installedVulkanLoader
@@ -157,6 +160,7 @@ if ($thumbprint -and -not $KeepDriver -and -not $driverRemovalFailed) {
 }
 
 $installRoot = [string]$state.installRoot
+Write-HeliosProgress 85 "Removing the Helios runtime files"
 if (Test-Path -LiteralPath $installRoot) {
     try { Remove-Item -LiteralPath $installRoot -Recurse -Force } catch {
         Write-Warning "Some runtime files are still loaded and could not be removed: $installRoot"
@@ -168,4 +172,5 @@ if ($driverRemovalFailed) {
 Remove-Item -LiteralPath $statePath -Force
 Remove-Item -LiteralPath (Join-Path $stateRoot "provisioning") -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath (Join-Path $stateRoot "provisioning-status.json") -Force -ErrorAction SilentlyContinue
+Write-HeliosProgress 100 "Helios was removed"
 Write-Host "Helios runtime registrations were removed. Reboot Windows to finish unloading the driver."

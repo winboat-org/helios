@@ -6,8 +6,10 @@ param(
     [Parameter(Mandatory)][string]$OpenClArtifact,
     [Parameter(Mandatory)][string]$LoadersArtifact,
     [Parameter(Mandatory)][string]$CompatibilityArtifact,
+    [Parameter(Mandatory)][string]$InstallerArtifact,
     [Parameter(Mandatory)][string]$OutputDir,
     [Parameter(Mandatory)][string]$Version,
+    [Parameter(Mandatory)][ValidateSet("Debug", "Release")][string]$Configuration,
     [Parameter(Mandatory)][string]$RepositoryCommit,
     [Parameter(Mandatory)][string]$MesaCommit,
     [Parameter(Mandatory)][string]$DxvkCommit,
@@ -43,15 +45,45 @@ function Invoke-SignTool([string]$SignTool, [string]$Thumbprint, [string]$Path) 
 }
 
 $shortCommit = $RepositoryCommit.Substring(0, 8)
-$packageId = "helios-windows-x64-$Version-$shortCommit"
-$stagingRoot = Join-Path $OutputDir $packageId
+$configurationSuffix = if ($Configuration -eq "Debug") { "-debug" } else { "" }
+$packageId = "helios-windows-x64-$Version-$shortCommit$configurationSuffix"
+$stagingRoot = Join-Path (Join-Path $OutputDir "staging") $packageId
 $payload = Join-Path $stagingRoot "payload"
+# Symbols are never embedded in the installer. They are useless at install time
+# and are ~25 MB even after compression, so they ship as a separate artifact.
+$symbolsRoot = Join-Path $OutputDir "$packageId-symbols"
 if (Test-Path -LiteralPath $stagingRoot) { Remove-Item -LiteralPath $stagingRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $payload | Out-Null
 
+# The driver and installer artifacts must be the same configuration as this
+# bundle, or a "debug" bundle silently ships release binaries.
+$driverConfigurationFile = Join-Path $DriverArtifact "configuration.txt"
+if (Test-Path -LiteralPath $driverConfigurationFile -PathType Leaf) {
+    $driverConfiguration = (Get-Content -LiteralPath $driverConfigurationFile -Raw).Trim()
+    if ($driverConfiguration -ne $Configuration) {
+        throw "Driver artifact is $driverConfiguration but this bundle is $Configuration."
+    }
+}
+$installerConfigurationFile = Join-Path $InstallerArtifact "configuration.txt"
+if (Test-Path -LiteralPath $installerConfigurationFile -PathType Leaf) {
+    $installerConfiguration = (Get-Content -LiteralPath $installerConfigurationFile -Raw).Trim()
+    if ($installerConfiguration -ne $Configuration) {
+        throw "Installer artifact is $installerConfiguration but this bundle is $Configuration."
+    }
+}
+
 $packageSource = Join-Path $RepoRoot "packaging\windows"
-foreach ($script in @("Install-Helios.cmd", "Install-Helios.ps1", "Uninstall-Helios.ps1", "Verify-Helios.ps1", "Helios-PackageCommon.ps1", "README.md")) {
+# Only the scripts the installer runs after extraction are embedded. The
+# human-facing README is placed next to the final exe, not inside it, and the
+# old Install-Helios.cmd launcher is gone now that the exe is the entry point.
+foreach ($script in @("Install-Helios.ps1", "Uninstall-Helios.ps1", "Verify-Helios.ps1", "Helios-PackageCommon.ps1")) {
     Copy-Required (Join-Path $packageSource $script) (Join-Path $stagingRoot $script)
+}
+# The Rust skeleton is NOT copied into the payload; it is the template the
+# packer appends the payload to at the end of this script.
+$skeleton = Join-Path $InstallerArtifact "HeliosSetup.exe"
+if (-not (Test-Path -LiteralPath $skeleton -PathType Leaf)) {
+    throw "The installer skeleton is missing: $skeleton"
 }
 
 $driverOut = Join-Path $payload "driver"
@@ -73,8 +105,10 @@ foreach ($name in @("helios_umd32.dll", "helios_umd12_32.dll")) {
 }
 foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb", "helios_umd12.pdb", "helios_umd32.pdb", "helios_umd12_32.pdb")) {
     $source = Join-Path $DriverArtifact $optional
-    if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Required $source (Join-Path $driverOut $optional) }
+    if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Required $source (Join-Path $symbolsRoot $optional) }
 }
+$installerPdb = Join-Path $InstallerArtifact "HeliosSetup.pdb"
+if (Test-Path -LiteralPath $installerPdb -PathType Leaf) { Copy-Required $installerPdb (Join-Path $symbolsRoot "HeliosSetup.pdb") }
 
 $mesaOut = Join-Path $payload "mesa"
 foreach ($name in @("vulkan_virtio.dll", "libgallium_wgl.dll")) {
@@ -96,7 +130,7 @@ foreach ($dependency in Get-ChildItem -LiteralPath $MesaX86Artifact -Filter "lib
 $openClOut = Join-Path $payload "opencl"
 Copy-Required (Join-Path $OpenClArtifact "clvk.dll") (Join-Path $openClOut "clvk.dll")
 $clvkPdb = Join-Path $OpenClArtifact "clvk.pdb"
-if (Test-Path -LiteralPath $clvkPdb -PathType Leaf) { Copy-Required $clvkPdb (Join-Path $openClOut "clvk.pdb") }
+if (Test-Path -LiteralPath $clvkPdb -PathType Leaf) { Copy-Required $clvkPdb (Join-Path $symbolsRoot "clvk.pdb") }
 
 $loadersOut = Join-Path $payload "loaders"
 Copy-Required (Join-Path $LoadersArtifact "vulkan-1.dll") (Join-Path $loadersOut "vulkan-1.dll")
@@ -134,12 +168,8 @@ foreach ($name in @(
     Copy-Required (Join-Path $CompatibilityArtifact $name) (Join-Path $resolveCompatibilityOut $name)
 }
 
-foreach ($architecture in @("x64", "x86")) {
-    $redistName = "vc_redist.$architecture.exe"
-    $redist = Get-ChildItem -LiteralPath $env:VCToolsRedistDir -Filter $redistName -File -Recurse | Select-Object -First 1
-    if (-not $redist) { throw "The Visual C++ $architecture redistributable was not found below $env:VCToolsRedistDir." }
-    Copy-Required $redist.FullName (Join-Path $payload "prerequisites\$redistName")
-}
+# No VC++ redistributables are shipped: both UMDs are built with the static CRT
+# (vkd3d `-Db_vscrt=mt` + crt-static), asserted in Build-Driver.ps1.
 
 $licenseOut = Join-Path $stagingRoot "licenses"
 foreach ($artifact in @($DriverArtifact, $MesaArtifact, $MesaX86Artifact, $OpenClArtifact, $LoadersArtifact, $CompatibilityArtifact)) {
@@ -215,6 +245,7 @@ $manifest = [ordered]@{
     packageId = $packageId
     version = $Version
     architecture = "x64"
+    configuration = $Configuration
     applicationArchitectures = @("x64", "x86")
     createdAtUtc = [DateTime]::UtcNow.ToString("o")
     source = [ordered]@{
@@ -249,11 +280,40 @@ $manifest = [ordered]@{
 }
 $manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath (Join-Path $stagingRoot "manifest.json") -Encoding UTF8
 
+# Finalize the self-contained installer. The Rust packer appends the whole
+# payload folder (scripts, driver, Mesa, CLVK, loaders, certificate, manifest)
+# to the skeleton, so the shipped artifact is one HeliosSetup.exe. The packer is
+# a GUI-subsystem exe, so it must be waited on explicitly.
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+$finalDir = Join-Path $OutputDir $packageId
+if (Test-Path -LiteralPath $finalDir) { Remove-Item -LiteralPath $finalDir -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $finalDir | Out-Null
+$selfContained = Join-Path $finalDir "HeliosSetup.exe"
+$pack = Start-Process -FilePath $skeleton -ArgumentList @("--bundle", $stagingRoot, $selfContained) -Wait -PassThru
+if ($pack.ExitCode -ne 0) {
+    throw "The installer packer failed with exit code $($pack.ExitCode)."
+}
+if (-not (Test-Path -LiteralPath $selfContained -PathType Leaf)) {
+    throw "The self-contained installer was not produced at $selfContained."
+}
+Copy-Item -LiteralPath (Join-Path $packageSource "README.md") -Destination $finalDir -Force
+
 $zipPath = Join-Path $OutputDir "$packageId.zip"
 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
-Compress-Archive -LiteralPath $stagingRoot -DestinationPath $zipPath -CompressionLevel Optimal
+Compress-Archive -LiteralPath $finalDir -DestinationPath $zipPath -CompressionLevel Optimal
 $zipHash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath "$zipPath.sha256" -Value "$zipHash  $([IO.Path]::GetFileName($zipPath))" -Encoding ascii
 Write-Host "Package: $zipPath"
 Write-Host "SHA256: $zipHash"
+
+# Separate symbols archive, produced only when the build actually emitted
+# symbols. It is uploaded alongside the installer and, on a tagged release,
+# published as its own asset.
+if (Test-Path -LiteralPath $symbolsRoot -PathType Container) {
+    $symbolsZip = Join-Path $OutputDir "$packageId-symbols.zip"
+    Remove-Item -LiteralPath $symbolsZip -Force -ErrorAction SilentlyContinue
+    Compress-Archive -LiteralPath $symbolsRoot -DestinationPath $symbolsZip -CompressionLevel Optimal
+    $symbolsHash = (Get-FileHash -LiteralPath $symbolsZip -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -LiteralPath "$symbolsZip.sha256" -Value "$symbolsHash  $([IO.Path]::GetFileName($symbolsZip))" -Encoding ascii
+    Write-Host "Symbols: $symbolsZip"
+}
