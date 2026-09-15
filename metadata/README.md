@@ -118,9 +118,15 @@ license/copyright notices remain intact. No blanket copyright replacement was ma
 - Mesa, Zink, Venus, DXVK, vkd3d, CLVK and the Khronos loaders keep their implementation
   identities, versions and third-party notices. WinBoat identifies the distributed
   Helios product. Vulkan conformance fields are not a claim of Helios certification.
-- Binary filenames, exports, service/registry paths, class GUID, INF feature score,
-  hardware matches and UMD registration slots remain unchanged. Archived drivers
-  and frozen historical documents are not rewritten.
+- Binary filenames, exports, service/registry paths, class GUID, hardware matches
+  and UMD registration slots remain unchanged. Archived drivers and frozen
+  historical documents are not rewritten.
+- The INF feature score was deliberately changed from FF to F6. FF is Windows'
+  unspecified-default driver rank, and the rank's feature byte outranks its
+  identifier byte, so FF lost to basicdisplay.inf (0xFB), stdvga (0xF8) and
+  viogpudo (0xF9) — a live install was left bound to Microsoft Basic Display.
+  F6 outranks all three on Helios's own PCI IDs; the signature byte still carries
+  the test-signing penalty.
 
 ## Validation
 

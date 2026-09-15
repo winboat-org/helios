@@ -1,7 +1,8 @@
 ; helios_kmd_render.inx — Helios vGPU WDDM render and display miniport driver.
 ; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_1050). The wdk-build
 ; toolchain stamps DriverVer and produces helios_kmd_render.inf during packaging.
-; Test-signed package: intentionally worse-ranked than production drivers.
+; Test-signed package. FeatureScore is set below the inbox and virtual display
+; drivers so PnP selects Helios on its own PCI IDs; see Helios_Install below.
 ; Branding strings are synchronized from metadata/helios.env by tools/sync-metadata.py.
 
 [Version]
@@ -39,7 +40,27 @@ helios_umd12_32.dll = 1,,
 
 [Helios_Install]
 Include = msdv.inf
-FeatureScore = FF
+
+; Driver rank is 0xSSGGTHHH (signature / feature / identifier); lower is better,
+; and the feature byte GG outranks the identifier byte. FeatureScore FF is
+; Windows' unspecified default, and it LOSES to every driver this device can
+; meet, because all of them declare a better score:
+;
+;   basicdisplay.inf (inbox Microsoft Basic Display fallback) = 0xFB
+;   stdvga           (QEMU standard VGA, reference convention) = 0xF8
+;   viogpudo         (Red Hat VirtIO GPU DOD, SAME PCI IDs)    = 0xF9
+;
+; With FF the virtio-gpu device stayed on Microsoft Basic Display after a live
+; install, and packaging/windows/Install-Helios.ps1 threw "PnP did not select a
+; third-party Helios driver package". The package only ever bound when it was
+; staged into the image before the device first enumerated.
+;
+; F6 is below all three, so Helios wins the rank against Basic Display and
+; viogpudo and binds on a running system. It is not 0x00, so it makes no
+; absolute-best claim; the signature byte still carries the test-signing
+; penalty, and this cannot outrank a real GPU's driver because the Models
+; entries match only VEN_1AF4&DEV_1050.
+FeatureScore = F6
 CopyFiles = Helios_CopyFiles
 AddReg = Helios_DeviceSettings
 
