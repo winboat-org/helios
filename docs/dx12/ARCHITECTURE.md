@@ -1283,11 +1283,11 @@ allowlist to the DDI versions actually implemented — but **never** drop `layou
 `umd/build.rs` gains the identical line in the same commit; a `bridge_common.h` visible to only one
 of the two crates is how a second `bridge_guard` gets written.
 
-**(c) The `/MD` + clang-cl coherence rule, and its `rerun-if-env-changed` edge.** State it in
+**(c) The `/MT` + clang-cl coherence rule, and its `rerun-if-env-changed` edge.** State it in
 `umd12/build.rs`'s module doc the way `umd/build.rs:9-13` does:
 
 > Toolchain coherence (critical): vkd3d, the cxx shim, and the Rust crate must all use the MSVC C++
-> ABI with the **dynamic** CRT (`/MD`).
+> ABI with the **static** CRT (`/MT`), so the UMD needs no VC++ redistributable.
 
 and reproduce `umd/build.rs:158-173` verbatim:
 
@@ -1399,8 +1399,8 @@ Artifacts land at `tmp/dx12/build/vkd3d-win64/libs/d3d12core/{d3d12core.dll,heli
 `libs/d3d12/d3d12.dll`, `tests/d3d12.exe`, `demos/{triangle,gears}.exe`. Copy to the VM with
 `robocopy`/`win_exec` — nothing about the *build* needs the VM.
 
-⚠ **`/MD` does not reach across the D4 boundary.** §8.1(c)'s toolchain-coherence rule (vkd3d, the
-cxx shim and the Rust crate all on the MSVC C++ ABI with the dynamic CRT) is a rule about objects
+⚠ **`/MT` does not reach across the D4 boundary.** §8.1(c)'s toolchain-coherence rule (vkd3d, the
+cxx shim and the Rust crate all on the MSVC C++ ABI with the static CRT) is a rule about objects
 linked into **one image**. D4's boundary is a **C ABI + `LoadLibrary`/`GetProcAddress`**: the only
 types crossing it are `LUID`, `REFIID`, `void**`, `HRESULT` and COM vtable pointers. A mingw-built
 `helios_vkd3d.dll` and an MSVC-built `helios_umd12.dll` therefore coexist by construction — which is
