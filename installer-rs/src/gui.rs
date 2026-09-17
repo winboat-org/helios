@@ -22,11 +22,14 @@ use crate::{prepare_payload, start_worker, Event, Op};
 const BG: u32 = 0x001B1614; // COLORREF is 0x00BBGGRR
 const CARD: u32 = 0x0029201C;
 const CARD_HOVER: u32 = 0x00382823;
+const EDGE: u32 = 0x0040302A;     // #2A3040
 const TEXT: u32 = 0x00F2EBE8;
 const MUTED: u32 = 0x00B3A298;
 const ACCENT_A: (u8, u8, u8) = (0x75, 0x50, 0xDC);
 const ACCENT_B: (u8, u8, u8) = (0x3C, 0x88, 0xF5);
 const SUCCESS: u32 = 0x008FC235;
+const ERROR: u32 = 0x004A56F0;   // #F0564A
+const ACCENT: u32 = 0x00DC5075;  // #7550DC
 const LOG_BG: u32 = 0x0016110F;
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -105,6 +108,7 @@ struct State {
     automatic: bool,
     worker: Option<Receiver<Event>>,
     running: bool,
+    failed: bool,
     progress: u8,
     progress_active: bool,
     status: String,
@@ -187,7 +191,7 @@ fn fill_gradient(hdc: HDC, rect: Rect, from: (u8, u8, u8), to: (u8, u8, u8)) {
 
 fn rounded(hdc: HDC, rect: Rect, radius: f32, fill: u32) {
     let brush = unsafe { CreateSolidBrush(colorref(fill)) };
-    let pen = unsafe { CreatePen(PS_NULL, 0, 0) };
+    let pen = unsafe { CreatePen(PS_SOLID, 1, colorref(EDGE)) };
     let old_brush = unsafe { SelectObject(hdc, brush as HGDIOBJ) };
     let old_pen = unsafe { SelectObject(hdc, pen as HGDIOBJ) };
     unsafe {
@@ -462,15 +466,25 @@ fn paint(state: &State, hdc: HDC, client_w: i32, client_h: i32) {
     // Card.
     rounded(hdc, state.card, RADIUS * s, CARD);
     unsafe {
-        let dot = CreateSolidBrush(colorref(if state.installed { SUCCESS } else { MUTED }));
-        let r = RECT {
-            left: (state.card.x + 18.0 * s) as i32,
-            top: (state.card.y + state.card.h / 2.0 - 5.0 * s) as i32,
-            right: (state.card.x + 28.0 * s) as i32,
-            bottom: (state.card.y + state.card.h / 2.0 + 5.0 * s) as i32,
+        let tint = if state.failed {
+            ERROR
+        } else if state.updating {
+            ACCENT
+        } else if state.installed {
+            SUCCESS
+        } else {
+            MUTED
         };
-        let mut r = r;
-        FillRect(hdc, &mut r, dot);
+        let dot = CreateSolidBrush(colorref(tint));
+        let old = SelectObject(hdc, dot as HGDIOBJ);
+        Ellipse(
+            hdc,
+            (state.card.x + 18.0 * s) as i32,
+            (state.card.y + state.card.h / 2.0 - 5.0 * s) as i32,
+            (state.card.x + 28.0 * s) as i32,
+            (state.card.y + state.card.h / 2.0 + 5.0 * s) as i32,
+        );
+        SelectObject(hdc, old);
         DeleteObject(dot as HGDIOBJ);
     }
     let card_text_x = state.card.x + 40.0 * s;
@@ -517,10 +531,25 @@ fn paint(state: &State, hdc: HDC, client_w: i32, client_h: i32) {
         let hot = state.hover == Some(button.id) && button.enabled;
         if button.primary && button.enabled {
             rounded_gradient(hdc, button.rect, RADIUS * s, ACCENT_A, ACCENT_B);
+            if hot {
+                unsafe {
+                    let pen = CreatePen(PS_SOLID, 1, colorref(0x00FFFFFF));
+                    let old = SelectObject(hdc, pen as HGDIOBJ);
+                    let null = CreateSolidBrush(colorref(CARD));
+                    let oldb = SelectObject(hdc, null as HGDIOBJ);
+                    RoundRect(hdc, button.rect.x as i32, button.rect.y as i32,
+                              button.rect.right() as i32, button.rect.bottom() as i32,
+                              (RADIUS * s * 2.0) as i32, (RADIUS * s * 2.0) as i32);
+                    SelectObject(hdc, oldb);
+                    SelectObject(hdc, old);
+                    DeleteObject(null as HGDIOBJ);
+                    DeleteObject(pen as HGDIOBJ);
+                }
+            }
             text(hdc, state.font_button, &button.label, button.rect, 0x00FFFFFF, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             rounded(hdc, button.rect, RADIUS * s, if !button.enabled { CARD } else if hot { CARD_HOVER } else { CARD });
-            let color = if button.enabled { TEXT } else { 0x005E5650 };
+            let color = if button.enabled { TEXT } else { 0x00A3938A };
             text(hdc, state.font_button, &button.label, button.rect, color, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
@@ -612,6 +641,7 @@ fn start_operation(state: &mut State, op: Op) {
         return;
     }
     state.running = true;
+    state.failed = false;
     state.progress = 0;
     state.progress_active = true;
     state.reboot_pending = false;
@@ -694,6 +724,7 @@ fn drain(state: &mut State) {
         } else if code == 2 {
             state.status = "This stored installer can only uninstall.".to_string();
         } else {
+            state.failed = true;
             state.status = format!("Setup failed (exit code {code}). See the log above.");
             append_log(state, &format!("[setup] failed with exit code {code}."));
         }
@@ -957,6 +988,7 @@ pub fn run(exe: &Path, automatic: bool) -> i32 {
                 automatic,
                 worker: None,
                 running: false,
+                failed: false,
                 progress: 0,
                 progress_active: false,
                 status: String::new(),
