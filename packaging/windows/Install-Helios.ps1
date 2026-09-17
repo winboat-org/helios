@@ -100,9 +100,15 @@ if (-not (Test-Path -LiteralPath $provisioningStatusPath -PathType Leaf)) {
 
 $previousState = $null
 if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-    if ($Repair) {
-        Write-Host "Re-applying $($manifest.version) over the existing Helios installation."
-        $previousState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $existingState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    # `-Automatic` over an existing install is the post-reboot completion step
+    # ONLY when the bundle version matches. A different version is an update and
+    # must go through the re-apply path, or shipping a newer OEM bundle would be
+    # a silent no-op that just reports `finished`.
+    $isUpdate = $Repair -or ([string]$existingState.version -ne [string]$manifest.version)
+    if ($isUpdate) {
+        $previousState = $existingState
+        Write-Host "Re-applying $($manifest.version) over the existing installation ($($existingState.version))."
         Write-HeliosProgress 12 "Preparing to overwrite the existing installation"
     } elseif ($Automatic) {
         & (Join-Path $stateRoot "Verify-Helios.ps1")
@@ -463,13 +469,9 @@ if ($previousState -and [string]$previousState.installRoot -and
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Helios-PackageCommon.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Uninstall-Helios.ps1") -Destination $stateRoot -Force
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Verify-Helios.ps1") -Destination $stateRoot -Force
-# Persist a usable uninstaller beside the copied scripts so Helios can be
-# removed later without the original bundle. The GUI detects the absent payload
-# in this copy and offers uninstall only.
-$setupExe = Join-Path $bundleRoot "HeliosSetup.exe"
-if (Test-Path -LiteralPath $setupExe -PathType Leaf) {
-    Copy-Item -LiteralPath $setupExe -Destination (Join-Path $stateRoot "HeliosSetup.exe") -Force
-}
+# Keep the manifest beside the scripts so a stored uninstaller can read the
+# version. The installer exe is NOT copied: it is self-contained and embedding it
+# in its own payload would duplicate the whole bundle.
 if (Test-Path -LiteralPath (Join-Path $bundleRoot "manifest.json") -PathType Leaf) {
     Copy-Item -LiteralPath (Join-Path $bundleRoot "manifest.json") -Destination $stateRoot -Force
 }
@@ -483,7 +485,11 @@ if ($RunSmokeTests) {
 } else {
     & (Join-Path $stateRoot "Verify-Helios.ps1") -AllowPendingReboot
 }
-Write-HeliosProvisioningStatus "driver-restart-required"
+# Do not pull an observer that already saw `finished` back into a reboot path.
+$currentStatus = if (Test-Path -LiteralPath $provisioningStatusPath -PathType Leaf) {
+    (Get-Content -LiteralPath $provisioningStatusPath -Raw | ConvertFrom-Json).status
+} else { "" }
+if ($currentStatus -ne "finished") { Write-HeliosProvisioningStatus "driver-restart-required" }
 Write-HeliosProgress 100 "Installation complete"
 Write-Warning "Reboot Windows before judging driver or desktop behavior."
 exit 3010

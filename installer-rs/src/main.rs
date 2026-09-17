@@ -296,6 +296,12 @@ fn parse_args() -> (Options, Option<(PathBuf, PathBuf)>) {
                 bundle = Some((PathBuf::from(&argv[i + 1]), PathBuf::from(&argv[i + 2])));
                 i += 2;
             }
+            "--bundle" => {
+                // A packaging misconfiguration must fail, not fall through to the
+                // GUI/silent install path with the operands silently ignored.
+                eprintln!("Helios: --bundle requires <payloadDir> <outExe>");
+                std::process::exit(2);
+            }
             _ => {}
         }
         i += 1;

@@ -105,9 +105,9 @@ const DXVK_C_COMPAT_HEADER: &str = "Z:\\umd\\build-support\\dxvk_c_compat.h";
 /// against. `umd/.cargo/config.toml` sets `crt-static` for the Rust half and
 /// `ci/windows/Build-Driver.ps1` asserts the shipped DLL imports no dynamic CRT.
 ///
-/// ⚠ This is the one place DXVK and vkd3d deliberately DIVERGE: vkd3d/`umd12`
-/// use the **dynamic** CRT (`-Db_vscrt=md`, `umd12/build.rs:32`). Do not
-/// "harmonise" them — each archive set must match the Rust crate that links it.
+/// vkd3d/`umd12` follow the SAME rule (`-Db_vscrt=mt` + `umd12`'s `crt-static`),
+/// so both engines' archives match the Rust crate that links them and the
+/// installer never needs the VC++ redistributables.
 ///
 /// The flag set is otherwise `ci/windows/Build-Driver.ps1`'s, which is the
 /// reference build; `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` carries the same
@@ -117,7 +117,7 @@ const DXVK_CPP_ARGS: &str = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH \
      -Wno-unused-private-field -Wno-unused-lambda-capture -Wno-c++20-extensions \
      -Wno-unused-const-variable";
 
-/// vkd3d-proton, built exactly like DXVK: clang-cl + MSVC ABI + `-Db_vscrt=md`,
+/// vkd3d-proton, built exactly like DXVK: clang-cl + MSVC ABI + `-Db_vscrt=mt`,
 /// into static archives that `helios_umd12.dll` links directly.
 ///
 /// ⛔ **Static, not a DLL** — owner decision 2026-08-05 (`DECISIONS.md` D4):
@@ -974,7 +974,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Build vkd3d-proton (the D3D12 engine) on win11 with the clang-cl (MSVC ABI) toolchain, producing the STATIC archives helios_umd12.dll links. ⛔ STATIC, NOT A DLL — owner decision 2026-08-05 (DECISIONS.md D4): \"we are going to statically link vkd3d-proton and not mess with dynamic dlls\". This is the exact shape win_dxvk uses for DXVK, and for the same reasons: it mirrors Z:\\vkd3d-proton-helios -> the local checkout C:\\Users\\Rupansh\\vkd3d-proton-helios (meson build IO must not run on the Z:\\ 9p share) and builds into C:\\Users\\Rupansh\\vkd3d-build. CRITICAL and the reason this tool exists rather than a raw win_exec: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64, because cmd expands %PATH% at PARSE time — the reverse order silently drops MSVC's lib.exe/link.exe and the archive step dies with 'CreateProcess failed'. It also pins CC/CXX=clang-cl, which is how meson picks clang-cl over cl.exe (matching the DXVK build dir, verified: compiler id clang-cl 17.0.6, linker lld-link, b_vscrt=md). Empty `args` is the normal case: it configures the build dir with the canonical setup if unconfigured, then compiles. The artifact set to link is libs/d3d12core/libhelios_d3d12_static.a plus libs/vkd3d/libvkd3d-proton.a, libs/vkd3d-common/libvkd3d_common.a, libs/vkd3d-shader/libvkd3d-shader.a, subprojects/dxil-spirv/libdxil-spirv.a, subprojects/dxil-spirv/libdxbc_spv_module.a and subprojects/dxil-spirv/subprojects/dxbc-spirv/libdxbc_spv.a. ⚠ helios_d3d12_static deliberately excludes libs/d3d12core/main.c, the only object in the engine that references CreateDXGIFactory1 — so the static arm has NO dxgi.dll import, which the retired DLL arm did have. Toolchain deps are all present on win11: widl from the WinLibs UCRT mingw64 bin, glslangValidator from the Vulkan SDK, meson/ninja from Python 3.12. Prerequisite: the nested submodules must be initialised (git submodule update --init --recursive inside the submodule) or meson will not configure."
+        description = "Build vkd3d-proton (the D3D12 engine) on win11 with the clang-cl (MSVC ABI) toolchain, producing the STATIC archives helios_umd12.dll links. ⛔ STATIC, NOT A DLL — owner decision 2026-08-05 (DECISIONS.md D4): \"we are going to statically link vkd3d-proton and not mess with dynamic dlls\". This is the exact shape win_dxvk uses for DXVK, and for the same reasons: it mirrors Z:\\vkd3d-proton-helios -> the local checkout C:\\Users\\Rupansh\\vkd3d-proton-helios (meson build IO must not run on the Z:\\ 9p share) and builds into C:\\Users\\Rupansh\\vkd3d-build. CRITICAL and the reason this tool exists rather than a raw win_exec: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64, because cmd expands %PATH% at PARSE time — the reverse order silently drops MSVC's lib.exe/link.exe and the archive step dies with 'CreateProcess failed'. It also pins CC/CXX=clang-cl, which is how meson picks clang-cl over cl.exe (matching the DXVK build dir, verified: compiler id clang-cl 17.0.6, linker lld-link, b_vscrt=mt). Empty `args` is the normal case: it configures the build dir with the canonical setup if unconfigured, then compiles. The artifact set to link is libs/d3d12core/libhelios_d3d12_static.a plus libs/vkd3d/libvkd3d-proton.a, libs/vkd3d-common/libvkd3d_common.a, libs/vkd3d-shader/libvkd3d-shader.a, subprojects/dxil-spirv/libdxil-spirv.a, subprojects/dxil-spirv/libdxbc_spv_module.a and subprojects/dxil-spirv/subprojects/dxbc-spirv/libdxbc_spv.a. ⚠ helios_d3d12_static deliberately excludes libs/d3d12core/main.c, the only object in the engine that references CreateDXGIFactory1 — so the static arm has NO dxgi.dll import, which the retired DLL arm did have. Toolchain deps are all present on win11: widl from the WinLibs UCRT mingw64 bin, glslangValidator from the Vulkan SDK, meson/ninja from Python 3.12. Prerequisite: the nested submodules must be initialised (git submodule update --init --recursive inside the submodule) or meson will not configure."
     )]
     async fn win_vkd3d(&self, Parameters(a): Parameters<WinVkd3dArgs>) -> String {
         // Same mirror-then-build flow as win_dxvk. /XD+/XF .git skip all git
@@ -990,7 +990,7 @@ impl WinHost {
                  if ($rc -ge 8) {{ \"win_vkd3d: robocopy vkd3d source mirror failed (exit $rc)\"; exit $rc }}"
             )
         };
-        // The canonical configure. `--buildtype release` + `-Db_vscrt=md` match
+        // The canonical configure. `--buildtype release` + `-Db_vscrt=mt` match
         // DXVK exactly, which is what keeps the two engines' CRT and C++ ABI
         // compatible with the Rust msvc target that links them both.
         // enable_tests stays OFF: the conformance suite is built by the mingw
@@ -1007,7 +1007,7 @@ impl WinHost {
         // prove. Removing it hard-fails the only working build.
         let stl = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH";
         let setup = format!(
-            "meson setup {VKD3D_BUILD} {VKD3D_MIRROR} --buildtype release -Db_vscrt=md \
+            "meson setup {VKD3D_BUILD} {VKD3D_MIRROR} --buildtype release -Db_vscrt=mt \
              -Denable_tests=false \"-Dcpp_args={stl}\" \"-Dc_args={stl}\""
         );
         let meson_cmd = if !a.args.is_empty() {
@@ -1185,7 +1185,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Build the DXVK-helios C++ engine (the UMD's render backend) on win11 with the clang-cl (MSVC ABI) toolchain. Mirrors the source Z:\\dxvk-helios -> the local git checkout C:\\Users\\Rupansh\\dxvk-helios (the meson build reads the LOCAL copy, NOT the Z:\\ share) with robocopy, then runs meson in the build dir C:\\Users\\Rupansh\\dxvk-build. CRITICAL and the reason this tool exists: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64 (which supplies MSVC lib.exe/link.exe). The reverse order silently drops the MSVC archiver because cmd expands %PATH% at PARSE time, and the archive step then fails 'CreateProcess failed'. Empty `args` is the normal case and does the right thing: it configures the build dir with the canonical setup if it is not configured yet, then compiles. ⛔ That canonical setup carries `-Db_vscrt=mt` — the STATIC CRT — which must match `umd/.cargo/config.toml`'s `crt-static`; vkd3d/umd12 deliberately use the DYNAMIC CRT instead, so the two engines' flags are NOT interchangeable (see DXVK_CPP_ARGS). After this, relink the UMD with `win_cargo crate_dir:\"umd\" args:[\"build\"]` (its build.rs reruns on the changed .a archives), then deploy with win_install_umd. Edit DXVK sources on the Linux/Z:\\ side; the mirror re-syncs on every call."
+        description = "Build the DXVK-helios C++ engine (the UMD's render backend) on win11 with the clang-cl (MSVC ABI) toolchain. Mirrors the source Z:\\dxvk-helios -> the local git checkout C:\\Users\\Rupansh\\dxvk-helios (the meson build reads the LOCAL copy, NOT the Z:\\ share) with robocopy, then runs meson in the build dir C:\\Users\\Rupansh\\dxvk-build. CRITICAL and the reason this tool exists: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64 (which supplies MSVC lib.exe/link.exe). The reverse order silently drops the MSVC archiver because cmd expands %PATH% at PARSE time, and the archive step then fails 'CreateProcess failed'. Empty `args` is the normal case and does the right thing: it configures the build dir with the canonical setup if it is not configured yet, then compiles. ⛔ That canonical setup carries `-Db_vscrt=mt` — the STATIC CRT — which must match `umd/.cargo/config.toml`'s `crt-static`; vkd3d/umd12 also use the STATIC CRT, so both engines' flags agree and the installer needs no VC++ redist (see DXVK_CPP_ARGS). After this, relink the UMD with `win_cargo crate_dir:\"umd\" args:[\"build\"]` (its build.rs reruns on the changed .a archives), then deploy with win_install_umd. Edit DXVK sources on the Linux/Z:\\ side; the mirror re-syncs on every call."
     )]
     async fn win_dxvk(&self, Parameters(a): Parameters<WinDxvkArgs>) -> String {
         // The canonical configure, kept HERE rather than only in the transcript of

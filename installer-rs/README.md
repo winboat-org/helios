@@ -47,12 +47,13 @@ before that. Three channels report it:
 `src/archive.rs` owns both packing and unpacking:
 
 ```
-[ PE image ][ entry data... ][ index ][ footer(64B: offset, size, index_off, sha256, "HLIOSET1") ]
+[ PE image ][ header ][ solid LZMA2 stream ][ footer(64B: offset, size, header_len, sha256, "HLIOSET2") ]
 ```
 
-Entries are raw-DEFLATE compressed. Extraction rejects absolute and
-parent-traversing entry names. The whole container is SHA-256 checked before any
-byte is written.
+The header is an uncompressed list of (name, size); the LZMA2 stream decodes to
+the concatenation of every entry in header order. Extraction rejects absolute and
+parent-traversing entry names, and the whole container is SHA-256 checked before
+any byte is written.
 
 ## Build
 

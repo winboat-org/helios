@@ -142,8 +142,8 @@ The driver job installs native `widl` through MSYS2's
 It builds only `helios_d3d12_static`; no app-local `d3d12.dll`, `d3d12core.dll`,
 or `helios_vkd3d.dll` is shipped. The build verifies PE machine types and undecorated `OpenAdapter10`,
 `OpenAdapter10_2`, and `OpenAdapter12` exports, rejects DXGI/D3D12 runtime imports
-in both D3D12 UMDs, and rejects dynamic CRT imports in both D3D11 UMDs. DXVK uses `/MT`; vkd3d and
-UMD12 keep their existing `/MD` contract and the bundle includes both VC runtimes.
+in both D3D12 UMDs, and rejects dynamic CRT imports in ALL FOUR UMDs. DXVK and vkd3d are both
+built `/MT` and the UMD crates are `crt-static`, so no Visual C++ runtime ships.
 Engine licenses, optional UMD PDBs, vkd3d source provenance, and the actual driver
 build tool versions (`payload/driver/toolchain.json`) travel with the package.
 
