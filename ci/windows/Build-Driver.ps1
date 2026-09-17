@@ -1,12 +1,19 @@
 param(
     [Parameter(Mandatory)][string]$RepoRoot,
     [Parameter(Mandatory)][string]$OutputDir,
+    [ValidateSet("Debug", "Release")][string]$Configuration = "Release",
     [string]$BuildRoot = "C:\helios-build"
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Initialize-HeliosBuild.ps1")
+
+# cargo's debug profile is named `dev` but writes to target/debug; the two names
+# are kept apart deliberately so neither is hardcoded downstream.
+$cargoMakeProfile = if ($Configuration -eq "Debug") { "dev" } else { "release" }
+$profileDir = if ($Configuration -eq "Debug") { "debug" } else { "release" }
+$mesonBuildType = if ($Configuration -eq "Debug") { "debug" } else { "release" }
 
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
 # Reject stale checked-in INF/Cargo descriptions before starting engine builds.
@@ -43,8 +50,8 @@ foreach ($architecture in @("x64", "x86")) {
     $env:PATH = "$env:LIBCLANG_PATH;$kitBin;$env:PATH"
     $nativeName = if ($architecture -eq "x86") { "clang-cl-x86-native.ini" } else { "clang-cl-native.ini" }
     $nativeFile = Join-Path $RepoRoot "ci\windows\$nativeName"
-    $dxvkBuild = Join-Path $BuildRoot "dxvk-$architecture"
-    $vkd3dBuild = Join-Path $BuildRoot "vkd3d-$architecture"
+    $dxvkBuild = Join-Path $BuildRoot "$Configuration\dxvk-$architecture"
+    $vkd3dBuild = Join-Path $BuildRoot "$Configuration\vkd3d-$architecture"
     foreach ($directory in @($dxvkBuild, $vkd3dBuild)) {
         if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force }
     }
@@ -58,7 +65,7 @@ foreach ($architecture in @("x64", "x86")) {
         "-Wno-unused-const-variable"
     ) -join " "
     & meson.exe setup $dxvkBuild $dxvkSource `
-        --native-file $nativeFile --buildtype release -Db_vscrt=mt `
+        --native-file $nativeFile --buildtype $mesonBuildType -Db_vscrt=mt `
         "-Dcpp_args=$dxvkCppArgs" "-Dc_args=/FI$compatHeader" `
         -Denable_d3d8=false -Denable_d3d9=false -Denable_d3d10=false `
         -Denable_d3d11=true -Denable_dxgi=true
@@ -66,10 +73,11 @@ foreach ($architecture in @("x64", "x86")) {
     & meson.exe compile -C $dxvkBuild
     if ($LASTEXITCODE -ne 0) { throw "DXVK $architecture build failed with exit code $LASTEXITCODE." }
 
-    # Preserve the engine/bridge CRT contract for BOTH architectures: DXVK /MT,
-    # vkd3d /MD. clang-cl uses MSVC ABI; MinGW archives cannot be linked here.
+    # Static CRT for BOTH engines, so no VC++ redistributable is needed on the
+    # target: DXVK and vkd3d are /MT, and the umd/umd12 crates are crt-static.
+    # clang-cl uses the MSVC ABI; MinGW archives cannot be linked here.
     & meson.exe setup $vkd3dBuild $vkd3dSource `
-        --native-file $nativeFile --buildtype release -Db_vscrt=md `
+        --native-file $nativeFile --buildtype $mesonBuildType -Db_vscrt=mt `
         -Denable_tests=false "-Dc_args=-Wno-error=incompatible-pointer-types"
     if ($LASTEXITCODE -ne 0) { throw "vkd3d $architecture meson setup failed with exit code $LASTEXITCODE." }
     & meson.exe compile -C $vkd3dBuild helios_d3d12_static
@@ -117,7 +125,7 @@ Push-Location $kmdRoot
 try {
     $rustcVersion = (& rustc.exe --version) -join "`n"
     $cargoVersion = (& cargo.exe --version) -join "`n"
-    & cargo.exe make --profile release --makefile Cargo.make.toml
+    & cargo.exe make --profile $cargoMakeProfile --makefile Cargo.make.toml
     if ($LASTEXITCODE -ne 0) { throw "Helios driver build failed with exit code $LASTEXITCODE." }
 } finally {
     Pop-Location
@@ -126,7 +134,7 @@ try {
     $env:CARGO_TARGET_DIR = $previousCargoTargetDir
 }
 
-$package = Join-Path $kmdRoot "target\release\helios_kmd_render_package"
+$package = Join-Path $kmdRoot "target\$profileDir\helios_kmd_render_package"
 $required = @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll")
 foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $package $name) -PathType Leaf)) {
@@ -158,13 +166,15 @@ foreach ($architecture in @("x64", "x86")) {
             }
         }
     }
-    $umdImports = @(& $llvmReadObj --coff-imports (Join-Path $package $d3d11Name) 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw "Failed to inspect $d3d11Name imports." }
-    $dynamicCrtImports = @($umdImports | Where-Object {
-        $_ -match '(?i)(MSVCP\d+|VCRUNTIME\d+(?:_\d+)?|UCRTBASE|api-ms-win-crt-[^\s]+)\.dll'
-    })
-    if ($dynamicCrtImports.Count -ne 0) {
-        throw "$d3d11Name imports an application-resolvable dynamic CRT: $($dynamicCrtImports -join '; ')"
+    foreach ($name in @($d3d11Name, $d3d12Name)) {
+        $imports = @(& $llvmReadObj --coff-imports (Join-Path $package $name) 2>&1)
+        if ($LASTEXITCODE -ne 0) { throw "Failed to inspect $name imports." }
+        $dynamicCrt = @($imports | Where-Object {
+            $_ -match '(?i)(MSVCP\d+|VCRUNTIME\d+(?:_\d+)?|MSVCR\d+|UCRTBASE|api-ms-win-crt-[^\s]+)\.dll'
+        })
+        if ($dynamicCrt.Count -ne 0) {
+            throw "$name imports a dynamic CRT; the installer must not need the VC++ redistributables: $($dynamicCrt -join '; ')"
+        }
     }
     $umd12Imports = @(& $llvmReadObj --coff-imports (Join-Path $package $d3d12Name) 2>&1)
     if ($LASTEXITCODE -ne 0) { throw "Failed to inspect $d3d12Name imports." }
@@ -179,7 +189,7 @@ Copy-Item -Path (Join-Path $package "*") -Destination $OutputDir -Recurse -Force
 foreach ($crate in @("umd", "umd12")) {
     $stem = if ($crate -eq "umd") { "helios_umd" } else { "helios_umd12" }
     foreach ($architecture in @("x64", "x86")) {
-        $targetProfile = if ($architecture -eq "x86") { "target\i686-pc-windows-msvc\release" } else { "target\release" }
+        $targetProfile = if ($architecture -eq "x86") { "target\i686-pc-windows-msvc\$profileDir" } else { "target\$profileDir" }
         $source = Join-Path $RepoRoot "$crate\$targetProfile\$stem.pdb"
         $stagedStem = if ($architecture -eq "x86") {
             if ($crate -eq "umd") { "helios_umd32" } else { "helios_umd12_32" }
@@ -225,5 +235,6 @@ $toolchain = [ordered]@{
     vkd3dX86 = Get-Content (Join-Path $engineBuilds.x86.vkd3d "meson-info\intro-compilers.json") -Raw | ConvertFrom-Json
 }
 $toolchain | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $OutputDir "toolchain.json") -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $OutputDir "configuration.txt") -Value $Configuration -Encoding ascii
 
-Write-Host "Driver artifact staged at $OutputDir"
+Write-Host "Driver artifact ($Configuration) staged at $OutputDir"

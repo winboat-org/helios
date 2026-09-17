@@ -29,11 +29,14 @@
 //! # Toolchain coherence (critical)
 //!
 //! vkd3d, the cxx shim, and the Rust crate must all use the MSVC C++ ABI with
-//! the **dynamic** CRT (`/MD`). vkd3d is built with clang-cl under meson
-//! (`vkd3d-proton-helios/meson.build:9` recognises `clang-cl` and pins
-//! `cpp_std=c++17`, the same standard this shim compiles with); we compile the
-//! shim with the *same* clang-cl so the objects link against one another and
-//! against the Rust msvc target. `HELIOS_CLANG_CL` / `HELIOS_MSVC_LIB` /
+//! the **static** CRT (`/MT`): a display UMD is loaded into arbitrary application
+//! directories, and `/MD` would both let an app's local runtime DLL win and drag
+//! the VC++ redistributables into the installer. vkd3d is built with clang-cl
+//! under meson with `-Db_vscrt=mt` (`vkd3d-proton-helios/meson.build:9`
+//! recognises `clang-cl` and pins `cpp_std=c++17`, the same standard this shim
+//! compiles with); we compile the shim with the *same* clang-cl and
+//! `static_crt(true)`, and the Rust msvc target enables `crt-static` in
+//! `.cargo/config.toml`. `HELIOS_CLANG_CL` / `HELIOS_MSVC_LIB` /
 //! `HELIOS_VKD3D_BUILD` override the baked-in defaults.
 //!
 //! # The bindgen deliverable
@@ -303,6 +306,10 @@ fn build_vkd3d_bridge() {
         .compiler(&clang_cl)
         .archiver(&archiver)
         .std("c++17")
+        // Static CRT, matching vkd3d (`-Db_vscrt=mt`) and the Rust crate's
+        // `crt-static`, so the whole image uses one CRT and no VC++ redist is
+        // needed on the target.
+        .static_crt(true)
         // cxx-build disables C++ exceptions by default; the shared
         // `bridge_guard` is a try/catch and will not compile without this.
         // ⛔ Enabling EH is NOT permission to define

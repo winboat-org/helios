@@ -331,7 +331,7 @@ DXVK.** There is no `helios_vkd3d.dll` on the shipping path and no `LoadLibrary`
 
 | check | result |
 |---|---|
-| vkd3d builds under clang-cl / MSVC ABI | ✅ **143/143 targets, exit 0** — compiler id `clang-cl` 17.0.6, linker `lld-link`, `b_vscrt=md`, byte-for-byte the toolchain the DXVK build already uses |
+| vkd3d builds under clang-cl / MSVC ABI | ✅ **143/143 targets, exit 0** — compiler id `clang-cl` 17.0.6, linker `lld-link`, `b_vscrt=mt` (switched from `md` when the installer dropped the VC++ redistributables), byte-for-byte the toolchain the DXVK build already uses |
 | the static arm has no DXGI dependency | ✅ **0** undefined `CreateDXGIFactory` refs in `libhelios_d3d12_static.a`, `libvkd3d-proton.a`, `libdxil-spirv.a` — against **1** dxgi import in the retired `helios_vkd3d.dll` |
 | the Helios entry points survive | ✅ `T helios_vkd3d_create_device`, `T helios_vkd3d_serialize_root_signature` |
 | ⭐ **the engine actually renders** | ✅ **`D12-G1` PASS against the static archive, 2026-08-05** — 28 steps, 0 failures, DXIL SM 6.0 triangle exact at five sample points, `dumpbin /IMPORTS` shows **no `dxgi.dll`**. Caps identical to the mingw arm. Until this run the clang-cl archives had produced nothing and only the mingw DLL had ever drawn. `tmp/dx12/gates/G1-static/RESULT.md` |

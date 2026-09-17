@@ -247,7 +247,10 @@ helios-vgpu/
 ├── tools/                  ← launcher, deploy scripts, ~40 D3D11/DXGI/D3DKMT probes,
 │                             gate scripts, and the `win` MCP server (tools/win-mcp)
 ├── packaging/windows/      ← Install-Helios.ps1 / Verify-Helios.ps1 + the four smoke
-│                             probes — the closest thing to an automated gate today
+│                             probes — the payload the installer embeds
+├── installer-rs/           ← ACTIVE: the self-contained Rust Windows installer (GUI +
+│                             CLI). Embeds the packaging/windows payload, appended to its
+│                             own PE image by `--bundle` in ci/windows/Assemble-Package.ps1
 ├── ci/ + .github/workflows ← the Windows graphics+compute bundle build
 ├── vkd3d-proton-helios/    ← submodule, forked off upstream 2c7ba22c. ⛔⛔ **DO NOT WRITE THE
 │                             CURRENT SHA HERE.** This line has named a stale SHA three times,

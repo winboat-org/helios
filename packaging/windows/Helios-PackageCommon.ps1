@@ -14,6 +14,33 @@ function Get-HeliosSha256([Parameter(Mandatory)][string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
 }
 
+# Copy a payload tree, skipping files whose destination already has identical
+# content. Re-applying the same package cannot overwrite runtime DLLs that
+# running processes have loaded (vulkan_virtio.dll is the recorded case), and it
+# does not need to: same packageId means the bytes are identical. A genuine
+# version change installs under a new installRoot, so nothing is skipped there.
+function Copy-HeliosTreeIfChanged(
+    [Parameter(Mandatory)][string]$Source,
+    [Parameter(Mandatory)][string]$Destination,
+    # A same-packageId re-apply has byte-identical CODE but the payload copies
+    # are re-signed with a fresh per-build certificate, so the hashes differ and
+    # the loaded runtime DLLs cannot be overwritten. In that case any existing
+    # destination is already the right code, so skip it.
+    [switch]$SkipExisting
+) {
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { return }
+    foreach ($file in (Get-ChildItem -LiteralPath $Source -File -Recurse)) {
+        $relative = $file.FullName.Substring($Source.Length).TrimStart("\")
+        $target = Join-Path $Destination $relative
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+        if ((Test-Path -LiteralPath $target -PathType Leaf)) {
+            if ($SkipExisting) { continue }
+            if ((Get-HeliosSha256 $target) -eq (Get-HeliosSha256 $file.FullName)) { continue }
+        }
+        Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+    }
+}
+
 function Assert-HeliosPeArchitecture(
     [Parameter(Mandatory)][string]$Path,
     [Parameter(Mandatory)][ValidateSet("x64", "x86")][string]$Architecture
@@ -307,6 +334,19 @@ function Write-HeliosJson(
     $temporary = "$Path.tmp"
     $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $temporary -Encoding $Encoding
     Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
+# Machine-readable progress for the GUI installer. Write-Host (not Write-Output)
+# keeps it out of the pipeline; the GUI's stdout reader consumes any line that
+# begins with this marker and never shows it raw. Plain `powershell -File` users
+# just see the marker as ordinary console text, which is harmless.
+function Write-HeliosProgress(
+    [Parameter(Mandatory)][int]$Percent,
+    [Parameter(Mandatory)][string]$Message
+) {
+    if ($Percent -lt 0) { $Percent = 0 }
+    if ($Percent -gt 100) { $Percent = 100 }
+    Write-Host "HELIOS-PROGRESS $Percent $Message"
 }
 
 # Old bundles predate explicit publisher metadata. Keep their known identity for

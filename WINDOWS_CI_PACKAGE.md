@@ -29,8 +29,11 @@ The jobs are independent so an error points at the actual component:
    loader, and architecture-matched smoke probes.
 5. `compatibility` builds and validates the app-local DaVinci Resolve ADL shim.
 6. `package` test-signs the final driver package and compatibility shim, hashes
-   every distributed binary,
-   and creates `helios-windows-x64-<version>-<commit>.zip`.
+   every distributed binary, builds the Rust installer for the configuration,
+   embeds the whole payload into a single self-contained `HeliosSetup.exe`, and
+   creates `helios-windows-x64-<version>-<commit>[-debug].zip` containing that
+   exe and its `README.md`. Debug symbols (`.pdb`/`.map`) are never embedded;
+   they are published separately as `<package>-symbols.zip`.
 
 The workflow runs for pull requests and pushes to `master`, and can be started
 manually. A tag beginning with `v` also publishes the zip and its SHA-256 file
@@ -67,7 +70,7 @@ the ephemeral certificate.
 
 `Install-Helios.ps1` verifies the payload manifest before making changes, then:
 
-- installs the Visual C++ x64 and x86 runtimes and the prebuilt PnP driver package;
+- installs the prebuilt PnP driver package (the UMDs are static-CRT, so no Visual C++ runtime is needed);
 - installs Mesa and CLVK in a versioned directory below `Program Files`;
 - installs official x64 and x86 `vulkan-1.dll` loaders and the x64 `OpenCL.dll`
   only when the matching system loader is absent;
@@ -139,8 +142,8 @@ The driver job installs native `widl` through MSYS2's
 It builds only `helios_d3d12_static`; no app-local `d3d12.dll`, `d3d12core.dll`,
 or `helios_vkd3d.dll` is shipped. The build verifies PE machine types and undecorated `OpenAdapter10`,
 `OpenAdapter10_2`, and `OpenAdapter12` exports, rejects DXGI/D3D12 runtime imports
-in both D3D12 UMDs, and rejects dynamic CRT imports in both D3D11 UMDs. DXVK uses `/MT`; vkd3d and
-UMD12 keep their existing `/MD` contract and the bundle includes both VC runtimes.
+in both D3D12 UMDs, and rejects dynamic CRT imports in ALL FOUR UMDs. DXVK and vkd3d are both
+built `/MT` and the UMD crates are `crt-static`, so no Visual C++ runtime ships.
 Engine licenses, optional UMD PDBs, vkd3d source provenance, and the actual driver
 build tool versions (`payload/driver/toolchain.json`) travel with the package.
 

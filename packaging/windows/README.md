@@ -11,17 +11,32 @@ compute stack, and the 32-bit Direct3D/Vulkan/OpenGL components needed by WoW64 
 - 32-bit desktop OpenGL through a separately built x86 Zink WGL ICD
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
-- the Microsoft Visual C++ x64 and x86 runtimes required by the D3D12 UMDs
 - optional, app-local DaVinci Resolve GPU-detection shim
 
 ## Install
 
 The driver is CI/test-signed, not Microsoft production-signed. Disable Secure
-Boot in the VM firmware, then double-click `Install-Helios.cmd`. On a new VM the
-first run enables Windows test-signing and asks for a reboot. Run it again after
-the reboot to install the stack, then reboot once more before testing it.
+Boot in the VM firmware, then run `HeliosSetup.exe`. It is a single
+self-contained executable — the installer, the graphics payload, the PowerShell
+install logic and the manifest are all inside it (see
+`installer-rs/README.md`); there is no folder of loose files. It offers Install /
+Repair / Update / Uninstall and streams the log with a progress bar.
 
-From an elevated 64-bit PowerShell, the equivalent command is:
+For unattended installs, `HeliosSetup.exe --silent` installs or repairs without
+a UI and overwrites any existing installation, writing a log to
+`C:\ProgramData\Helios\logs\setup.log` and returning the payload's exit code
+(`3010` = reboot required). `HeliosSetup.exe --silent --automatic` is WinBoat's
+unattended provisioning mode and is what the OEM `install.bat` calls. On a new VM
+the first run enables Windows test-signing and asks for a reboot. Run it again
+after the reboot to install the stack, then reboot once more before testing it.
+
+To update an existing installation, run a newer `HeliosSetup.exe`; it shows
+**Update** with the version transition, and `--silent` performs the same
+overwrite. The uninstall/verify scripts are copied into `C:\ProgramData\Helios`,
+so Helios can be removed later even without the original installer.
+
+For debugging, the installer can be built from the payload scripts directly (they
+are embedded but also shipped in the source bundle):
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Helios.ps1 -EnableTestSigning
@@ -32,9 +47,6 @@ not replace `opengl32.dll`, and it never overwrites existing Khronos loader
 DLLs. Vulkan and OpenCL coexist with other vendors through their standard ICD
 registries. OpenGL is registered only on the Helios display adapter software
 key.
-
-Each installed Visual C++ runtime (x64 and x86) at least as new as the bundled
-version is kept. Otherwise, setup runs its matching redistributable installer.
 
 If the virtio-gpu device is using Red Hat's `viogpudo` driver, desktop setup
 shows a Yes/No dialog (default No) before uninstalling that driver package and
@@ -99,7 +111,6 @@ C:\ProgramData\Helios\Uninstall-Helios.ps1
 The uninstaller deliberately keeps Khronos loader DLLs because another vendor
 installed later may use them. Add `-RemoveKhronosLoaders` to remove loaders that
 this package originally installed, but only if their hashes are unchanged.
-The shared Microsoft Visual C++ runtime is also left installed.
 
 ## Current limits
 
