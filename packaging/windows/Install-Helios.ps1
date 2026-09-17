@@ -484,6 +484,15 @@ Copy-Item -LiteralPath (Join-Path $bundleRoot "Verify-Helios.ps1") -Destination 
 if (Test-Path -LiteralPath (Join-Path $bundleRoot "manifest.json") -PathType Leaf) {
     Copy-Item -LiteralPath (Join-Path $bundleRoot "manifest.json") -Destination $stateRoot -Force
 }
+# The engine licenses and the DaVinci Resolve shim live beside the stored
+# uninstaller: the bundle embeds them, but its extraction directory is deleted
+# when the installer exits.
+foreach ($extra in @("licenses", "compatibility")) {
+    $extraSource = Join-Path $bundleRoot $extra
+    if (Test-Path -LiteralPath $extraSource -PathType Container) {
+        Copy-HeliosTreeIfChanged $extraSource (Join-Path $stateRoot $extra)
+    }
+}
 Write-HeliosJson $state $statePath
 
 Write-Host ""
