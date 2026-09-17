@@ -1019,16 +1019,6 @@ pub fn run(exe: &Path, automatic: bool) -> i32 {
             state.font_button = font(12.0 * state.scale, 600, "Segoe UI");
             state.font_status = font(11.0 * state.scale, 400, "Segoe UI");
             state.font_mono = font(11.0 * state.scale, 400, "Consolas");
-            refresh(&mut state);
-            state.status = if state.installed && !state.has_install {
-                "Only uninstall is available from this stored installer.".into()
-            } else if state.updating {
-                "An update is available.".into()
-            } else if state.installed {
-                "Ready to repair or uninstall.".into()
-            } else {
-                "Ready to install.".into()
-            };
             *cell.borrow_mut() = Some(state);
         });
 
@@ -1079,15 +1069,26 @@ pub fn run(exe: &Path, automatic: bool) -> i32 {
             GetClientRect(state.hwnd, &mut client);
             layout(state, client.right, client.bottom);
             append_log(state, "Helios vGPU Setup");
-            append_log(state, &format!("Bundle: {}", state.payload_dir.display()));
+            append_log(state, &format!("Installer: {}", state.exe.display()));
             if let Err(error) = ensure_workspace(state) {
                 append_log(state, &format!("[setup] {error}"));
             }
             // ensure_workspace extracts the embedded payload and can turn a
-            // "no Install-Helios.ps1" state into an installable one, so the
-            // buttons must be recomputed after it. Otherwise the shipped
-            // single-file exe shows Install greyed out forever.
+            // "no Install-Helios.ps1" state into an installable one, so BOTH the
+            // buttons and the ready-state line must be computed after it. The
+            // shipped single-file exe otherwise reports the stored-installer
+            // status and greys out Install even though the payload is right
+            // there in the extracted directory.
             refresh(state);
+            state.status = if state.installed && !state.has_install {
+                "Only uninstall is available from this stored installer.".to_string()
+            } else if state.updating {
+                "An update is available.".to_string()
+            } else if state.installed {
+                "Ready to repair or uninstall.".to_string()
+            } else {
+                "Ready to install.".to_string()
+            };
         });
 
         ShowWindow(hwnd, SW_SHOW);
