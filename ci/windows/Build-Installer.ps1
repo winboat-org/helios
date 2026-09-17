@@ -15,9 +15,9 @@ if ($env:LIBCLANG_PATH) { $env:PATH = "$env:LIBCLANG_PATH;$env:PATH" }
 $cargo = Assert-Command "cargo.exe"
 $llvmReadObj = Assert-Command "llvm-readobj.exe"
 
-$crateRoot = Join-Path $RepoRoot "installer-rs"
+$crateRoot = Join-Path $RepoRoot "installer"
 if (-not (Test-Path -LiteralPath (Join-Path $crateRoot "Cargo.toml") -PathType Leaf)) {
-    throw "installer-rs\Cargo.toml was not found below $RepoRoot."
+    throw "installer\Cargo.toml was not found below $RepoRoot."
 }
 $profileDir = if ($Configuration -eq "Debug") { "debug" } else { "release" }
 $targetDir = Join-Path $crateRoot "target"
@@ -33,7 +33,7 @@ if ($env:RUSTFLAGS) {
 
 Push-Location $crateRoot
 try {
-    $arguments = @("build", "--target-dir", $targetDir)
+    $arguments = @("build", "--locked", "--target-dir", $targetDir)
     if ($Configuration -eq "Release") { $arguments += "--release" }
     & $cargo @arguments
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE." }

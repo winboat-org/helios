@@ -248,7 +248,7 @@ helios-vgpu/
 │                             gate scripts, and the `win` MCP server (tools/win-mcp)
 ├── packaging/windows/      ← Install-Helios.ps1 / Verify-Helios.ps1 + the four smoke
 │                             probes — the payload the installer embeds
-├── installer-rs/           ← ACTIVE: the self-contained Rust Windows installer (GUI +
+├── installer/              ← ACTIVE: the self-contained Rust Windows installer (GUI +
 │                             CLI). Embeds the packaging/windows payload, appended to its
 │                             own PE image by `--bundle` in ci/windows/Assemble-Package.ps1
 ├── ci/ + .github/workflows ← the Windows graphics+compute bundle build
