@@ -2,7 +2,7 @@
 //! Helios driver exists, i.e. on Microsoft Basic Display, where a GPU-backed
 //! toolkit cannot be assumed to initialise.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -118,10 +118,20 @@ struct State {
     progress_rect: Rect,
     log_rect: Rect,
     reboot_pending: bool,
+    reboot_prompt: bool,
 }
 
 thread_local! {
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+    // WM_CTLCOLOR* is delivered to this window *re-entrantly*: append_log's
+    // SendMessageW(EM_REPLACESEL) makes the EDIT paint, and the EDIT asks its
+    // parent for the background brush while the caller's `with_state` borrow is
+    // still live. Reaching into STATE from the WM_CTLCOLOR* handler therefore
+    // panicked ("RefCell already borrowed"), and under panic=abort that aborted
+    // the whole installer the moment any operation was started. The brush is a
+    // plain handle, so it lives in its own slot and the handler never touches
+    // STATE. See the WM_CTLCOLOR* arm below.
+    static EDIT_BRUSH: Cell<HBRUSH> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -709,18 +719,14 @@ fn drain(state: &mut State) {
         } else if code == 3010 {
             state.status = "A reboot is required to finish.".to_string();
             state.reboot_pending = true;
+            // Do NOT show the prompt here. drain runs inside `with_state`, so the
+            // STATE RefCell is still borrowed; MessageBoxW pumps messages, and a
+            // WM_PAINT/WM_TIMER delivered meanwhile re-enters `with_state` and
+            // panics ("RefCell already borrowed"). With panic=abort that aborts
+            // the whole installer mid-install. Flag it instead and let WM_TIMER
+            // show the prompt after the borrow is released.
+            state.reboot_prompt = true;
             append_log(state, "[setup] a reboot is required to finish the installation.");
-            let answer = unsafe {
-                MessageBoxW(
-                    state.hwnd,
-                    wide("Helios is installed, but Windows must restart to load the new display driver.\r\n\r\nRestart now?").as_ptr(),
-                    wide("Helios vGPU Setup").as_ptr(),
-                    MB_ICONINFORMATION | MB_YESNO,
-                )
-            };
-            if answer == IDYES {
-                do_reboot();
-            }
         } else if code == 2 {
             state.status = "This stored installer can only uninstall.".to_string();
         } else {
@@ -749,6 +755,22 @@ fn append_log(state: &mut State, line: &str) {
         SendMessageW(state.edit, EM_SETSEL, length as WPARAM, length as LPARAM);
         SendMessageW(state.edit, EM_REPLACESEL, 0, text.as_mut_ptr() as LPARAM);
         SendMessageW(state.edit, EM_SCROLLCARET, 0, 0);
+    }
+}
+
+/// Show the reboot prompt. Must be called with the STATE borrow released:
+/// MessageBoxW pumps messages, and a re-entrant `with_state` would panic.
+fn prompt_reboot(hwnd: HWND) {
+    let answer = unsafe {
+        MessageBoxW(
+            hwnd,
+            wide("Helios is installed, but Windows must restart to load the new display driver.\r\n\r\nRestart now?").as_ptr(),
+            wide("Helios vGPU Setup").as_ptr(),
+            MB_ICONINFORMATION | MB_YESNO,
+        )
+    };
+    if answer == IDYES {
+        do_reboot();
     }
 }
 
@@ -798,7 +820,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             let hdc = wparam as HDC;
             SetTextColor(hdc, rgb(0xC8, 0xD0, 0xDE));
             SetBkColor(hdc, colorref(LOG_BG));
-            with_state(|state| state.edit_brush as LRESULT)
+            // Deliberately NOT with_state: this arm can run re-entrantly while a
+            // with_state borrow is live (see EDIT_BRUSH).
+            EDIT_BRUSH.with(|brush| brush.get() as LRESULT)
         }
         WM_MOUSEMOVE => {
             let x = (lparam as i32 & 0xFFFF) as f32;
@@ -871,7 +895,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_TIMER => {
             if wparam == 1 {
-                with_state(drain);
+                let prompt = with_state(|state| {
+                    drain(state);
+                    std::mem::take(&mut state.reboot_prompt)
+                });
+                if prompt {
+                    prompt_reboot(hwnd);
+                }
             }
             0
         }
@@ -1004,6 +1034,7 @@ pub fn run(exe: &Path, automatic: bool) -> i32 {
                 progress_rect: Rect::default(),
                 log_rect: Rect::default(),
                 reboot_pending: false,
+                reboot_prompt: false,
             };
             let mut client = zeroed();
             GetClientRect(hwnd, &mut client);
@@ -1065,6 +1096,7 @@ pub fn run(exe: &Path, automatic: bool) -> i32 {
             state.edit = edit;
             SendMessageW(edit, WM_SETFONT, state.font_mono as WPARAM, 1);
             state.edit_brush = CreateSolidBrush(colorref(LOG_BG));
+            EDIT_BRUSH.with(|brush| brush.set(state.edit_brush));
             let mut client = zeroed();
             GetClientRect(state.hwnd, &mut client);
             layout(state, client.right, client.bottom);
