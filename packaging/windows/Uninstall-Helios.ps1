@@ -100,6 +100,10 @@ if (-not $KeepDriver -and [string]$state.activeInf) {
 }
 
 if (-not $KeepDriver -and -not $driverRemovalFailed) {
+    # Only "PnP still selects the removed package" is a real driver-removal
+    # failure. Everything else here (the adapter moved, its software key is
+    # absent, the rollback restore failed) is advisory: the saved class key was
+    # already restored above and the driver package is gone.
     try {
         $currentInstanceId = Get-HeliosDeviceInstanceId
         $currentInf = Get-HeliosActiveInf $currentInstanceId
@@ -107,13 +111,18 @@ if (-not $KeepDriver -and -not $driverRemovalFailed) {
         $currentInfHash = if ($currentInfPath -and (Test-Path -LiteralPath $currentInfPath -PathType Leaf)) { Get-HeliosSha256 $currentInfPath } else { "" }
         if ($currentInf -ieq [string]$state.activeInf -and
             (-not $currentInfHash -or -not $hasInfHash -or $currentInfHash -ieq $state.activeInfSha256)) {
-            throw "PnP still selects the package being removed; retry uninstall after the required restart."
+            $driverRemovalFailed = $true
+            Write-Warning "PnP still selects the package being removed; retry uninstall after the required restart."
+        } else {
+            try {
+                $currentClassKey = Get-HeliosDisplayClassKey $currentInstanceId
+                Restore-HeliosDirect3DAfterRemoval $state $currentInf $currentClassKey $currentInfHash
+            } catch {
+                Write-Warning "Direct3D rollback step skipped: $($_.Exception.Message)"
+            }
         }
-        $currentClassKey = Get-HeliosDisplayClassKey $currentInstanceId
-        Restore-HeliosDirect3DAfterRemoval $state $currentInf $currentClassKey $currentInfHash
     } catch {
-        $driverRemovalFailed = $true
-        Write-Warning "Direct3D rollback did not complete; retaining the install state for retry: $($_.Exception.Message)"
+        Write-Warning "Could not inspect the current adapter during cleanup: $($_.Exception.Message)"
     }
 }
 
