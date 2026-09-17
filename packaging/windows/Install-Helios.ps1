@@ -8,7 +8,11 @@ param(
     # snapshots rather than capturing Helios's own values as the restore point.
     [switch]$Repair,
     # Overwrite semantics for unattended callers: identical to -Repair.
-    [switch]$Force
+    [switch]$Force,
+    # The GUI/silent front-end is non-interactive and cannot answer the
+    # viogpudo prompt; installing Helios already implies replacing the display
+    # driver, so it approves the removal without a console prompt.
+    [switch]$ReplaceViogpudo
 )
 
 Set-StrictMode -Version Latest
@@ -160,7 +164,7 @@ if ($previousState -and $previousState.PSObject.Properties["previousDirect3D"] -
     }
 }
 if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInstall)) {
-    if (-not $Automatic) {
+    if (-not ($Automatic -or $ReplaceViogpudo)) {
         Write-Warning "The virtio-gpu device is currently using viogpudo ($activeInfBeforeInstall)."
         $approved = $false
         $usedGraphicalPrompt = $false
@@ -188,7 +192,7 @@ if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInst
             throw "Helios installation was cancelled; viogpudo was not changed."
         }
     } else {
-        Write-Host "Automatic mode: replacing viogpudo ($activeInfBeforeInstall) with Helios."
+        Write-Host "Unattended mode: replacing viogpudo ($activeInfBeforeInstall) with Helios."
     }
 
     Invoke-HeliosNative "pnputil.exe" @("/delete-driver", $activeInfBeforeInstall, "/uninstall", "/force") -SuccessExitCodes @(0, 259, 3010)
@@ -272,11 +276,16 @@ $state = [ordered]@{
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot,$stateRoot | Out-Null
 
-Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "mesa") (Join-Path $runtimeRoot "mesa")
-Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "opencl") (Join-Path $runtimeRoot "opencl")
-Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "loaders") (Join-Path $runtimeRoot "loaders")
+# The runtime root is keyed by packageId, so an existing one is always this
+# exact package's CODE (even after an update re-signed the payload copies).
+# Its files may be mapped by a running process and therefore un-overwritable, so
+# skip existing files instead of failing a re-apply over them.
+$runtimeExists = Test-Path -LiteralPath $runtimeRoot
+Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "mesa") (Join-Path $runtimeRoot "mesa") -SkipExisting:$runtimeExists
+Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "opencl") (Join-Path $runtimeRoot "opencl") -SkipExisting:$runtimeExists
+Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "loaders") (Join-Path $runtimeRoot "loaders") -SkipExisting:$runtimeExists
 if (Test-Path -LiteralPath (Join-Path $payloadRoot "smoke")) {
-    Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "smoke") (Join-Path $runtimeRoot "smoke")
+    Copy-HeliosTreeIfChanged (Join-Path $payloadRoot "smoke") (Join-Path $runtimeRoot "smoke") -SkipExisting:$runtimeExists
 }
 
 foreach ($file in Get-ChildItem -LiteralPath $runtimeRoot -File -Recurse) {

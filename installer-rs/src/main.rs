@@ -115,7 +115,7 @@ fn build_command(payload: &Payload, op: Op, automatic: bool) -> Command {
             if automatic {
                 command.arg("-Automatic");
             } else {
-                command.arg("-EnableTestSigning");
+                command.arg("-EnableTestSigning").arg("-ReplaceViogpudo");
             }
         }
         Op::Repair => {
@@ -123,7 +123,7 @@ fn build_command(payload: &Payload, op: Op, automatic: bool) -> Command {
             if automatic {
                 command.arg("-Automatic").arg("-Repair");
             } else {
-                command.arg("-Repair").arg("-EnableTestSigning");
+                command.arg("-Repair").arg("-EnableTestSigning").arg("-ReplaceViogpudo");
             }
         }
         Op::Uninstall => {

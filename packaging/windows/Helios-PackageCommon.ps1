@@ -21,16 +21,21 @@ function Get-HeliosSha256([Parameter(Mandatory)][string]$Path) {
 # version change installs under a new installRoot, so nothing is skipped there.
 function Copy-HeliosTreeIfChanged(
     [Parameter(Mandatory)][string]$Source,
-    [Parameter(Mandatory)][string]$Destination
+    [Parameter(Mandatory)][string]$Destination,
+    # A same-packageId re-apply has byte-identical CODE but the payload copies
+    # are re-signed with a fresh per-build certificate, so the hashes differ and
+    # the loaded runtime DLLs cannot be overwritten. In that case any existing
+    # destination is already the right code, so skip it.
+    [switch]$SkipExisting
 ) {
     if (-not (Test-Path -LiteralPath $Source -PathType Container)) { return }
     foreach ($file in (Get-ChildItem -LiteralPath $Source -File -Recurse)) {
         $relative = $file.FullName.Substring($Source.Length).TrimStart("\")
         $target = Join-Path $Destination $relative
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
-        if ((Test-Path -LiteralPath $target -PathType Leaf) -and
-            ((Get-HeliosSha256 $target) -eq (Get-HeliosSha256 $file.FullName))) {
-            continue
+        if ((Test-Path -LiteralPath $target -PathType Leaf)) {
+            if ($SkipExisting) { continue }
+            if ((Get-HeliosSha256 $target) -eq (Get-HeliosSha256 $file.FullName)) { continue }
         }
         Copy-Item -LiteralPath $file.FullName -Destination $target -Force
     }
