@@ -40,7 +40,7 @@ pub enum Op {
 }
 
 /// Events from the worker thread to the GUI, polled on a timer so no message
-/// carries a heap pointer (the C++ installer's leak class).
+/// carries a heap pointer.
 pub enum Event {
     Log(String),
     Progress(u8, String),

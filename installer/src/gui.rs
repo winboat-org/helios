@@ -719,12 +719,8 @@ fn drain(state: &mut State) {
         } else if code == 3010 {
             state.status = "A reboot is required to finish.".to_string();
             state.reboot_pending = true;
-            // Do NOT show the prompt here. drain runs inside `with_state`, so the
-            // STATE RefCell is still borrowed; MessageBoxW pumps messages, and a
-            // WM_PAINT/WM_TIMER delivered meanwhile re-enters `with_state` and
-            // panics ("RefCell already borrowed"). With panic=abort that aborts
-            // the whole installer mid-install. Flag it instead and let WM_TIMER
-            // show the prompt after the borrow is released.
+            // drain runs under with_state, so defer the prompt until the borrow
+            // is released (WM_TIMER shows it). See EDIT_BRUSH for the reentrancy.
             state.reboot_prompt = true;
             append_log(state, "[setup] a reboot is required to finish the installation.");
         } else if code == 2 {
@@ -1149,12 +1145,11 @@ pub fn console_line(value: &str) {
                 let mut line: Vec<u16> = value.encode_utf16().collect();
                 line.push(b'\r' as u16);
                 line.push(b'\n' as u16);
-                let mut written = 0u32;
-                WriteConsoleW(handle, line.as_ptr() as *const _, line.len() as u32, &mut written, std::ptr::null());
-            }
-            FreeConsole();
-        }
-    }
+                 let mut written = 0u32;
+                 WriteConsoleW(handle, line.as_ptr() as *const _, line.len() as u32, &mut written, std::ptr::null());
+             }
+             FreeConsole();
+         }
+     }
 }
 
-// Keep the DPI helper available on SDKs where it is a direct import.
