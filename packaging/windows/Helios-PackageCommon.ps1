@@ -166,7 +166,10 @@ function Test-HeliosViogpudoDriver([Parameter(Mandatory)][string]$InfName) {
     if ($leafName -ne $InfName -or $leafName -notmatch "^[A-Za-z0-9._-]+\.inf$") { return $false }
     $infPath = Join-Path $env:windir "INF\$leafName"
     if (-not (Test-Path -LiteralPath $infPath -PathType Leaf)) { return $false }
-    return (Get-Content -LiteralPath $infPath -Raw) -match "(?i)\bviogpudo(?:\.inf|\.sys)?\b"
+    # Match the driver's IDENTITY, never a bare mention of its name. The Helios
+    # INF itself names viogpudo in a comment, so `(?i)\bviogpudo\b` matched the
+    # Helios package and made the installer try to replace itself.
+    return (Get-Content -LiteralPath $infPath -Raw) -match "(?i)\bviogpudo\.(inf|sys)\b|\bVioGpuDod\b"
 }
 
 function Get-HeliosRegistrySnapshot([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name) {

@@ -48,7 +48,7 @@ Include = msdv.inf
 ;
 ;   basicdisplay.inf (inbox Microsoft Basic Display fallback) = 0xFB
 ;   stdvga           (QEMU standard VGA, reference convention) = 0xF8
-;   viogpudo         (Red Hat VirtIO GPU DOD, SAME PCI IDs)    = 0xF9
+;   Red Hat VirtIO GPU DOD (same PCI IDs as Helios)           = 0xF9
 ;
 ; With FF the virtio-gpu device stayed on Microsoft Basic Display after a live
 ; install, and packaging/windows/Install-Helios.ps1 threw "PnP did not select a
@@ -56,7 +56,7 @@ Include = msdv.inf
 ; staged into the image before the device first enumerated.
 ;
 ; F6 is below all three, so Helios wins the rank against Basic Display and
-; viogpudo and binds on a running system. It is not 0x00, so it makes no
+; the Red Hat DOD and binds on a running system. It is not 0x00, so it makes no
 ; absolute-best claim; the signature byte still carries the test-signing
 ; penalty, and this cannot outrank a real GPU's driver because the Models
 ; entries match only VEN_1AF4&DEV_1050.
