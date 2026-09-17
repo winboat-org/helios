@@ -1,8 +1,8 @@
 # Windows CI package
 
-The `Windows graphics and compute bundle` GitHub Actions workflow builds one
-x64 Windows archive that turns a clean Helios Windows 11 guest into a
-system-wide graphics/compute installation. It includes x86 Direct3D 11/12 and Vulkan/OpenGL
+The `Windows graphics and compute bundle` GitHub Actions workflow builds x64
+Windows archives (Release and Debug) that turn a clean Helios Windows 11 guest
+into a system-wide graphics/compute installation. It includes x86 Direct3D 11/12 and Vulkan/OpenGL
 components for WoW64 applications alongside the native x64 stack.
 
 The 2026-09-09 native-DGC source requires the paired renderer/protocol fork
@@ -33,7 +33,9 @@ The jobs are independent so an error points at the actual component:
    embeds the whole payload into a single self-contained `HeliosSetup.exe`, and
    creates `helios-windows-x64-<version>-<commit>[-debug].zip` containing that
    exe and its `README.md`. Debug symbols (`.pdb`/`.map`) are never embedded;
-   they are published separately as `<package>-symbols.zip`.
+   they are published separately as `<package>-symbols.zip`. The GitHub Actions
+   artifact is named `helios-windows-x64-<version>-<Configuration>`, and
+   downstream consumers pin that name (WinBoat's `build-guest-server.sh`).
 
 The workflow runs for pull requests and pushes to `master`, and can be started
 manually. A tag beginning with `v` also publishes the zip and its SHA-256 file
@@ -103,10 +105,11 @@ provider from either source.
 
 ## Application compatibility files
 
-The archive includes the separately deployed DaVinci Resolve ADL shim at
-`compatibility\DaVinci Resolve\atiadlxx.dll`. It is not installed system-wide or
-copied by `Install-Helios.ps1`. The adjacent installer safely backs up and
-places the DLL beside `Resolve.exe`; no special launcher is required.
+The bundle embeds the DaVinci Resolve ADL shim, and `Install-Helios.ps1`
+extracts it to `C:\ProgramData\Helios\compatibility\DaVinci Resolve\` beside the
+stored uninstaller. It is not installed system-wide. The adjacent installer
+safely backs up and places the DLL beside `Resolve.exe`; no special launcher is
+required.
 
 D3D12 is enabled when `HKLM\SOFTWARE\Helios!UmdD3D12` is absent. Explicit
 DWORD `0` disables it, and the installer preserves that override. The D3D12
@@ -144,8 +147,10 @@ or `helios_vkd3d.dll` is shipped. The build verifies PE machine types and undeco
 `OpenAdapter10_2`, and `OpenAdapter12` exports, rejects DXGI/D3D12 runtime imports
 in both D3D12 UMDs, and rejects dynamic CRT imports in ALL FOUR UMDs. DXVK and vkd3d are both
 built `/MT` and the UMD crates are `crt-static`, so no Visual C++ runtime ships.
-Engine licenses, optional UMD PDBs, vkd3d source provenance, and the actual driver
-build tool versions (`payload/driver/toolchain.json`) travel with the package.
+Engine licenses, vkd3d source provenance, and the actual driver build tool
+versions (`payload/driver/toolchain.json`) travel with the package: the licenses
+are installed to `C:\ProgramData\Helios\licenses\`, and optional UMD PDBs are
+published separately in `<package>-symbols.zip`.
 
 The VM comparison on 2026-09-07 found LLVM/clang-cl/libclang **22.1.8** in both
 active engine builds and Vulkan SDK **1.4.350.0** (glslang **16.2.0**). CI now
@@ -163,5 +168,4 @@ engines with the x86 Visual Studio environment and
 `ci/windows/clang-cl-x86-native.ini`. x86 Cargo outputs live under each crate's
 `target/i686-pc-windows-msvc/<profile>` and are renamed only when staged.
 Verifier checks installed image hashes against the bundle, PE architectures,
-and both four-slot registrations. The shared VC runtimes remain installed on
-uninstall, as before.
+and both four-slot registrations.

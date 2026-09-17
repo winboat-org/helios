@@ -2,8 +2,9 @@
 
 `HeliosSetup.exe` is the user-facing installer for the Helios Windows graphics
 stack, and it is a **single self-contained executable**: the whole bundle
-(scripts, KMD, both UMDs, Mesa, CLVK, Khronos loaders, certificate, manifest) is
-appended to its own PE image. There is no folder of loose files to keep together.
+(scripts, KMD, both UMDs, Mesa, CLVK, Khronos loaders, certificate, manifest,
+engine licenses, the DaVinci Resolve shim) is appended to its own PE image.
+There is no folder of loose files to keep together.
 
 Rust owns the window, the container, process supervision and the CLI. The
 install logic stays in the one PowerShell payload, which is embedded and
@@ -18,7 +19,7 @@ HeliosSetup.exe                          # GUI: Install / Repair / Update / Unin
 HeliosSetup.exe --silent [--automatic]   # no UI; install or repair/update
 HeliosSetup.exe --silent --uninstall     # no UI; remove
 HeliosSetup.exe --silent --log PATH      # log to a chosen file
-HeliosSetup.exe --bundle <payload> <out> # CI only: pack a payload folder into <out>
+HeliosSetup.exe --bundle <payloadDir> <out>  # CI only: pack a payload folder into <out>
 ```
 
 `--silent` writes `%ProgramData%\Helios\logs\setup.log` (or `--log`), returns the

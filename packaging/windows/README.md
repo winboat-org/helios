@@ -19,7 +19,7 @@ The driver is CI/test-signed, not Microsoft production-signed. Disable Secure
 Boot in the VM firmware, then run `HeliosSetup.exe`. It is a single
 self-contained executable — the installer, the graphics payload, the PowerShell
 install logic and the manifest are all inside it (see
-`installer-rs/README.md`); there is no folder of loose files. It offers Install /
+`installer/README.md`); there is no folder of loose files. It offers Install /
 Repair / Update / Uninstall and streams the log with a progress bar.
 
 For unattended installs, `HeliosSetup.exe --silent` installs or repairs without
@@ -35,8 +35,8 @@ To update an existing installation, run a newer `HeliosSetup.exe`; it shows
 overwrite. The uninstall/verify scripts are copied into `C:\ProgramData\Helios`,
 so Helios can be removed later even without the original installer.
 
-For debugging, the installer can be built from the payload scripts directly (they
-are embedded but also shipped in the source bundle):
+For debugging, run the payload scripts directly from a source checkout
+(`packaging/windows/`):
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Helios.ps1 -EnableTestSigning
@@ -48,10 +48,11 @@ DLLs. Vulkan and OpenCL coexist with other vendors through their standard ICD
 registries. OpenGL is registered only on the Helios display adapter software
 key.
 
-If the virtio-gpu device is using Red Hat's `viogpudo` driver, desktop setup
-shows a Yes/No dialog (default No) before uninstalling that driver package and
-replacing it with Helios. A remote console uses the equivalent `[y/N]` prompt.
-For WinBoat or another unattended orchestrator, use automatic mode:
+If the virtio-gpu device is using Red Hat's `viogpudo` driver, a manual
+`Install-Helios.ps1` run prompts Yes/No (default No; `[y/N]` on a console)
+before uninstalling that driver package. `HeliosSetup.exe` and `-Automatic`
+replace `viogpudo` without prompting. For WinBoat or another unattended
+orchestrator, use automatic mode:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Helios.ps1 -Automatic
@@ -94,13 +95,14 @@ reports the real Helios display adapter through the AMD enumeration surface
 Resolve expects. CLVK directly accepts Resolve 21.0.4's nonstandard context
 combining WGL and D3D11 sharing for compatibility with AMD and Intel runtimes.
 
-Close Resolve and run the compatibility directory's
-`Install-Resolve-Compatibility.ps1` from an elevated PowerShell. Resolve can
-then be started normally; no special launcher is required. The compatibility
-installer is explicit and separate from the system-stack installer. It backs
-up and hash-tracks its target, supports verified upgrades, and includes a saved
-uninstaller that restores the pre-Helios file. See the adjacent README for the
-exact command, implementation scope, and rollback behavior.
+Close Resolve and run
+`C:\ProgramData\Helios\compatibility\DaVinci Resolve\Install-Resolve-Compatibility.ps1`
+from an elevated PowerShell. Resolve can then be started normally; no special
+launcher is required. The compatibility installer is explicit and separate from
+the system-stack installer. It backs up and hash-tracks its target, supports
+verified upgrades, and includes a saved uninstaller that restores the pre-Helios
+file. See the README beside it for the exact command, scope, and rollback
+behavior.
 
 Uninstall with:
 

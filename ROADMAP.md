@@ -180,7 +180,7 @@ memory handles retain 64 bits, process pointers and PSO streams follow target
 width/alignment, and both architectures read the same Helios registry knobs.
 No KMD wire layout changed. OpenCL remains x64-only.
 
-Packaging includes four UMDs, both VC runtimes, matching D3D device/readback
+Packaging includes four UMDs, matching D3D device/readback
 probes, PE/export/CRT checks, catalog signing over final image bytes, and
 registration/hash verification. Rollback preserves or removes WoW64 registration
 by package ownership. Independent ABI, lifetime, build and rollback reviews
@@ -1720,9 +1720,10 @@ the device reports Code 0, and UMD12 occupies `UserModeDriverName[3]` with no
 exported driver are backed up under
 `C:\ProgramData\HeliosDeployBackups\before-dx12-20260907`.
 This upgrade exposed a prerequisite bug: bundled VC runtime 14.44.35211.0
-rejects installed 14.51.36247.0 with error 1638. The installer now checks the
-registered x64 runtime version and keeps an equal or newer installation;
-the successful retry exercised this path. Guest installation logs are under
+rejects installed 14.51.36247.0 with error 1638. The installer briefly worked
+around it by keeping an equal-or-newer registered runtime; both UMDs have since
+linked the static CRT, so no VC runtime ships or is touched at all. Guest
+installation logs are under
 `C:\Users\Tibix\HeliosDX12-20260907`.
 
 Local metadata refresh on 2026-09-12: after the owner-approved start/reboot,
