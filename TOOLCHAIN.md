@@ -30,7 +30,7 @@ The Windows dev VM can be a separate VM from the target VM, or the same one if y
 
 - Linux kernel **6.13+** (required for KVM page-fault fixes with blob resources)
 - Vulkan 1.3-capable GPU with a compliant driver (RADV for AMD, ANV for Intel)
-- The pinned **`qemu-helios`** submodule (based on QEMU 11.0.1)
+- The pinned **`qemu-helios`** submodule (based on QEMU 11.1.1)
 - virglrenderer built from source with Venus enabled
 
 Check your kernel:

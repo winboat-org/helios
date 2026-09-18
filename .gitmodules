@@ -12,7 +12,7 @@
 	url = https://github.com/winboat-org/vkd3d-proton.git
 [submodule "qemu-helios"]
 	path = qemu-helios
-	url = https://github.com/rupansh/qemu-helios.git
+	url = https://github.com/winboat-org/qemu-helios.git
 [submodule "virglrenderer"]
 	path = virglrenderer
 	url = https://github.com/winboat-org/virglrenderer.git
