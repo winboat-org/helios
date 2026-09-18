@@ -12,6 +12,39 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Self-contained installer and WinBoat provisioning, 2026-09-17
+
+The C++ GUI installer was replaced by a Rust one: `HeliosSetup.exe` (crate
+`helios-setup`, directory `installer/`) is a single PE image with the whole bundle
+— scripts, KMD, four UMDs, Mesa, CLVK, loaders, certificate, manifest, engine
+licenses and the DaVinci Resolve shim — appended as one solid LZMA2 container
+(`HLIOSET2`, `installer/src/archive.rs`). `Assemble-Package.ps1` produces it with
+`HeliosSetup.exe --bundle <payloadDir> <out>`; symbols are published separately as
+`<package>-symbols.zip`, and both UMDs link the static CRT, so no VC++ runtime is
+shipped. The installer carries the install logic as one embedded PowerShell payload
+and exposes `--silent`, `--automatic`, `--repair`, `--uninstall` and `--log`,
+returning `0`/`3010`/`2` and writing `%ProgramData%\Helios\provisioning-status.json`
+for orchestrators.
+
+CI builds Release **and** Debug bundles (matrix in `windows-stack.yml`); the GitHub
+artifact is `helios-windows-x64-<version>-<Configuration>`, which is what downstream
+pins. `installer/Cargo.lock` is committed and the build runs `--locked`.
+
+Verified on `d2bb2e1e`: install/repair/update/uninstall/automatic on the guest, all
+six smoke probes after reboot, and the Debug bundle. Two defects were found and fixed
+during that verification: the GUI aborted on every operation (0xc0000409 from a
+nested `STATE` RefCell borrow reachable through `WM_CTLCOLOR*` reentrancy;
+`9c428ac`), and the embedded `licenses/` and `compatibility/` were extracted to a
+temporary directory and lost (`6b57235` now installs them beside the stored
+uninstaller). WinBoat's OEM `install.bat` runs `HeliosSetup.exe --silent
+--automatic`; `build-guest-server.sh` pins the helios CI run copied into
+`C:\OEM\helios`.
+
+Open: `-Repair` cannot refresh driver binaries whose version did not change, so a
+rebuilt same-version bundle fails `Verify-Helios.ps1` loudly instead of silently
+keeping the stale DriverStore copy; and the real `viogpudo` replacement path is
+untested because the test image ships no viogpudo display package.
+
 ## Native FL12_1 admission on AMD/RADV, 2026-09-13
 
 Native FL12 was refused on every AMD host because admission required the host
