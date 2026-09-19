@@ -24,6 +24,12 @@ pub struct PresentSource {
     pub fence_value: u64,
     /// Borrowed until the same-thread Present returns; the bridge duplicates it.
     pub semaphore_handle: usize,
+    /// Borrowed VkImageCreateInfo and nested data until same-thread Present
+    /// returns. Native import deep-copies it before caching the resource.
+    pub source_image_create_info: usize,
+    /// v4: producer releases this source to EXTERNAL after its fallback blit;
+    /// helper acquires/releases it only around this frame's actual read.
+    pub source_external_ownership: bool,
     pub width: u32,
     pub height: u32,
     pub dxgi_format: u32,
@@ -93,6 +99,8 @@ pub fn set_present_source(
     alloc_size: u64,
     memory_type_index: u32,
     semaphore_handle: usize,
+    source_image_create_info: usize,
+    source_external_ownership: bool,
 ) -> i32 {
     if resid == 0
         || width == 0
@@ -116,6 +124,8 @@ pub fn set_present_source(
             resid,
             fence_value,
             semaphore_handle,
+            source_image_create_info,
+            source_external_ownership,
             width,
             height,
             dxgi_format,
@@ -239,7 +249,9 @@ pub(crate) unsafe fn vehicle_present_prepare(
             Some(pos)
                 if cache[pos].width == info.width
                     && cache[pos].height == info.height
-                    && cache[pos].dxgi_format == info.dxgi_format =>
+                    && cache[pos].dxgi_format == info.dxgi_format
+                    && cache[pos].source_template == (info.source_image_create_info != 0)
+                    && cache[pos].source_external_ownership == info.source_external_ownership =>
             {
                 cache[pos].resource_raw
             }
@@ -251,11 +263,18 @@ pub(crate) unsafe fn vehicle_present_prepare(
         }
     };
     if imported_raw == 0 {
+        // SAFETY: the armed v3 source template and all nested pointers remain
+        // live through this same-thread Present. open_texture2d copies them
+        // before caching; v2 supplies zero and does not dereference a template.
         let opened = dev.dxvk.open_texture2d(
             info.width,
             info.height,
             info.dxgi_format,
-            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            if info.source_image_create_info != 0 {
+                0 // v3 only copies the source; do not invent SAMPLED usage.
+            } else {
+                D3D11_BIND_SHADER_RESOURCE.0 as u32
+            },
             0,
             // `global` is log-only in the bridge but must be nonzero; there
             // is no KMT handle on this in-process path — carry the resid.
@@ -272,6 +291,8 @@ pub(crate) unsafe fn vehicle_present_prepare(
             false,
             false,
             false,
+            info.source_image_create_info,
+            info.source_external_ownership,
         );
         let Some(imported) = opened else {
             let n = EXT_IMPORT_FAILS.fetch_add(1, Ordering::Relaxed);
@@ -301,6 +322,8 @@ pub(crate) unsafe fn vehicle_present_prepare(
             width: info.width,
             height: info.height,
             dxgi_format: info.dxgi_format,
+            source_template: info.source_image_create_info != 0,
+            source_external_ownership: info.source_external_ownership,
             resource_raw: raw,
         });
         imported_raw = raw;

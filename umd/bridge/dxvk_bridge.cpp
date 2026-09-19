@@ -73,18 +73,20 @@
 //
 // `dxvk::DxvkError` is not a `std::exception`, so without this arm every DXVK
 // failure would log "unknown exception". The macro is the header's documented
-// customization point and expands to the *identical* catch clause the guard
-// carried before it moved (S1 is a move; behaviour change here is a defect).
+// customization point. Preserve the engine's refusal reason so an invalid
+// external-image template can be distinguished from an allocation failure.
 // It must be defined AFTER `util_error.h` above, because it is expanded when
 // `bridge_guard.h` is preprocessed.
 //
 // ⛔ Must not allocate — a `std::string` built inside a `std::bad_alloc`
-// handler can throw again. That is also why `DxvkError::message()` (which
-// returns `std::string`) is not called here.
+// handler can throw again. DxvkError::message() returns a borrowed const
+// reference; assert that contract before formatting into fixed stack storage.
 #define HELIOS_BRIDGE_ENGINE_CATCH(what)                          \
-  catch (const dxvk::DxvkError&) {                                \
-    char msg[160];                                                \
-    std::snprintf(msg, sizeof(msg), "%s: DxvkError", (what));     \
+  catch (const dxvk::DxvkError& error) {                          \
+    static_assert(std::is_same_v<decltype(error.message()), const std::string&>); \
+    char msg[512];                                                \
+    std::snprintf(msg, sizeof(msg), "%s: DxvkError: %.320s",       \
+      (what), error.message().c_str());                           \
     ::helios_bridge::umd_log(msg);                                \
   }
 #include "bridge_guard.h"
@@ -618,7 +620,9 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
     bool scanout_linear,
     bool linear_scanout_target,
     bool cross_context_optimal,
-    bool dedicated_present_buffer) const {
+    bool dedicated_present_buffer,
+    std::size_t source_image_create_info,
+    bool source_external_ownership) const {
   if (!impl || !impl->d3d11 || !global || !renderer_resource_id || !width || !height)
     return 0;
 
@@ -667,6 +671,11 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       importInfo.LinearScanoutTarget = linear_scanout_target;
       importInfo.CrossContextOptimal = cross_context_optimal;
       importInfo.DedicatedPresentBuffer = dedicated_present_buffer;
+      // Same-thread vehicle v3 borrow. DXVK deep-copies this template and its
+      // supported pNext/array data during the synchronous texture constructor.
+      importInfo.SourceCreateInfo =
+        reinterpret_cast<const VkImageCreateInfo*>(source_image_create_info);
+      importInfo.SourceExternalOwnership = source_external_ownership;
 
       // static_cast, matching the sibling context downcast in this file. Zero
       // runtime change today (the base sits at offset 0), but if an upstream DXVK

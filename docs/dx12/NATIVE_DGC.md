@@ -94,6 +94,126 @@ General DX12-to-DX11 external ownership/consumer release, pending allocator
 Reset versus fence-worker lifetime, sharing/resize/rotation/teardown and async
 WSI stress remain open.
 
+### Vulkan fault diagnostics, 2026-09-18
+
+`VKR_DEBUG=validate,fault` adds opt-in host CPU-dispatch records for image/buffer
+creation and binding, imported/exported memory identity, copies, ownership
+barriers, command-buffer submissions and real queue-marker results. Records
+include context, sequence and UTC time, with an explicit 200,000-record limit
+per context. They do not prove GPU execution or map an NVIDIA fault VA directly
+to a Vulkan object. Subresource/extension coverage is diagnostic, not a complete
+Vulkan replay trace.
+
+The September19 follow-up also records command names before native dispatch,
+buffer-copy ranges, pipeline bindings, primary/secondary command-buffer links,
+submission semaphore values/stages and actual fence-wait results. Buffer device
+addresses are logged only when the guest requests them; the diagnostic adds no
+address query or GPU work. The CPU `venus_fault_dispatch` test invokes the
+production dispatch with fake native entrypoints, checking disabled behavior,
+handle translation, 64-bit ranges/values and unchanged device-loss/timeout
+returns for both submission APIs. These records still describe CPU dispatch,
+not completion of the commands they name.
+
+Fault mode also prints the external-memory binding VUIDs normally suppressed
+by the legacy Venus host-visible-memory filter. An explicitly external WSI
+image/memory type mismatch was hidden by that filter during candidate8; the
+absence of printed validation messages in older runs is not contract proof.
+
+Set `VKR_FAULT_TRACE_DIR` to a fresh directory to save decoded
+`vkCreateShaderModule` bytes before the native call. Files include process,
+context, sequence and module ID, use exclusive creation and flush to disk, and
+have a 128 MiB per-context budget with explicit failure/limit records. This
+does not capture inline pipeline shader modules or shader objects. Validate
+saved modules and compare hashes with process-qualified guest traces; a valid
+module alone does not exclude resource corruption or a host compiler fault.
+The CPU `venus_fault_trace` test checks disabled behavior, byte preservation,
+non-overwrite and budget enforcement. `venus_queue_sync` retains its real
+completion/error/quarantine checks. No device-idle, timeout-success, consumer
+release or ownership behavior changes with this diagnostic.
+
+`tools/vulkan_transfer_pool_probe.c` is a bounded transfer control, separate
+from presentation acceptance. It checks upload → buffer → optimal 2D/3D image
+→ readback bytes, using separate allocations or interleaved buffer/image memory
+pools. Allocation sizes, alignment, granularity and dedicated requirements come
+from the device. Four slots allow multiple outstanding submissions; each slot's
+real fence protects CPU writes, readback, command reset and resource retirement.
+Legacy and synchronization2 submissions carry exact timeline dependencies and
+execute secondary command buffers. A timeout fails admission and retains pending
+resources; there is no device-idle or timeout-success path. CPU lavapipe with
+synchronization validation and both Windows v2 24-submission cases pass.
+Neither closes Steel's freeze. The later `--copy-burst` control reproduces
+readback corruption with mapped device-local upload and cached readback memory;
+the same native Vulkan copy control passes. `vulkan_dmabuf_mapping_probe.c`
+then finds disagreement between Vulkan and DMA-BUF CPU mappings of one type4
+allocation, with zero GPU submissions; type3 is a passing control. These runs
+precede a newly verified host reboot. September19 fresh-boot repeats now also
+fail on type4, including a PROT_READ DMA-BUF alias whose native Vulkan mapping
+passes a full self-check; type3 remains a passing control. An initial type4
+pass is followed by repeated failures, with no QEMU or renderer running, zero
+submissions by these probes, and no NVIDIA Xid recorded that boot. Separate
+OPAQUE_FD Vulkan allocation/import controls pass, but the driver does not
+advertise the requested dual-handle combination;
+this is not permission to force a different export type. The syscall trace
+selects the DRM/NVKMS export path, whose contiguous-address assumption is now a
+source-supported candidate requiring physical-range evidence. Neither the
+mapping failure nor that source candidate proves Steel's root cause. See
+ROADMAP for exact evidence, memory-type controls and acceptance limits.
+
+Candidate12 pairs ordinary Helios/NVIDIA resources with an internal OPAQUE_FD
+allocation export, while preserving explicit DMA-BUF WSI. The renderer now
+honors explicit export types rather than adding an incompatible DMA-BUF bit.
+The probe's optional `--renderer-import` build exercises the production Vulkan
+mapper on a separate device: three type4 and three type3 CPU comparisons pass;
+a same-boot read-only DMA-BUF type4 comparison fails. Native builds and focused
+CPU tests pass. The Windows build now passes, but its first attempted transfer
+trial used an elevated task, which invalidates the ICD override. The producer
+trace uses DMA-BUF; a new Xid31 is attributed to DWM, and the watcher pauses QEMU.
+Retrieved guest evidence shows wrong bytes but no loaded-module receipt; the
+installed baseline ICD remains an inference for that invalid elevated run.
+The probe now rejects elevation and checks the actual ICD path/hash before
+device creation; an initialization-only step checks mapping policy before a
+transfer trial. After the owner reports recovery and authorizes the same boot,
+the v4 Windows init-only control and all five transfer controls pass with the
+candidate loaded: 240 MiB checked, no timeout, OPAQUE exports verified, and no
+new Xid. The first 180-second Steel observation is incomplete; two runs with
+a separate workload allowance complete at 8124 / 81.25 FPS and 8069 / 80.70 FPS,
+with visible scene progression, verified candidate identities and no new Xid.
+Both producer traces hit the record cap. One shutdown retains an unproven helper
+source, producing a four-object `vkDestroyDevice` validation warning; the repeat
+has neither that cancellation nor a host VUID. The retention guard remains
+mandatory; consumer completion/teardown acceptance is still open. Neither
+graphics defect is closed. See ROADMAP's candidate12 entry for the packages,
+verified archives and acceptance limits. Native DGC and completion rules are unchanged.
+
+The September19 teardown follow-up adds source-only candidate13: after window
+cancellation, WSI continues sleeping waits on the already captured helper-copy
+target for a bounded five seconds. It preserves the presentation error and
+releases the source only on proven completion; timeout/device failure still
+retain it. Focused CPU tests pass, but the Windows ICD build and lifecycle
+trials have not run. Entry checks found a new 19:49:58 Xid in context67 using
+DMA-BUF; its guest workload/ICD are unverified. QEMU is paused pending recovery
+from that new fault. See [the copy-retirement amendment](../HPS2_REFACTOR.md#vehicle-copy-completion-fixed-target-and-pending-waits)
+and ROADMAP. This changes neither native DGC nor the acceptance status of either
+graphics defect.
+
+The owner subsequently reports recovery and authorizes resuming that same boot.
+Retrieved guest logs tie context67 to Steel PID2932 using the installed baseline
+ICD path. Candidate13v2 then builds on Windows and passes close/resize retirement
+controls with complete traces, explicit source-object destruction and no host
+VUID/new Xid; both baseline controls reproduce the retained four-object leak.
+Five candidate transfer controls also pass (240MiB). These scoped results do
+not close either graphics defect or lost-device teardown. Native DGC is unchanged.
+Two candidate13 Steel Vulkan runs subsequently complete at 81.27 and 80.83 FPS,
+each retiring the final cancelled copy without a retained source, host VUID or
+new Xid. Producer trace caps and broader acceptance limits remain in ROADMAP.
+
+At the owner's September20 request, candidate13 is subsequently installed as
+the machine-default ICD and activated by a Windows restart. DWM and a Vulkan
+control using normal registry selection load the verified candidate; a 48MiB
+transfer passes with no new Xid. The baseline and rollback script are retained.
+Deployment does not establish a Steel fix or native DX12 frame order. Native
+DGC and the open defect status are unchanged; see ROADMAP for the install receipt.
+
 ## Compute statistics update, 2026-09-10
 
 [DGC_QUERIES.md](DGC_QUERIES.md) supersedes the D3D12 compute-query failure

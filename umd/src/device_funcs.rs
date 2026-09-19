@@ -28,6 +28,8 @@ pub struct PresentSrcEntry {
     pub width: u32,
     pub height: u32,
     pub dxgi_format: u32,
+    pub source_template: bool,
+    pub source_external_ownership: bool,
     /// Owned `ID3D11Resource` COM pointer from `open_ddi_texture2d`.
     pub resource_raw: usize,
 }
@@ -121,7 +123,9 @@ pub struct SnapshotRing {
 
 impl SnapshotRing {
     pub fn byte_size(&self) -> u64 {
-        self.slots.iter().fold(0u64, |sum, slot| sum.saturating_add(slot.alloc_size))
+        self.slots
+            .iter()
+            .fold(0u64, |sum, slot| sum.saturating_add(slot.alloc_size))
     }
 }
 

@@ -398,7 +398,66 @@ there is no per-frame NT/Vulkan synchronization-object creation. Measure this
 payload and publication cost in the performance comparison.
 
 WSI exports one unnamed NT semaphore handle per chain and passes it with the
-exact pre-present value through `helios_umd_set_present_source_v2`. WSI owns
+exact pre-present value through `helios_umd_set_present_source_v4`. The v3 seam
+also borrows the source's actual `VkImageCreateInfo` through the same-thread
+Present. Dedicated external-memory imports must use that template, not flags/usage
+inferred from D3D11 bind flags. DXVK deep-copies supported format-list and
+queue-family arrays before caching the import, preserving creation fields and
+letting the backend append the matching external-memory declaration. Ordinary
+exclusive, unprotected 2D WSI sources are supported; unsupported creation
+chains fail through the existing import-failure counters. Compression-control
+and concurrent/protected sources require separate helper-device support and
+are not silently reconstructed. The v2 export retains its old ABI for older
+callers; the new WSI requires v4 and reports missing exports explicitly.
+The source import's DXGI format describes its actual Vulkan format, separately
+from the vehicle swapchain's flip-compatible format. In particular, a BGRA8
+sRGB source remains an sRGB dedicated image; a compatible transfer to the
+UNORM swapchain preserves its encoded bytes, without sampling the source or
+inventing SAMPLED usage. Numeric packed-format conversions remain separate.
+The v4 handoff additionally requires matched source ownership. App-to-PRESENT
+keeps producer ownership through WSI's fallback buffer read, then the WSI blit
+releases the original image to EXTERNAL in GENERAL before its exact producer
+signal. The helper acquires/releases that source around the actual transfer
+in its execution command buffer; it is excluded from generic eager self-acquire
+on the next command list. Moving this copy to the init command buffer would put
+it ahead of the acquire barrier. The app's next transition out of PRESENT
+acquires from EXTERNAL. Ordinary prime blits and FOREIGN scanout retain their
+existing behavior. v2/v3 callers retain their old ABI and do not opt in to v4
+ownership; neither partial deployment silently gains this new contract.
+The source image and its dedicated allocation must also request the same
+renderer handle type. The resource-id helper uses DMA_BUF. A host trace on
+2026-09-18 exposed a WSI OPAQUE_FD image bound to DMA_BUF export memory, hidden
+by the renderer's legacy VUID-02728 filter. WSI now requests DMA_BUF explicitly
+for both. DXVK's exact-template validator accepts DMA_BUF while retaining
+legacy OPAQUE_FD metadata support; mixed or unrelated handle types are refused.
+The exact alias itself explicitly uses DMA_BUF. A queued 4,000-frame pattern
+control completes through the helper with matching pixels and handle types;
+this validates the repaired contract, while Vulkan-freeze acceptance is open.
+
+Shared-image command ordering is part of that ownership contract. The
+September19 DWM trace proves an init-buffer transition executing ahead of an
+older execution-buffer transition recorded under a rotated backing's other
+logical image identity. `requiresHeliosOrderedAccess` now prevents transition
+and transfer promotion for external shared images (including explicit v4
+sources); private staged/debug stand-ins remain exempt. Ownership barriers and
+accesses stay on the execution buffer without new waits or lifetime shortcuts.
+The deployed FCFF7F28 candidate removes the observed layout-order VUIDs and
+passes the same-image trace replay plus the steady portion of a queued pattern
+control. A startup mixed-frame capture and the original freeze remain open;
+see ROADMAP for the full evidence and acceptance limits.
+
+The KMD's raw Venus allocator must use the renderer's DMA_BUF contract for both
+Present-buffer creation and its dedicated export; Mesa normalizes the matching
+DXVK import but cannot normalize KMD commands. External LINEAR images start
+UNDEFINED. Their allocation-time submission transitions to GENERAL and releases
+to EXTERNAL, then waits for that submission's real fence before exposing the
+HOST3D backing to CPU writes or cross-device consumers. Failed/ambiguous setup
+retains its image, memory and command objects. Readiness checks on existing
+LINEAR copies replace late initialization, which could otherwise discard pixels
+already written. This initial fence says nothing about later consumer release;
+the existing copy/scanout retirement and allocation teardown guards still apply.
+
+WSI owns
 the handle until chain teardown; the helper duplicates it, caches an imported
 Vulkan semaphore using exact kernel-object comparison, and retains the import
 through the recorded copy. `clear_present_source_v2` ends the borrowed scope
@@ -556,10 +615,11 @@ Owner acceptance of the moving scene remains unreceived.
   and is expected only in deliberate resize/stop cases. Both are printed in WSI
   telemetry and on the always-readable terminal diagnostic line.
 * Only confirmed copy completion clears `read_unproven` and permits recycling.
-  Chain error, changed/destroyed surface, helper failure or async-worker stop
-  cancels the wait without releasing the image. Such images retain the existing
-  device-teardown lifetime. The helper COM device is released only after the
-  async worker joins. The raw UMD device registry is not itself a lifetime pin.
+  In the deployed implementation, chain error, changed/destroyed surface,
+  helper failure or async-worker stop cancels the wait without releasing the
+  image. The source-only candidate13 amendment below separates cancellation
+  from retirement of that read. The helper COM device is released only after
+  the async worker joins. The raw UMD device registry is not itself a lifetime pin.
 * Acquire's own timeout and status signaling remain unchanged. Pending work
   keeps an image unavailable; it does not invent `VK_ERROR_DEVICE_LOST`.
   This follows [Vulkan acquire semantics](https://docs.vulkan.org/refpages/latest/refpages/source/vkAcquireNextImageKHR.html).
@@ -594,3 +654,66 @@ archive/export and 4814 successful helper Presents. Copy waits exceeding 32 ms
 completed without invented device loss. Its final surface-loss cancellation
 retained the outstanding read as the window closed (`wait_cancel=1`); this is
 not evidence for general fault teardown or consumer release.
+
+**September19, candidate13 source amendment — cancelled-copy retirement:**
+candidate12's second completed Steel observation retained one source image,
+its staging buffer and two memory allocations after surface loss; host
+`vkDestroyDevice` validation reported those four remaining children. Its next
+run had no cancellation and no warning. Neither observation establishes safe
+cancellation teardown.
+
+`wsi_copy_retirement.h` now contains the actual wait loop used by Win32 WSI.
+OUT_OF_DATE/SURFACE_LOST and async-worker stop latch a presentation error but
+keep the helper device and same-thread submission target alive. Sleeping waits
+continue on that fixed target for up to five seconds after cancellation.
+Proven completion clears `read_unproven`, allowing normal swapchain destruction
+to destroy the source; the cancelled presentation still returns its error and
+does not recycle the image. A restored window cannot restart the budget or
+make that presentation successful. Device failure before/after a wait and
+deadline expiry retain the source. Ordinary presentation has no new deadline,
+flush or submission. `wait_cancel` now counts presentation cancellations even
+when their read retires; `source_retained`, `completed` and `drain_expired`
+diagnostics distinguish the outcomes.
+
+The five-second bound contains the existing host-loss reporting gap; it does
+not solve resource cleanup after an unproven read or lost device. That retained
+resource path still has a lifetime/validation gap. In particular,
+[device loss does not implicitly destroy device children](https://docs.vulkan.org/spec/latest/chapters/devsandqueues.html).
+No timeout grants permission to release their storage.
+
+The production-loop CPU test covers cancellation/completion races, deadline
+expiry, window restoration and failure notifications. It and five surrounding
+Mesa allocation/ownership/feature tests pass; sanitizer checks and MinGW
+compilation of the CPU test and modified vehicle probe also pass. The probe's
+`--teardown-close` and `--teardown-resize` modes cancel during a demonstrated
+pending read, then fence the application's own submission before destroying
+the chain, as required by
+[swapchain destruction](https://docs.vulkan.org/refpages/latest/refpages/source/vkDestroySwapchainKHR.html).
+Application completion alone is insufficient: require the same PID and exact
+producer's helper retirement plus host object destruction, no VUID and no new
+Xid. A new host Xid before this continuation's trials leaves QEMU paused.
+Windows ICD compilation and baseline/candidate lifecycle trials are pending;
+candidate13 is not deployed or accepted. See ROADMAP for the preserved evidence.
+
+After the owner reports host recovery on the same boot, Windows candidate13v2
+(`9AE82DE7…`) builds and passes both close/resize comparisons. Candidate12v4
+retains four source objects in both controls; candidate13 retires the exact
+pending helper read, preserves SURFACE_LOST/OUT_OF_DATE, and destroys those
+objects without a VUID or new Xid. Complete producer/helper traces and loaded
+module hashes support this narrow result. All five transfer controls also pass
+240MiB. Lost-device and expired-drain cleanup remain unaccepted, as do both
+broader graphics defects. This isolated runtime candidate is not a global
+driver deployment; ROADMAP records the verified archives and Steel follow-up.
+Two subsequent Steel Vulkan runs complete at 8126 / 81.27 FPS and 8083 /
+80.83 FPS. Both final surface-loss cancellations retire their exact helper copy
+with `source_retained=0`, no host VUID and no new Xid. Their producer traces hit
+the record cap, so full producer destruction history remains unavailable for
+these benchmarks. The focused lifecycle controls retain complete traces.
+
+On September20 the owner explicitly requests default installation after
+confirming recovery from another baseline Steel fault. Candidate13 (`9AE82DE7…`)
+is registered machine-wide and Windows is restarted. DWM's loaded hash and a
+normal registry-selected Vulkan control verify activation; a 48MiB transfer
+and desktop capture pass, with no new Xid. The baseline and rollback script are
+preserved. This deployment adds no Steel benchmark acceptance or lost-device
+lifetime result; both graphics defects remain open. ROADMAP records the receipt.

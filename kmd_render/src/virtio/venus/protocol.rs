@@ -47,8 +47,6 @@ pub(crate) const ST_INSTANCE_CREATE_INFO: i32 = 1;
 pub(crate) const ST_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 pub(crate) const ST_DEVICE_CREATE_INFO: i32 = 3;
 pub(crate) const ST_SUBMIT_INFO: i32 = 4;
-pub(crate) const ST_BUFFER_CREATE_INFO: i32 = 12;
-pub(crate) const ST_EXTERNAL_MEMORY_BUFFER_CREATE_INFO: i32 = 1000072000;
 pub(crate) const ST_MEMORY_DEDICATED_REQUIREMENTS: i32 = 1000127000;
 pub(crate) const ST_BUFFER_MEMORY_REQUIREMENTS_INFO_2: i32 = 1000146000;
 pub(crate) const ST_MEMORY_REQUIREMENTS_2: i32 = 1000146003;
@@ -109,12 +107,9 @@ pub(crate) const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 pub(crate) const IMAGE_USAGE_SAMPLED: u32 = 0x0000_0004;
 pub(crate) const IMAGE_USAGE_STORAGE: u32 = 0x0000_0008;
 pub(crate) const IMAGE_USAGE_COLOR_ATTACHMENT: u32 = 0x0000_0010;
-pub(crate) const BUFFER_USAGE_TRANSFER_SRC: u32 = 0x0000_0001;
-pub(crate) const BUFFER_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 pub(crate) const IMAGE_CREATE_MUTABLE_FORMAT: u32 = 0x0000_0008;
 pub(crate) const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
 pub(crate) const IMAGE_LAYOUT_GENERAL: u32 = 1;
-pub(crate) const IMAGE_LAYOUT_PREINITIALIZED: u32 = 8;
 pub(crate) const IMAGE_ASPECT_COLOR: u32 = 0x0000_0001;
 pub(crate) const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
 pub(crate) const QUEUE_FAMILY_EXTERNAL: u32 = u32::MAX - 1;
@@ -205,7 +200,7 @@ pub(crate) const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 pub(crate) use helios_kmd_logic::{
     encode_image_create, encode_memory_allocate, ImageCreateSpec, ImagePNext, MemoryAllocateSpec,
     MemoryPNext, MemoryTypeChoice, Writer, CMD_ALLOCATE_MEMORY, CMD_CREATE_IMAGE,
-    CMD_FLAG_GENERATE_REPLY, IMAGE_TILING_LINEAR, IMAGE_TILING_OPTIMAL, SHARING_MODE_EXCLUSIVE,
+    CMD_FLAG_GENERATE_REPLY, IMAGE_TILING_OPTIMAL,
 };
 
 /// Why the venus ring was declared unusable. Each arm names a registry counter

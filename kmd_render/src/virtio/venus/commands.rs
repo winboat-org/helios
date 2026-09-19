@@ -93,8 +93,8 @@ impl ImageBarrier {
     }
 
     /// The one-shot transition of a freshly created image into GENERAL.
-    /// `old_layout` is whichever layout it was created with -- UNDEFINED for an
-    /// internal conversion image, PREINITIALIZED for the LINEAR scan-out image.
+    /// Both internal conversion and external LINEAR images start UNDEFINED.
+    /// This discard must precede exposure of the image's CPU-writable memory.
     pub(super) const fn initial_to_general(image: VkImageId, old_layout: u32) -> Self {
         Self {
             image,
@@ -558,21 +558,7 @@ impl VenusClient {
         let w = encode_image_create(
             self.device_id.into(),
             image_id.into(),
-            &ImageCreateSpec {
-                // VkExternalMemoryImageCreateInfo only. This matches the Linux
-                // KMS probe that reached QEMU's egl-headless dmabuf import on
-                // NVIDIA.
-                pnext: ImagePNext::ExternalMemory {
-                    handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
-                },
-                flags: 0,
-                format: FORMAT_B8G8R8A8_UNORM,
-                width,
-                height,
-                tiling: IMAGE_TILING_LINEAR,
-                usage: IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST,
-                initial_layout: IMAGE_LAYOUT_PREINITIALIZED,
-            },
+            &helios_kmd_logic::external_memory::linear_scanout_image(width, height),
         );
         // The raw VkResult of the LINEAR external-DMA_BUF image create is the
         // most likely NVIDIA-venus rejection point for the CachyOS shape, which
@@ -880,8 +866,9 @@ impl VenusClient {
 
     /// Create the KMD side of a present-staging buffer.
     ///
-    /// DXVK imports the same HOST3D payload into an exactly matching OPAQUE_FD,
-    /// SRC|DST, exclusive buffer. Querying this buffer therefore gives the
+    /// Mesa normalizes DXVK's OPAQUE_FD request to the renderer's DMA_BUF type.
+    /// This raw Venus path must request the same DMA_BUF, SRC|DST, exclusive
+    /// buffer explicitly. Querying this buffer therefore gives the
     /// memory mask for the precise dedicated export/import contract on both
     /// sides, rather than assuming independently shaped buffers accept the same
     /// heap.
@@ -891,27 +878,11 @@ impl VenusClient {
         size: u64,
     ) -> Result<VkBufferId, VirtioError> {
         let buffer_id = self.new_buffer_id();
-        let mut w = Writer::new();
-        w.header(CMD_CREATE_BUFFER, CMD_FLAG_GENERATE_REPLY);
-        w.handle(self.device_id);
-        w.count(true);
-        w.i32(ST_BUFFER_CREATE_INFO);
-        w.count(true); // pNext: VkExternalMemoryBufferCreateInfo
-        w.i32(ST_EXTERNAL_MEMORY_BUFFER_CREATE_INFO);
-        w.count(false);
-        w.u32(EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD);
-        w.u32(0); // VkBufferCreateFlags
-        w.u64(size);
-        // KMD writes this buffer and the UMD imports the same memory as its
-        // transfer source.  Asking for both usages makes the compatibility mask
-        // valid for both consumers, not only for the first one created.
-        w.u32(BUFFER_USAGE_TRANSFER_SRC | BUFFER_USAGE_TRANSFER_DST);
-        w.u32(SHARING_MODE_EXCLUSIVE);
-        w.u32(0); // queueFamilyIndexCount
-        w.count(false);
-        w.count(false); // pAllocator
-        w.count(true);
-        w.handle(buffer_id);
+        let w = helios_kmd_logic::external_memory::encode_present_buffer(
+            self.device_id.into(),
+            buffer_id.into(),
+            size,
+        );
         let mut r = self.ring_command_expect(
             adapter,
             w.as_slice()?,
@@ -992,18 +963,11 @@ impl VenusClient {
         let w = encode_memory_allocate(
             self.device_id.into(),
             memory_id.into(),
-            &MemoryAllocateSpec {
-                // The memory immediately becomes an exported HOST3D blob and
-                // DXVK imports that payload with a dedicated-buffer chain.
-                // Make both sides explicit and identical regardless of whether
-                // the host merely prefers or strictly requires dedication.
-                pnext: MemoryPNext::ExportDedicatedBuffer {
-                    handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-                    buffer: buffer_id.into(),
-                },
+            &helios_kmd_logic::external_memory::present_buffer_memory(
+                buffer_id.into(),
                 size,
                 memory_type_index,
-            },
+            ),
         );
         self.ring_command_expect(
             adapter,

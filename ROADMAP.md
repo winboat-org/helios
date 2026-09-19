@@ -12,6 +12,1473 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Open: Steel Nomad Vulkan launch freeze and DX12 frame rollback, 2026-09-18
+
+Investigate the Vulkan freeze first. The owner reports that Steel Nomad Vulkan
+freezes the display while SSH remains responsive, process termination stalls,
+and a requested reboot eventually responds after about 90 seconds. Separately,
+Port Royal and Steel Nomad DX12 display an older whole frame between newer frames
+under SDL; VNC appears to skip frames. DX11 is not reported affected. Stable
+benchmark FPS is not presentation-order acceptance.
+
+**Latest, September20, 00:30 IST:** after the owner confirms recovery and
+explicitly requests installation, candidate13 becomes the machine-default ICD
+(`9AE82DE7…`). QEMU resumes on the same host boot, and a Windows restart
+activates the candidate in DWM, verified by its loaded module hash. The
+registered-driver initialization control and one 48MiB transfer control pass
+without an ICD environment override; the desktop capture is healthy. No new
+Xid is recorded. The prior baseline DLL, manifest and rollback script are
+preserved. Normal application launches now select candidate13. This deployment
+does not close either graphics defect; both remain **OPEN** and no candidate
+is accepted. No Steel benchmark was rerun during this installation.
+
+**Publication checkpoint, September20:** the owner requests committing and
+pushing the investigation. The dependency commits are published and their
+canonical remote branch tips verified before the parent pins are updated:
+Mesa `89bd0676a4e` (`main`), virglrenderer `5d0e47bd` (`main`), DXVK
+`da42d2d2` (`master`), and QEMU `37e165580f` (`helios-11.1.1`). The source
+checkpoint includes the mapping and lifetime candidates, exact image-import
+and ownership contracts, bounded diagnostics, focused tests and reproduction
+tools. The local session transcript and ignored runtime evidence are excluded.
+
+Publication checks pass: all 220 KMD logic tests; six focused Mesa CPU tests;
+four renderer CPU tests; the DXVK import/ownership test under ASan/UBSan;
+Linux Mesa and renderer builds; the full configured QEMU build and module
+loading test (12 subtests). Both C reproduction tools compile with warnings
+treated as errors, and the visible-pattern validator passes Python compilation.
+Check logs are preserved under `tmp/publish-graphics-20260920-sp8l3l2a/`.
+No Windows deployment, VM lifecycle operation or GPU workload is performed
+for publication. The installed candidate13 evidence and limitations above
+remain unchanged: both graphics defects are **OPEN**, no candidate is an
+accepted fix, and the reproduced mapping defect is not proof of Steel's
+root cause.
+
+**September20, 00:05 IST:** the owner's manual Steel Vulkan run at
+September19 23:56 freezes during loading and produces no result. Guest logs tie
+Steel PID5732 to producer context127 and helper129, with the installed baseline
+ICD path (`22199CA9…`) selected. Candidate13 was not active. The host records
+Xid31 at 23:56:41 and Xid44 at 23:56:47 in renderer PID219439/context127, with
+a DMAR fault between them. The workload has exited by the first MCP process
+snapshot; its failed result reports workload status10000, `No result produced`.
+After verified MCP evidence retrieval, QEMU is paused at 00:05:04 on the same
+host boot. Recovery from these new faults is not established by the responsive
+`nvidia-smi` query. The producer trace reaches its cap before the first Xid.
+Both graphics defects remain **OPEN**; no candidate is accepted or globally
+deployed. The earlier candidate13 passes below remain scoped to their isolated
+test environment, not ordinary launcher runs.
+
+**September19, 21:08 IST:** the owner reports recovery from the 19:49:58
+Xid and authorizes resuming QEMU on the same host boot. Retrieved guest evidence
+ties that fault to Steel PID2932/context67, whose helper log selects the installed
+baseline ICD path (`22199CA9…`), not the isolated mapping candidate. Candidate13
+now builds on Windows; both cancelled-copy controls pass with exact helper
+completion and source destruction, while both baseline controls reproduce the
+four-object leak. All five transfer controls pass (240 MiB), with no new Xid.
+Two bounded Steel runs with candidate13 complete at **8126 / 81.27 FPS** and
+**8083 / 80.83 FPS**, both retiring their final cancelled copy without a retained
+source, host VUID or new Xid. Both producer traces still reach the record cap.
+QEMU is running; Windows reports problem code 0 and no benchmark/probe process.
+Timeout/device-failure retention and both graphics defects remain **OPEN**;
+no candidate is accepted
+or globally deployed.
+
+At 19:35 IST, candidate12's opaque-mapping ICD passes all
+five bounded guest transfer controls (240 MiB) and completes two Steel Vulkan
+runs at **8124 / 81.25 FPS** and **8069 / 80.70 FPS**, with verified loaded
+identities and visible scene progression. No new Xid appears on the boot the
+owner authorized after recovery. One run has the existing retained-source
+teardown warning; both producer traces reach their record cap. Both graphics
+defects remain **OPEN**, with no accepted fix or global candidate deployment.
+The candidate12 entry below records the evidence and remaining limits.
+
+The initial September18 reproduction used the contributor's **standalone QEMU**, not the WinBoat
+environment recorded elsewhere: SDL GL, QEMU 11.1.1 Helios fork, KMD
+22.22.271.0/oem54.inf (`BEE45488…`), Mesa ICD `43394BBD…`, D3D11 UMD
+`57C84ED4…`, with async vehicle WSI retained. Diagnostic artifacts are under
+`tmp/display-order-20260918/` and the matching guest ProgramData directory.
+
+Observed evidence, not yet a root cause or fix:
+
+- The initial Vulkan run's helper copy stopped completing at producer value 156;
+  Mesa subsequently gave up its exact wire-fence wait after 60 seconds and left
+  the shared synchronization object unsignaled. Do not convert this to success
+  or remove the source-recycling guard.
+- A second run after a guest reboot, without restarting QEMU, produced NVIDIA
+  Xid 31 at 19:56:10 local time in the actual workload's renderer context 41
+  (`vkr-ring-41`), reporting unsupported-kind GPU MMU read/write faults. Other
+  guest contexts subsequently reported device loss. This is host-side fault
+  evidence, not proof that the host driver caused the invalid access.
+- A fresh validation-enabled QEMU run exposed helper-context buffer allocation
+  size and feature-enable validation errors: 3,876,920 allocated bytes versus
+  3,876,928 required, a timeline semaphore created without enabling its feature,
+  and QueueSubmit2 without synchronization2. That run was invalidated by a
+  screenshot task stealing workload focus during loading; it establishes no
+  benchmark completion or absence of the freeze.
+- A cold-restart repeat without the screenshot task caused a GPU-wide FECS
+  firmware fatal error, Xid 109 context-switch timeouts and Xid 154 at about
+  20:13:29. QEMU was paused to stop further guest submissions; no host GPU reset
+  or unrelated-service termination was attempted. The owner force-rebooted the
+  host and relaunched the original bridged SDL/Wayland QEMU with validation.
+  Event delivery order does not establish which client caused this fatal error.
+- The renderer's successful fence-retirement callback cannot carry device loss;
+  the current failure path intentionally leaves completion pending. Error
+  propagation and teardown recovery remain an explicit gap, distinct from the
+  invalid GPU access that must be localized.
+
+Earlier diagnostic launch changes: QEMU was cold-restarted with `VKR_DEBUG=validate`.
+SSH/RDP were forwarded on localhost 2222/33890 using an isolated user
+network retaining the guest's 192.168.122.120 address. Windows' replacement network
+profile was restored to Private, preserving its existing Private-only SSH rule.
+`tmp/display-order-20260918/launch-validation.sh` and `ssh-validation.conf` record
+the historical launch/access settings; that network/launcher is no longer active.
+After the owner's host reboot, MCP verifies Code 0 and the unchanged .271 KMD,
+43394BBD ICD and 57C84ED4 DWM UMD. The host has no Xid this boot.
+
+Local Mesa candidate, not runtime freeze or rollback acceptance: allocate WSI
+blit buffers and shared backing using VkMemoryRequirements.size, preserving the
+pixel size/pitch; copy the renderer feature chain to enable WSI's internal host
+timeline without changing app-enabled features or duplicating promoted structs;
+select Submit2's existing legacy conversion from the enabled synchronization2
+feature, not API/extension availability. Empty converted submits retain their
+fence signal. CPU-only `wsi-buffer-allocation` and `venus-device-features` tests
+pass (padding/shared fallback/size truncation, chain preservation and OOM unwind).
+Linux and Windows ICD builds pass. Three interactive, driver-internal guest
+probes pass with legacy, promoted 1.2/1.3 and standalone timeline feature chains:
+941x1030 padded-buffer swapchain creation, internal timeline creation and empty
+converted submits with fence completion, without new validation errors or Xid.
+These probes do not present images and are not rendering acceptance. Candidate
+ICD `89727553…` is installed and verified loaded by DWM after a guest reboot;
+the baseline DLL and manifest are preserved. Subsequent vehicle presentation
+and Steel Nomad results are recorded below; neither reported defect is closed.
+
+Follow-up runtime evidence: a limited interactive vkcube run with the same fixes
+plus once-per-image source diagnostics (`13AAFEEB…`, isolated loader manifest)
+sustained vehicle presents for about 34 seconds, then closed normally, exit 0,
+without Xid. Logs prove a source/helper reconstruction mismatch for the same
+resids 446/450/454: producer usage `0x11`, flags `0x400`; importer usage `0x7`,
+flags `0x8`, despite matching format, geometry and allocation size. Dedicated
+OPAQUE_FD image imports require identical image creation parameters; an exact
+allocation size is insufficient. This is a concrete contract defect, not yet
+proof of the Steel Nomad fault's origin.
+
+The local v3 vehicle candidate now carries the source image creation template
+through same-thread Present. The native import owns a deep copy of its fields,
+format list and queue-family array, preserves source usage/flags instead of
+adding SAMPLED/MUTABLE, and refuses unsupported chains. Producer timeline,
+helper-copy completion and source-recycling guards are unchanged. The v2 ABI
+is preserved for old callers; new WSI requires v3. CPU template tests pass,
+including ASan/UBSan, metadata lifetime, pointer immutability and loud-refusal
+cases. Windows DXVK, D3D11 UMD (`135105C5…`) and Mesa (`DE2EFF66…`) release
+builds pass. The pair is installed in ProgramData with verified hashes, backups
+and a guest reboot; DWM's loaded modules match both candidate hashes. KMD and
+UMD12 were not changed. The template CPU test also passes natively on Windows.
+An interactive cube run (PID 2080, `cube-candidate5`) shows changing visible SDL
+frames and matched producer/import usage `0x11` and flags `0x400` for resids
+384/388/392. It sustained about 43 seconds of vehicle presentation, with zero
+import/copy failures during steady state and no new Xid, then its own window
+was closed and the process exited 0 after 45.3 seconds. Shutdown cancelled one
+pending copy and retained its source, producing the existing four-object
+device-teardown leak warning; teardown conformance is not claimed. The earlier
+2,400-frame cube run exited while its helper initialized and is not vehicle
+acceptance. Screenshots `cube-candidate5-visible{,2}.png` show changing cube
+orientation. Steel Nomad and DX12 presentation-order acceptance remain open.
+
+The next isolated Steel run (`vulkan-candidate2`, PID 10504/context 35, helper
+37) reached vehicle READY without a new Xid but refused its first source
+import: Vulkan BGRA8 sRGB (format 50) had been described with the vehicle's
+UNORM DXGI format 87. The old mapping is required for the flip-model destination,
+not for the dedicated source alias. The workload closed normally on its own
+WM_CLOSE request; its aborted/error result is not benchmark acceptance. The
+follow-up separates source format 91 from destination 87 and uses a compatible
+byte-preserving sRGB/UNORM transfer, not a sampled numeric conversion requiring
+extra source usage. CPU tests cover exact sRGB metadata and copy-format pairs,
+including native Windows and Linux ASan/UBSan. Windows builds pass. Updated
+UMD `9964DA7B…` and ICD `4D22C37C…` are installed and verified loaded by DWM
+after the guest boot at 21:24:50. The preceding reboot spent about 149 seconds
+in Windows servicing; the visible screen said Updates are underway and CBS
+logged TrustedInstaller finalization. This delay is not evidence of a graphics
+shutdown deadlock. No servicing configuration was changed.
+
+The corrected isolated Steel run (`vulkan-candidate3`, workload PID 4492/context
+35, helper context 37) reached vehicle READY and successfully imported sRGB
+source resid 376 with matching format 50, usage `0x11`, flags `0x400`, geometry
+and allocation size. Loading presents and fences continued retiring without a
+copy timeout while assets initialized. At 21:28:10, the helper's renderer PID
+34331 (`vkr-ring-37`) reported Xid 31: CE5/CE3 PDE **write** fault at
+`0x049b0000`, then GR_HOST0 PDE **read** fault at `0x05713000` at 21:28:11.
+The watcher stopped QEMU and verified paused state via QMP. There is no full
+benchmark completion or freeze repair acceptance. Matched image metadata is
+therefore necessary but not sufficient; the helper's destination/backing
+lifetime and the loading-to-test transition remain localization targets, not
+proven causes. `qemu-vulkan-candidate3.log`, `kernel-vulkan-candidate3.log` and
+visible loading captures preserve host evidence. The owner cold-relaunched the
+original VM at 21:37:33; MCP confirms Code 0 and DWM's loaded `9964DA7B…` UMD /
+`4D22C37C…` ICD, with no workload left running and no new host Xid since launch.
+Guest logs were retrieved through verified MCP into
+`retrieved-20260918-1613.zip` (SHA256 `76E4AAB8…`). They show roughly 384 helper
+presents using the same loading source, with no second source import or resize
+recorded before the fault. The loading-to-test transition is not established
+by those logs. Do not resume the faulted workload or repeat Steel without a
+new causal change and a bounded regression control. The original bridged
+launcher still requires unavailable sudo authority.
+Read-only renderer stack attachment was denied by ptrace permissions. No
+host GPU reset or unrelated process/service termination was attempted.
+
+Next local candidate: v4 adds matched EXTERNAL ownership for the actual WSI
+source. The app retains ownership into PRESENT through WSI's fallback buffer
+read, then the blit releases the source in GENERAL before its exact signal.
+The helper acquires/copies/releases in its execution command buffer, excluding
+that source from generic eager next-list self-acquire. The next app transition
+out of PRESENT acquires it. Ordinary prime/FOREIGN paths are unchanged; v2/v3
+ABIs remain and do not opt in. CPU tests pass for the real WSI recorder's
+post-read release, Venus mapping and the helper barrier pair, plus existing
+allocation/feature tests (Mesa 4/4; DXVK ASan/UBSan and native Windows).
+Linux Mesa and Windows Mesa/DXVK/UMD builds pass. UMD `C0BF1A57…` and ICD
+`22199CA9…` are installed with verified hashes and pre-v4 backups; KMD/UMD12
+are unchanged. DWM's actual loaded pair matches after the 22:03:06 guest boot.
+The first 1,600-frame sRGB control (`93FC1C95…` ICD, PID 6048) completed, but
+validation identified VUID-09633: HOST cannot accompany an image queue-family
+transfer. The corrected recorder separates the buffer's HOST visibility from
+the image's TRANSFER-to-BOTTOM external release; the CPU test checks both
+dependencies independently. The repeated control (PID 5940) completed 1,600
+frames / exit 0 in 28.5 seconds with matching source/import metadata, vehicle
+LIVE, external_release=1 / wsiExternal=1 and no copy failures or new Xid. No new
+validation message appeared during that control; earlier boot-context warnings
+remain open. A focused SDL repeat captures serials 155 and 400; a host-terminal
+capture from the preceding unfocused repeat is not rendering evidence.
+`vk_vehicle_completion_probe --present-loop srgb|unorm WIDTH
+HEIGHT FRAMES` adds a 60-second bounded COLOR_ATTACHMENT-only control with a
+16-bit visible serial, repeated PRESENT reacquisition and per-chain drain.
+This repairs a concrete ownership contract gap, not yet the reported freeze;
+full Steel acceptance remains required. The finite control waits per submission
+and does not establish the benchmark's deeper asynchronous lifetime safety.
+
+The corrected v4 Steel retry (`vulkan-candidate4`, interactive workload PID
+9212) reached vehicle LIVE at 22:05:51. Source resid 464 and the helper import
+match sRGB format 50, usage `0x11`, flags `0x400`, 1896x1030 and size 8773632,
+with external_release=1 / wsiExternal=1. The visible loading progress reached
+its end, but at 22:07:07 renderer PID 50908 / **producer** context 49 reported
+Xid 13, Illegal Instruction Encoding (GPC0/TPC0/SM0), not the previous helper
+context's CE memory fault. Helper context is 51 / PID 50933. The watcher stopped
+QEMU and verified paused state; the faulted workload was not resumed. This
+candidate does **not** close the freeze. An invalid shader, resource corruption
+or a host compiler/driver defect is not distinguished by this Xid alone; do not
+infer host blame from the renderer process name. Shader/dispatch localization
+in the producer is now a required independent investigation seam.
+Host evidence: `qemu-vulkan-candidate4.log` (SHA256 `75AA2250…`),
+`kernel-vulkan-candidate4.log` (`62A4AEFA…`), watcher pause output and focused
+`steel-candidate4-loading{1,2,3}.png`. Live guest tails were mirrored to the
+share before pause; they are partial, and concurrent 9p readback shows mixed
+overwrite snapshots. Retrieve the complete C: logs through MCP after a cold
+relaunch before treating those tails as a complete chronology. The finite
+control archive `present-loop-v4b-controls.zip` was MCP-pulled with SHA256
+`55DAA30B…` verified on both ends. No new validation message appeared in the
+Steel retry before pause; previously recorded boot warnings remain open.
+Standalone relaunch remains blocked by sudo authentication (`sudo -n true`
+requires a password). No alternate guest transport, faulted-workload resume,
+host GPU reset or unrelated service termination was attempted. DX12 rollback
+acceptance remains open and was not retried on this faulted VM.
+
+After the owner's 22:10:00 cold relaunch, MCP verified the 22:10:19 guest boot,
+Code 0 and DWM's loaded `C0BF1A57…` / `22199CA9…` pair. Complete candidate4
+C: logs were MCP-pulled as `retrieved-candidate4-20260918-1641.zip`, SHA256
+`365F9E63…` verified on both ends. They refine the partial chronology: pending
+copies 453, 456, 457, 459 and 462 completed after waits of 45–464 ms; a second
+source resid 468 was imported at 22:07:03, and producer value 464's copy from
+resid 464 remained pending with its source retained at 22:07:04. The earlier
+candidate3's no-second-import observation does not apply to candidate4. The
+"flip gate TIMEOUT - flipping anyway" diagnostic precedes the separate
+mandatory copy-completion wait; it alone does not establish early source reuse.
+Destination visibility and producer fault localization remain open.
+
+Vehicle-off isolation (`HELIOS_WSI_DCOMP_PRESENT=0`, async WSI retained) passed
+a finite 1,600-frame sRGB control, PID 6920/session 1, exit 0 in 28.53 seconds.
+Focused SDL captures show serials 139 → 393. This is the GPU-buffer/GDI fallback,
+not helper acceptance; disabling the vehicle also removes source export and
+the helper-specific EXTERNAL ownership contract. SDK API-dump tracing was
+checked on a separate 300-frame cube, PID 7344/session 1 (`vulkan-candidate5`),
+exit 0 in 6.43 seconds. Its complete trace was MCP-pulled with SHA256
+`773AE3BE…`; CPU SPIR-V validation found two unique recorded shaders and no
+validation failure. This validates trace extraction, not Steel's shaders or
+host-side shader bytes. No production knob default was changed.
+
+The subsequent stock Steel Vulkan **vehicle-off + API-dump** diagnostic arm
+(`vulkan-candidate6`, PID 6016/session 1, producer context 49) also faulted.
+The workload module snapshot verifies ICD `22199CA9…`, API-dump layer
+`7750D157…`, and no helper UMD. At 22:15:17 DWM renderer PID 53380/context 5
+reported Xid 31: CE0/CE2 unsupported-kind **write** at `0x139c0000`. The watcher
+immediately stopped QEMU and verified paused state. Surviving API tails end at
+the first loading-frame submit/present returning SUCCESS; these CPU return
+values are not GPU completion or visible-frame evidence. The captured SDL
+image is black, not a successful loading/rendering capture. At that point the
+C: API and DWM logs still required retrieval (completed below). API tracing changes
+timing, and the host had not undergone GPU recovery after candidate4's Xid;
+this failed arm does not establish a clean-baseline causal isolation result.
+
+At 22:16:36–41, Alacritty also reported Xid 31 read faults after the VM was
+paused. These may be collateral consequences of the GPU fault; occurrence in
+another process does not establish causal independence or a separate defect.
+Pausing the VM is not evidence that the host GPU has recovered. Further trials
+were stopped at that point. Host logs and unique live
+API tails are preserved under
+`tmp/display-order-20260918/`: `qemu-vulkan-candidate6.log` (`B28B03EB…`),
+`kernel-vulkan-candidate6.log` (`B4EC7DAB…`), and watcher output. The faulted
+test VM was stopped through QMP quit at 22:19:39; QEMU and its renderer PIDs
+were verified gone. No faulted-workload resume, host GPU reset, alternate
+Windows transport or other-application termination was attempted.
+
+**22:25 cold launch / subsequent Vulkan-only investigation:** live inspection
+verifies standalone bridged QEMU PID 68186, SDL/Wayland, NVIDIA and
+`VKR_DEBUG=validate`. Windows booted at 22:25:06; SYSTEM-purpose MCP enumeration
+verifies DWM PID 1820/session 1 actually loaded UMD `C0BF1A57…` and ICD
+`22199CA9…`; KMD remains .271/Code 0. Installed native UMD12 remains
+`C7241DE6…`, without a new DX12 runtime check. The host is still on its 20:17
+boot: no intervening GPU reset/reinitialization action or time was established.
+The owner confirms current GPU use and does not require a host reboot.
+`nvidia-smi` reports Recovery Action None, and no new Xid appeared after 22:16.
+These support current usability, not proof of a reset or clean causal isolation
+of candidate6.
+
+All surviving candidate6 C: evidence was SHA256-verified and pulled through MCP
+as `retrieved-candidate6-verified-20260918-1704.zip`, digest
+`09C310DF503B2598062DDB9AAFAFE91EA6E4240B7AFA615DFEB6E3B9B925FB07`.
+The 2,824,839-byte API file has a 132,354-byte NUL tail starting at offset
+2,692,485. Its readable prefix ends at graphics-pipeline creation; the separately
+preserved final live tail reaches the first Present. Earlier numbered tails
+include different processes/instance handles writing the same filename: their
+relative timestamps must not be merged into one chronology. CPU `spirv-val`
+accepts 41 unique shaders in 104 recorded arrays from the readable prefix, not
+all Steel shaders or the transmitted/host bytes. Archived `umd-6016.log` is a
+September 5 PID-reuse artifact. DWM's append log spans multiple incarnations;
+the relevant context-5 segment last records import resid428 at 22:14:58, but
+does not identify the fault-time GPU copy or map fault VA `0x139c0000` to an
+allocation. The prior DWM DXVK per-executable log was overwritten by the new
+boot. These are explicit gaps, not evidence that a copy did or did not occur.
+
+`vk_vehicle_completion_probe --present-queued` now has three independent
+command-buffer/acquire-semaphore/submission-fence slots, waits only on reuse or
+final draining, and retains the mandatory WSI consumer-completion/acquire guard.
+On the unchanged installed candidate pair, bounded sRGB 1896×1030 controls ran
+with async WSI, actual interactive user/RunLevel Limited, and an Xid watcher:
+
+| Arm | Completion | Observed pending submissions | Focused SDL serials |
+| --- | --- | --- | --- |
+| Vehicle off, PID2504/context31 | 10,000 frames, exit 0, 10.26 s harness time | 3 | 266 → 9,839, no decreases among sampled captures |
+| Helper on, PID3064/producer33/helper35 | 1,600 frames, exit 0, 18.32 s harness time | 3 | 732 → 1,577, no decreases among sampled captures |
+
+The helper arm records LIVE plus three source imports (395/400/404). Neither arm
+produced a new Xid or new host validation message. An earlier 1,200-frame arm
+also completed but lacked a valid focused capture and is not rendering evidence.
+Archives `queued-controls-20260918-172242.zip` (`F808A0B0…`) and
+`queued-helper-20260918-172422.zip` (`B62420D7…`) were C:-archived and MCP-pulled
+with SHA256 verification. These controls exercise deeper WSI reuse; they do not
+cover Steel's shader/resource workload, arbitrary lifetime stress, or DX12.
+
+Next causal checks are host-side image/memory/import/copy identity and shader
+byte integrity, motivated by candidate6's DWM CE write and candidate4's producer
+illegal-instruction fault. An opt-in renderer diagnostic (`VKR_DEBUG=fault`,
+alongside `validate`) records those identities, command-buffer submissions,
+ownership barriers and actual marker results, and saves decoded shader modules
+before native creation. It does not alter waits, retirement, ownership or error
+results. The renderer build and CPU evidence-integrity/queue-worker tests pass.
+The isolated package
+and `launch-fault-trace.sh` are under `tmp/display-order-20260918/`; the active
+renderer installation is preserved. Same-transport relaunch needs the owner's
+sudo authentication. Each launch requires desktop and bounded-control checks
+before Steel; both defects remain open.
+
+The owner offered to perform that relaunch. The prepared diagnostic package has
+renderer library SHA256 `F77FFBDD…` and server `90130547…`; its launcher checksum
+and `--version` checks pass. It selects a fresh evidence directory and starts a
+10-minute Xid watcher. Current DWM/ICD logs were C:-archived and MCP-pulled as
+`pre-hosttrace-20260918-173742.zip` (`EC617889…`). A normal guest shutdown was
+requested through Windows MCP; QEMU PID68186 was gone at 23:08:50, and its
+renderer processes were subsequently verified gone.
+
+**23:10 diagnostic launch:** the owner relaunched at 23:10:39. QEMU PID105273
+uses the same bridge/disk/SDL-Wayland/NVIDIA configuration and the isolated
+renderer above with `VKR_DEBUG=validate,fault`. Its log and shader files are in
+`tmp/display-order-20260918/vulkan-hosttrace-20260918-231028-IIeroF/`.
+Windows booted at 23:10:42; SYSTEM-purpose MCP verifies DWM1808/session1 loaded
+the expected `C0BF1A57…` UMD and `22199CA9…` ICD, with Helios Code 0 and .271 KMD.
+The focused SDL desktop was inspected. This VM relaunch is not a host GPU reset.
+
+The traced vehicle-off cube (`vulkan-candidate7`, PID6676/context29) completed
+300 frames/exit 0 with visible rotation. Both unique app-side shader arrays
+match the decoded host files byte-for-byte and pass CPU SPIR-V validation.
+The queued helper-on control (PID3252/producer31/helper33) then completed 1,600
+frames/exit 0 in 18.38 s harness time, observing three unsignaled submissions
+and changing focused SDL serials. Neither control added an Xid or validation
+message, and no diagnostic limit or shader-dump failure occurred. C: evidence
+was archived and MCP-pulled as `hosttrace-cube-20260918-1748.zip` (`044DF3E3…`)
+and `hosttrace-helper-20260918-1753.zip` (`4D052C84…`). These validate the
+diagnostic/control paths on the current usable host, not Steel or host recovery.
+The targeted Steel hypothesis remains malformed decoded shader input or an
+incorrect resource import/binding/lifetime at the failing GPU copy. Host traces
+can test those facts; CPU submission order alone does not prove completion.
+
+**Candidate8, 23:23–23:25:** stock Steel Vulkan with the helper enabled and
+async WSI, host tracing and no app API-dump layer ran as PID4500/session1,
+producer47/renderer112245 and helper49/renderer112273. Focused SDL captures
+show displaced rectangular regions in the loading image, then a corrupted
+scene. At **23:25:05.469**, the producer reported **Xid109 CTX SWITCH TIMEOUT**.
+The watcher paused QEMU; QMP quit at 23:25:35 removed QEMU and all its renderers.
+No other host process was terminated or GPU reset requested. Producer marker510
+completed; 511–513 subsequently returned `VK_ERROR_DEVICE_LOST`. All 494 dumped
+producer shader modules pass CPU `spirv-val` with Vulkan1.3/scalar-block-layout;
+there was no dump/trace limit. This does not exclude runtime shader/data faults.
+The helper imported all three sources (456/460/464); the preserved guest log
+records pending copy448/452/453/455/458/460 later completing. Neither an absent
+second import nor a premature-copy-retirement conclusion fits this run.
+
+The owner relaunched at 23:27:19. Windows booted at 23:27:25, DWM1884/session1
+loads the unchanged candidate pair and Helios reports Code0. Candidate8 C:
+evidence was archived and MCP-pulled with SHA256 verification as
+`retrieved-candidate8-20260918-1759.zip`, digest
+`0BD18E841DDA22FECC5540942F3620DFEA1BA2B8A6759548615C11614972F450`.
+
+**Confirmed contract violation; freeze causality still open:** the host trace
+shows producer image40 created with external `OPAQUE_FD` (`0x1`), bound to
+memory43 allocated with export `DMA_BUF` (`0x200`) and exported as resid456;
+the helper imports that DMA_BUF into image388. The other WSI sources repeat
+this mismatch. The earlier queued control has the same mismatch, so its
+successful flat clears did not establish the external-memory contract.
+[VUID-02728](https://docs.vulkan.org/refpages/latest/refpages/source/VkBindImageMemoryInfo.html)
+requires an intersecting handle type. The renderer's legacy validation filter
+suppressed that message, so "no new validation message" was not proof of a
+valid bind. `wsi_configure_cpu_image` now explicitly requests DMA_BUF for both
+image and dedicated memory, matching the resource-id helper; ownership and
+all completion/retention guards are unchanged. Linux Mesa and Windows Mesa
+build, and four Mesa plus two renderer CPU checks pass. The staged ICD is
+`246993D18A78C467BDD85875A536C602B013F95FDA7F774A7B6CF903524AE375`;
+it is not globally installed or runtime-accepted. Renderer diagnostic v2
+(`renderer-fault-package-v2`) exposes the legacy suppressed VUIDs only in
+`VKR_DEBUG=fault`. It became active in the owner's 23:39:55 launch. A new
+`--present-pattern` control retains three queued slots and encodes a spatial
+pattern plus visible serial for checking actual image contents before any
+further Steel arm.
+
+All 41 unique modules in candidate6's surviving app trace also match decoded
+producer modules from candidate8; this is a cross-run subset comparison, not a
+complete same-run integrity proof. The pattern capture checker is
+`tools/validate_vk_present_pattern.py`; it checks 1,728 spatial samples per
+capture against the visible serial and flags sampled serial decreases.
+The new probe and candidate ICD are staged under
+`C:\ProgramData\Helios\display-order-20260918\wsi-dmabuf-candidate\` without
+changing the registered ICD. Before the diagnostic-v2 restart, current logs
+were MCP-pulled as `pre-renderer-v2-20260918-1808.zip` (`432A22CC…`). Normal
+guest shutdown was requested at 23:36:16; QEMU114083 and all its renderers were
+verified gone at 23:36:31. The owner then launched
+`bash tmp/display-order-20260918/launch-fault-trace-v2.sh`: QEMU124093 started
+23:39:55, Windows booted 23:39:57, DWM1808/session1 loads C0BF1/22199 and
+Helios reports Code0. The renderer's running executable hash is D804A711…;
+SDL/Wayland, NVIDIA, bridged networking and `VKR_DEBUG=validate,fault` are
+verified. The focused desktop is visible. Trace directory:
+`vulkan-hosttrace-20260918-233951-e5ThGz`. This is still the same host boot;
+no host GPU reset/reinitialization is established.
+
+**DMA_BUF pattern controls A/B, 23:46–23:47:** the staged ICD246993 loads
+with UMD C0BF1 in session1. A completes 1,200 frames before the helper becomes
+ready. B completes 10,000 frames but its first source import fails: the
+helper's exact-template validator still accepts only OPAQUE_FD. Both therefore
+use GDI fallback and are **not helper-path passes**, despite exit0 and three
+observed unsignaled submissions. Host source images and dedicated allocations
+now both request DMA_BUF. There are no new Xids or printed VUIDs. Of five A
+pattern captures, two contain mixed frame patterns; B's 19 sampled captures
+(serial64→9925) have no sampled pixel mismatch or rollback. Those results do
+not localize the mixed-frame defect. C: logs were SHA256-verified through MCP
+as `retrieved-pattern-ab-20260918-1820.zip`, digest
+`4D2DDA2B4F70E071D58F52F6A2C4773ECF56F071D1F34D79D26636F2A0F9C8AF`.
+
+The DXVK exact-template validator now accepts DMA_BUF and preserves legacy
+OPAQUE_FD acceptance, while rejecting mixed/other handle types. Exact WSI
+alias creation explicitly requests DMA_BUF too. A regression check fails on
+the prior validator and passes under Linux ASan/UBSan and native Windows after
+the change. Windows DXVK and release UMD builds pass. UMD523CF7B6… also keeps
+the bounded, allocation-free bridge exception log but includes the borrowed
+DXVK error message. The broad `win_cargo` copy failed on preserved archive
+filenames; a scoped MCP build copied only the UMD and its dependencies to C:
+and built successfully. Registration alone left UMD C0BF1 cached: control C
+loaded it and also fell back to GDI. Its C: archive is
+`retrieved-pattern-c-20260918-1826.zip` (`AFC41122…`). A guest display-adapter
+restart at 23:56:11–17 succeeded, reports Code0, and SYSTEM enumeration confirms
+DWM6868/session1 now loads UMD523CF7B6 with the registered ICD22199. The host
+GPU was not reset.
+
+**Corrected helper control D, 23:57–23:58:** PID5624 loads UMD523CF7B6 and
+ICD246993, producer17/helper19. It completes 4,000 frames/exit0 in 58.75 s
+harness time, observes three unsignaled submissions, imports all three sources
+254/259/263, and records 3,353 successful helper Present callbacks without
+import/copy/overwrite errors. The traced source image, allocation and helper
+import all use DMA_BUF. No new Xid or printed VUID appears. All 117 active
+pattern captures (serial126→3975) match 1,728 sampled pixels each and advance
+monotonically. The next capture shows serial646, the last pre-helper GDI frame,
+coincident with helper teardown, then the desktop returns. Preserve this
+observed exit-time rollback; its timing suggests stale fallback contents, but
+does not localize or clear the original DX12 rollback. Full control C: evidence
+was MCP-pulled as `retrieved-pattern-d-20260918-1830.zip`, digest
+`9688E762F0616AAC92F12877C74B2E9FD19D3E7665987B82E5DB4BF8A4CAC5EE`.
+The corrected external-memory contract has a matched queued runtime control;
+Steel freeze acceptance remains open.
+
+**Candidate9, 00:00–00:01 on September19: FAILED.** Stock Steel used that pair,
+helper/async WSI enabled, host fault tracing and no API-dump layer. Workload
+PID9180/session1 loaded UMD523CF7B6 and staged ICD246993; producer39 was renderer
+PID141686 and helper41 was PID141714. Loading pixels remained malformed. At
+this point the host was still on the boot that had sustained candidate8's
+Xid109; candidate9 is not a clean-baseline causal isolation result. At
+**00:01:23.659569 IST**, the first Xid31 named **QEMU PID124093**, engine GRAPHICS
+GPC2/GPCCLIENT_GPCCS, a PDE read fault at `0x1_21167000`. QMP pause succeeded,
+but **did not contain the host GPU failure**. At 00:01:24.163604, NVIDIA reported
+FECS `UCODE Fatal Error`, followed by faults across renderer and other host
+application contexts. Those later faults may be collateral; they do not prove
+independent defects. QEMU's readback fence returned `VK_ERROR_DEVICE_LOST` at
+00:01:24.584406, after the first fault. The first reported process and that
+later error do not identify the root cause or map the fault VA to an image.
+
+Complete C: evidence was recovered after reboot through SHA256-verified MCP:
+`retrieved-candidate9-20260919-1837.zip`, digest
+`180C39533B4D2FCC524A56AFA30E93E6C193C529DFD92BC49EF6DBBC4F2C1367`.
+The 14 archived files include the full ICD log, DWM6868 and workload9180 UMD
+logs, invocation/module evidence and workload progress. Host evidence is in
+`vulkan-hosttrace-20260918-233951-e5ThGz/`, including the preserved QEMU log,
+previous-boot kernel journal, screenshots and decoded shaders. All 494 producer
+shader dumps (312 unique modules) pass CPU `spirv-val` with Vulkan1.3/scalar
+block layout; this does not prove GPU execution or exclude data/compiler faults.
+Source image, allocation and helper alias now agree on DMA_BUF. Pending helper
+copies still show real completion before source reuse; the trace does not
+establish a copy-retention violation. No new renderer VUID was printed.
+That statement covers the workload interval: the complete trace also contains
+earlier DWM layout and KMD external-memory VUIDs at desktop startup. It does
+not establish a validation-clean launch.
+
+**Verified host recovery, September19:** the owner reported losing the PC
+display and performing a forced reboot. The new host boot began **00:04:09 IST**,
+boot ID `35a49c53-4991-467d-a07f-1da64c150c3d`; the new kernel records NVIDIA
+initialization. This is a host recovery action, unlike the earlier VM-only
+relaunches. The owner cold-launched standalone bridged SDL/Wayland QEMU4269 at
+00:05:43, with renderer fault package v2 and NVIDIA Vulkan. Windows booted at
+00:05:46; SYSTEM MCP enumeration confirms DWM1812/session1 actually loads
+UMD523CF7B6 and the **registered ICD22199** (the trial ICD246993 remains staged),
+Helios Code0 and unchanged KMD. No GPU trial had run at that recovery check.
+
+The current diagnostic gap is **QEMU's own Vulkan readback device**: its
+`VkInstance` did not enable validation; renderer `VKR_DEBUG=validate,fault`
+does not cover it. An opt-in QEMU diagnostic now adds core/synchronization
+validation, resource-to-DMA-BUF identity, exact imported image shape/memory
+types, and operation-qualified API return records, including submit and fence
+results. It preserves existing ownership, waits and failure returns. An
+isolated build and packaged module checks pass. The staged package is
+`qemu-readback-package-v1` (QEMU SHA256 `05872F39B1AC8EDE4849866DCE859120BF287504C9A45437F67616B077789E3A`,
+OpenGL module `E4A77A2FEC4E80CDFA8D25E96C7894F45E056CAF27C9085055C36254CEB667B7`).
+No running executable or module was overwritten. MCP requested normal guest
+shutdown at 00:25:00; QEMU4269 and all its renderers were verified gone at
+00:25:37. The owner launched `launch-readback-trace-v1.sh` at **00:28:02**:
+QEMU29705 has the verified packaged binary/modules, renderer package v2,
+bridged SDL/Wayland/NVIDIA configuration, and native readback core/sync
+validation enabled. Windows booted at 00:28:04, Code0; SYSTEM-purpose MCP
+verified DWM1804 actually loaded UMD523CF7B6/registered ICD22199.
+Evidence is in `vulkan-readback-20260919-002801-CqXI9y/`.
+
+**DWM transition-order defect and candidate, September19:** this clean-host
+desktop startup reproduces VUID-09592/01197 before any benchmark. For DWM
+renderer29853/context5/image172 (export resid45), execution command79 records
+UNDEFINED→SHADER_READ; a later init command147 records SHADER_READ→COLOR_ATTACHMENT.
+Submission runs 147 before 79, reversing the intended transitions before the
+draw/copy. Storage rotation changes logical image identities, so resource-local
+tracking alone cannot safely promote these operations. DXVK now keeps external
+shared-image transfers and layout transitions on the execution buffer, after
+the existing ownership/rotation barriers. Private staging/debug images remain
+exempt. No wait, producer dependency or consumer-retention guard is removed or
+added; v4's explicit acquire/copy/release remains intact.
+
+Windows DXVK and release UMD builds pass. Installed UMD SHA256 is
+`FCFF7F285D9203D4089BFD65E3663CBEDD79CE97ED6C99C5B10F09F04504AF4D`.
+The 00:40:14 PnP restart completed; its immediate snapshot caught old DWM
+instances, but SYSTEM enumeration subsequently verifies DWM8100/session1
+started 00:40:19 and loaded FCFF7F28/22199, with Code0 and a visible desktop.
+KMD .271 and native UMD12 are unchanged. The same-image CPU submission-order
+witness still finds the old violation and finds none across 6,647 barriers in
+the candidate trace (renderer40231/context7/image172). Both traces have complete
+record sequences. The parser was corrected to accept QEMU timestamp prefixes;
+the initial candidate witness had incorrectly skipped those records. This
+repairs the observed ordering defect, not yet the reported freeze.
+
+**Recovered-host bounded control, 00:46–00:47:** PID7744/session1 actually loads
+FCFF7F28 and staged ICD246993, with helper/async WSI enabled. The queued spatial
+pattern completes 4,000 frames/exit0 in 58.87s, observing three unsignaled
+submissions. Producer23/renderer49873 has 4,000 successful completion markers;
+helper25/renderer49968 imports sources268/273/277 and records 3,352 copies.
+There are no new renderer or native-QEMU validation messages, failed traced
+results, trace limits or host Xids. Of 150 focused SDL captures, 117 consecutive
+pattern captures have correct sampled pixels and serials407→3997 without
+rollback (116 after the first host helper copy, serials662→3997). **The first
+pattern capture is mixed**, with 1,632/1,728 sampled pixels inconsistent with
+its serial1; it precedes the helper's first recorded copy. The other 32 captures
+show the desktop before/after the probe. Preserve the startup failure; this is
+not an unqualified pixel pass or proof that the fallback path caused it.
+All 15 C: evidence files were archived and SHA256-verified through MCP in
+`retrieved-pattern-ordered-a-20260918-1918.zip`, digest
+`35D5D0177374441114C309665FD6C52BA478B4ABB8AFCAE3EEA2DF71F108A4EB`.
+
+The remaining boot VUID-01443 (KMD LINEAR external image created PREINITIALIZED)
+and VUID-09860 (OPAQUE_FD buffer allocation gains incompatible DMA_BUF export)
+are still open; no causal independence from the freeze is established. Native
+QEMU validation covers its own device, not cross-device consumer lifetime.
+The buffer mismatch originates in the KMD's raw Venus encoders
+(`create_present_destination_buffer` / `allocate_present_buffer_memory`):
+unlike Mesa's buffer path, they bypass renderer-handle normalization, and
+virglrenderer adds DMA_BUF to their OPAQUE_FD export request. A correction must
+keep creator, dedicated allocation and import metadata consistent. The LINEAR
+image correction must cover initialization and ownership before its first
+consumer, including the existing-linear-source path; merely changing creation
+to UNDEFINED and discarding contents after CPU writes is insufficient. These
+KMD paths were unchanged during the preceding .271 control.
+
+**KMD allocation candidate, September19:** the raw Present-buffer creator and
+dedicated exporter now both request DMA_BUF, matching Mesa's normalized import.
+External LINEAR images start UNDEFINED and complete their own initialization
+submission (GENERAL plus release to EXTERNAL) before the allocator creates and
+publishes the HOST3D blob. This covers CPU-written primaries and fallback copy
+targets; first use never performs a late discard. A bounded, fallibly allocated
+image registry retains backing and setup objects after ambiguous submission or
+failed waits, refuses premature publication/destruction/free, and checks both
+source and target before recording an existing-LINEAR copy. Actual copy drains,
+consumer release, async WSI and WDDM2.1 remain intact. The 220 Linux KMD logic
+tests, producer-ABI check, Windows release build and Inf2Cat validation pass.
+The .289 package uses the installed native-only INF shape with its DriverVer
+updated, preserving the exact FCFF UMD11 / C724 UMD12 / 22199 ICD overrides.
+It rebuilds the current checkout, including committed changes since installed
+.271; runtime results must not be described as an isolated two-change A/B.
+Build/package evidence is `kmd-memory-1948` on C:. All 90 recorded build-source
+hashes match the current files. The native-only catalog passes Inf2Cat, and the
+normal SetupAPI installer binds the signed .289 KMD hash
+`F6604A277DEF8333F5D769AF6D93B7EC7BEE2C98C38C52934DDEF45BB7400996`.
+The guest rebooted at **01:20:28 IST**; SYSTEM enumeration confirms DWM1836
+loads unchanged FCFF/22199, Helios reports Code0, and a focused SDL capture
+shows the desktop. New KMD renderer79963/context1 records LINEAR image6 created
+UNDEFINED, GENERAL/release barriers, submit, then backing export; buffer11 and
+its dedicated allocation both use `0x200`. Neither boot VUID reappears, and
+the new boot/control trace has no VUID, negative VkResult or host Xid.
+
+**.289 queued control, 01:24–01:25:** PID6396/session1 loads FCFF UMD and
+246993 ICD with helper-on/async1. It completes 4,000 frames, exit0, in 56.794 s;
+producer29/renderer81591 has 4,000 successful marker results and helper31/
+renderer81617 records 3,144 copies from sources364/373/369. Of 150 focused
+captures, 110 active frames advance 177→3983. One sampled pixel in capture035
+is obscured by the visible blue busy cursor; the raw mismatch is preserved.
+The next capture117 shows **855 after3983**, then the desktop returns.
+This repeats the earlier Vulkan helper exit rollback and does not localize the
+native DX12 defect or establish causal independence from the freeze. The first
+captured frame is177, so this arm also cannot clear the earlier serial1 startup
+failure. A stuck broad health-report process consumed one CPU during the first
+11 seconds; its command identity was checked and only that diagnostic child
+was stopped through MCP. Do not use the harness duration as a performance claim.
+Complete C: evidence and build provenance were archived/pulled through MCP as
+`retrieved-pattern-memory-a-20260918-1957.zip`, SHA256
+`1097028DD764376FB7D19C9C50235D11BEB421D2D9C414D7961E3E8D1FBE21A3`;
+all 45 inner manifest entries verify. Raw captures, classification, boot/control
+traces and the exit interval are in the current `vulkan-readback-...-CqXI9y` dir.
+
+**candidate10, owner-authorized bounded Steel trial, 01:42–01:45: FAILED.**
+This was the first Steel trial on host boot
+`35a49c53-4991-467d-a07f-1da64c150c3d` after the owner's forced reboot at
+00:04:09; the pretrial kernel journal contained no Xid. SYSTEM enumeration
+confirmed KMD .289/F6604, DWM1836/session1 with FCFF/22199 and Helios Code0.
+The stock Vulkan invocation began at **01:42:53.825 IST** with staged 246993,
+helper-on/async1 and no API-dump layer. Workload508/session1 loaded the expected
+246993 ICD and FCFF UMD; its producer was renderer104414/context45 and helper
+renderer104441/context47. Focused SDL captures show malformed loading imagery,
+then a mostly black loading screen with a full progress bar, without a rendered
+benchmark scene. At **01:44:18.863607 IST**, about 85 seconds after invocation,
+the producer renderer reported **Xid31: CE0/HUBCLIENT_CE2 unsupported-kind READ
+at `0x0_19c00000`**. The watcher paused QEMU before the 90-second harness could
+finish. QMP quit at **01:45:00 IST** stopped QEMU29705 and all its renderers;
+their absence was verified. This is no normal-exit or termination acceptance.
+
+The captured host interval has no VUID, negative Vulkan return or exhausted
+trace budget before the fault. Producer marker454 completed at 01:44:18.654;
+its final recorded queue7 submission, fence19777 and command buffers19776/
+19778, returned SUCCESS at 01:44:18.782. QEMU's last recorded readback completed
+at 01:44:18.662. These observations do not identify the offending operation
+or establish completion of the final producer submit. The last command buffers'
+contents are not covered by the current trace: buffer copies, draw/dispatch
+and secondary-command execution need explicit correlation before another arm.
+All 494 host-decoded producer shader records, 312 unique binaries, pass CPU
+`spirv-val --target-env vulkan1.3 --scalar-block-layout`; the unique hashes
+match candidate9. Structural validity is not GPU/runtime safety.
+
+Complete surviving C: files were archived and retrieved through Windows MCP as
+`retrieved-steel-memory10-20260918-2015.zip`, SHA256
+`81C2DE49450D4C52EB2E373EC43392CF05B55F77379C891BACCED0D3A18B3589`;
+all 47 inner manifest entries verify. The archive includes the full saved ICD
+and UMD1836/508 logs, invocation and workload modules. There is no harness
+state/result; snapshot `workload-508-35.json` is 966 zero bytes. Preserve this
+incomplete final write. PID1836's append log includes older lifetimes; use the
+verified current FCFF load and current contexts. Guest logs record pending
+copies442/445/446/448 completing after 59–417 ms, then copy451 pending with
+source440 retained. Host tracing continues through 454 helper copies from its
+single recorded source alias388. The guest tail is incomplete relative to host
+progress; it cannot prove final copy completion or premature source recycling.
+Host trace, kernel journal, 112 focused captures and shader validation are in
+`vulkan-readback-20260919-002801-CqXI9y/steel-memory10-*` and
+`qemu-steel-memory10-final.log`.
+
+The owner relaunched QEMU105969 at 01:46:49 for evidence retrieval only; guest
+boot is 01:46:55.500, DWM1816 loads FCFF/22199, KMD .289 remains installed and
+Helios reports Code0. The host remains on the same boot with no observed GPU
+reset/reinitialization record; VM relaunch is not proof of host GPU recovery.
+No further benchmark ran. The DWM/KMD contract repairs and bounded-control
+success therefore do **not** fix Steel's freeze. Root cause, startup/exit
+presentation defects and native DX12 rollback remain **OPEN**.
+
+**September19 follow-up, CPU work only:** the renderer's missing command-name,
+buffer-range, secondary-command and submission-dependency records are now built
+in immutable `renderer-fault-package-v3`; they are diagnostics, not a repair.
+Three production-dispatch/trace/queue-completion CPU tests pass, including
+unchanged device-loss and timeout returns. A new bounded transfer control
+(`tools/vulkan_transfer_pool_probe.c`) exercises upload → device buffer →
+optimal 2D/3D image → readback with four outstanding slots. Both separate and
+interleaved buffer/image allocations pass 24 submissions each on CPU lavapipe
+with synchronization validation, checking 254,054,592 bytes in total. Its native
+Windows build passes (source `58EE6E68…`, executable `DBA4B852…`) and is staged
+under C: `transfer-pool-v1`. No guest GPU control or benchmark ran. Existing
+bindings show mixed pools but do not establish an overlap or memory-kind cause;
+the control is intended to test that hypothesis without another blind Steel run.
+
+At **02:11:32.634 IST**, on the same host boot, a further **Xid13 Illegal
+Instruction Encoding** named PID98711, `VLLM::EngineCor`. This can be collateral
+GPU-fault damage; causal independence from candidate10 is not established.
+No new guest workload was active. The application process was already absent
+when checked at 02:14:56; the agent did not terminate it or perform a GPU reset.
+Host evidence is preserved in `fault-followup-20260919-0214/`. Windows MCP
+accepted a normal VM shutdown at about 02:14:57; QEMU105969 and all renderer
+processes were subsequently verified gone. At that point host recovery was
+unverified and another GPU control was blocked. The owner-run
+`launch-transfer-trace-v1.sh` is prepared with renderer v3 and the unchanged
+QEMU readback package/bridged disk/network. The bridge launcher still needs
+the owner's sudo authentication. Steel freeze remains **OPEN**.
+
+**September19, 02:31 relaunch and bounded transfer controls:** the owner reported
+automatic GPU recovery and relaunched the prepared standalone bridged SDL/Wayland
+VM. This is owner-reported recovery on the same host boot; no reset/reinitialization
+journal record was observed. QEMU132955 uses readback package `05872F39…` and
+renderer package v3 (`44bc07d2…` library / `c658e1ca…` server), with actual
+validation/fault environment and mapped libraries verified. SYSTEM enumeration
+confirms DWM1820/session1, UMD FCFF/ICD22199, KMD .289/F6604 and Helios Code0.
+
+The transfer-pool v2 controls explicitly select upload type4/flags0x7 and
+readback type3/flags0xe, matching the workload's relevant host-memory types.
+Separate and interleaved device buffer/image pools each complete 24 submissions,
+127,027,296 checked bytes and exit0 (4.179 / 3.975 s harness time), with the
+loaded 246993 ICD verified. No new Xid, VUID or negative native return was
+observed. Earlier v1 used type2/flags0x6 for both host buffers: separate exits0;
+mixed reports all 24 checks and its internal RESULT exit0, but the 30-second
+harness expired before collecting the OS exit code. Preserve that limitation.
+The four controls and build/guest logs were MCP-retrieved as
+`retrieved-transfer-pools-20260918-2113.zip`, SHA256
+`CA31252D0C937A4EDFCA384573B9B5EF083B425F8D5AE1E969D165C622BCB56C`;
+all 40 inner files verify. These controls do not prove benchmark lifetime safety.
+
+**candidate11, authorized 90-second Steel trace, 02:50–02:52: INCONCLUSIVE.**
+The stock invocation starts at 02:50:37.365; workload1272/session1 loads
+ICD246993 and UMD FCFF, producer renderer158551/context49 and helper context51,
+async1/helper-on with no API-dump layer. The harness stops admission at its
+90-second limit and finishes cleanup at 100.293 seconds. Workload and CLI are
+gone; the result archive reports `No result produced`, not benchmark success.
+Inspected focused SDL captures show malformed loading imagery, then black,
+then the desktop. No rendered scene is established. No new Xid was observed.
+
+The new producer trace identifies CB19776 (the same IDs in candidate10's last
+submit): **12,547 buffer copies**, 468 of 288 bytes and 12,079 of 144 bytes,
+from buffer170 to uniform buffer174, between barriers. The 12 MiB source is
+bound at offset0 in a 16 MiB type4 mapped/exported allocation171; the destination
+is bound at offset262144 in 64 MiB type1 allocation143 shared with optimal
+images. All recorded copy ranges are in bounds and nonoverlapping. Queue7
+submits CB19776/19778 with fence19777 at **02:52:02.840645**; the actual native
+wait returns SUCCESS at **02:52:02.854116**. This establishes that submission's
+completion in candidate11, not the faulting candidate10 submission's completion
+or any consumer-release/ownership contract. All 12,604 captured buffer-copy
+ranges are in bounds; no allocation is freed in the producer prefix.
+
+At **02:52:03.813830**, the producer reaches its 200,000-record limit while
+recording draws in CB20262. The trace therefore cannot describe final GPU work
+or teardown. Its 494 sequence gaps correspond exactly to shader-dump IDs, not
+missing pre-cap records. Guest pending helper copies453/457/458/460/463/465
+complete after 62–506 ms with their source retained. The flip-gate warning is
+followed by the mandatory copy wait; it is not evidence of early reuse.
+
+Complete surviving C: evidence was retrieved through SHA256-verified MCP as
+`retrieved-steel-transfer11-20260918-2134.zip`, SHA256
+`2F9B7E81029BADEF59776A14E27583DF80106057DBA99FAA8500CC41B54E6F61`;
+all 52 inner files verify, including SYSTEM post-trial loaded-driver health.
+Host records, 130 focused captures and the range audit are under
+`vulkan-transfer-20260919-023138-MxEV81/`. The v3 trace changes timing; no new
+production fix was deployed between candidate10 and candidate11. Steel's
+freeze and native DX12 rollback remain **OPEN**.
+
+**September19, smaller transfer/mapping reproduction after candidate11:**
+`tools/vulkan_transfer_pool_probe.c --copy-burst` reproduces the captured 12,547
+ranges, verified against the trace, using two retained slots and four finite
+submissions. It allocates a 16 MiB mapped source pool and a 64 MiB destination
+pool with a buffer at offset262144 beside an optimal image. Independent readback
+checks all 12 MiB, including untouched gaps; the destination has the additional
+TRANSFER_SRC usage needed for that check. CPU lavapipe/synchronization validation
+passes. The Windows v1 binary is `4F5B6A05…`; v2 adds full mismatch counts, sampled
+CPU upload values and a direct upload-to-readback arm (`63F38269…`, source
+`DFB6ED19…`). Neither changes the driver.
+
+On the same reported-recovered host boot, the guest produces these results:
+
+| Arm | Workload/context | Result |
+|---|---|---|
+| Type4 upload → pooled device buffer → type3 cached readback; 12,547 individual calls | PID6424/ctx53 | exit1, first mismatch byte327680, actual zero; native fence succeeds |
+| Same ranges in one call | PID2104/ctx55 | exit1, first mismatch byte196608, actual zero |
+| Direct type4 upload → type3 readback, one call | PID2028/ctx59 | exit1; 413,244 copied words differ, no gap errors; first wrong byte393216 matches pattern data from exactly 2 MiB farther into the source; CPU upload sample is correct |
+| Direct type2 upload → type3 readback | PID4316/ctx61 | exit0; four submissions, 50,331,648 exact bytes |
+| Direct type4 upload → type2 readback | PID9020/ctx63 | exit0; four submissions, 50,331,648 exact bytes |
+
+All run in session1 with loaded ICD246993 verified, complete fence waits, no
+timeout success, and no new Xid/VUID observed. Type4 is flags0x7, type3 flags0xe,
+type2 flags0x6. The type substitutions are diagnostic observations, not grounds
+to hide advertised memory types. No acceptance or causal link to Steel's Xid is
+claimed. The v2 `pooled` task was prepared but **not run**. All five guest runs,
+both builds, scripts and logs are MCP-retrieved in
+`retrieved-transfer-bursts-20260918-2200.zip`, SHA256
+`F4181138143FADD7131F737ABEA4C671E5E05C831A4FD8CE63DF8B0E9F31EDD4`;
+all 45 inner files verify. Host context traces are in the current `MxEV81` dir.
+
+The same direct type4→type3 GPU copy control passes native Linux/NVIDIA with
+Vulkan mappings and synchronization validation (four submissions / 50,331,648
+bytes, `burst-native-direct-v2.log`). A further Linux-only control,
+`tools/vulkan_dmabuf_mapping_probe.c`, creates a 12 MiB exportable buffer in a
+16 MiB allocation and compares `vkMapMemory` with `mmap` of its DMA-BUF in both
+directions, with DMA-BUF CPU-access ioctls and real error checks. It creates no
+command buffers and submits **zero GPU commands**. On type4/flags0x7 the two
+CPU mappings disagree from byte851968: 2,932,736 words differ in each direction
+(`dmabuf-map-native-vram.log`, exit1). Type3/flags0xe passes both directions
+(`dmabuf-map-native-cached.log`, exit0). Source SHA256 is
+`36C04DDAB4C57E6E0023041B7FEA7B324F48936FF2F46FC1454A8E7DB287CFC7`.
+The optional `--fixed` mapping variant is implemented but **not run**.
+
+This narrows the investigation to exported-memory mapping, but **all these
+observations used the same previously faulted host boot** with owner-reported
+automatic recovery. They do not yet establish a fresh-boot host-driver defect
+or Steel's root cause. Review the CPU alias probe's contract and reproduce its
+type4/type3 pair on a recovered baseline before selecting a mapping repair.
+The renderer prefers DMA-BUF for host-visible allocations and maps it with
+`mmap`; its OPAQUE_FD route instead has a Vulkan-backed allocator. Any change
+must keep buffer/image/allocation handle declarations compatible and retain the
+explicit WSI DMA-BUF contract. Do not blindly force a different export type.
+
+**Live-state check at 16:53–16:54 IST, September19:** the host has since rebooted;
+boot ID is `61a268ee-72a8-42bb-8bf1-9040a1e9e534`, boot time15:54:50 and NVIDIA
+module initialization15:55:48.886. No QEMU, renderer or probe process is present.
+Windows MCP `win_host_status(host="vm")` times out at 192.168.122.120:22. The
+previous launch, DWM and loaded-driver facts above are historical, not current.
+No trial was run on this new boot and the agent did not perform that reboot.
+Preserve the newly observed untracked `codex-session-01a0b574-c242-7a30-935c-1f5bd0822598.md`;
+it was not created or changed by this investigation. Both defects remain OPEN.
+
+**Fresh-boot CPU mapping reproduction, September19, 17:02 onward:** boot
+`61a268ee-72a8-42bb-8bf1-9040a1e9e534` now has a reproduced mapping failure.
+NVIDIA is 615.71.09 (open kernel module and userspace), kernel 7.2.6-arch2-1,
+RTX PRO 6000 Blackwell. No QEMU or renderer is running, and the kernel journal
+has no NVIDIA Xid before or after these controls. All controls below submit
+**zero GPU commands**; no Steel or guest transfer trial ran on this boot.
+Evidence is in `mapping-newboot-20260919-qatb20l1/` under the existing outbox.
+Its immutable archive is `mapping-newboot-20260919-qatb20l1.zip`, SHA256
+`780F1FA48F633B695E5033251C2545355E32BAEFFE8A4EDBE274CB92B8B9E88C`;
+all 124 manifest-listed files and the archived manifest verify. It includes
+every control result, original/extended sources, binary hashes, kernel history,
+syscall trace, loaded-library hashes and vendor source/provenance checks.
+
+The original probe source is byte-identical to the earlier `36C04DDA…` source.
+Its first validation-enabled type4/type3 pair passes; that single type4 pass is
+not stable. The subsequent type4 run without a layer fails from byte 5,505,024,
+with 1,769,472 wrong words in **each** direction. The validation-enabled
+`--fixed` type4 arm fails at the same boundary/count; cached type3 passes both
+arms. There are no Vulkan validation errors. The initial validation pair logs
+a deprecated validation-setting warning, corrected in later invocations.
+
+The extended `tools/vulkan_dmabuf_mapping_probe.c` adds a native self-check,
+`--read-only-dmabuf` (PROT_READ, no writes through that alias), a queried
+`--vulkan-import` control, and explicitly declared OPAQUE_FD controls. Native
+`-Wall -Wextra -Werror` builds pass. Read-only type4 repeats have correct native
+contents but 2,785,280 wrong DMA-BUF words, starting at byte 1,441,792; cached type3
+passes. Thus neither writes through the suspect alias nor a preceding GPU fault
+is required for the mapping disagreement. The changing boundary is consistent
+with allocation-dependent physical layout, but the actual physical ranges have
+not been captured. The 17:26 fdinfo capture passes again and names exporter
+`drm`; the defect is intermittent across allocations, not an unconditional
+type4 failure. Successful allocations do not invalidate the preserved failures.
+
+Separate `--opaque-only` type4 and type3 allocations/imports pass both directions
+with synchronization validation. These are **separate allocations**, not proof
+that an OPAQUE_FD alias of the failing DMA-BUF allocation works. Two attempted
+same-allocation comparisons refuse with exit77: the queried DMA-BUF import
+mask `0x3` excludes original type4, and DMA-BUF buffer compatibility `0x200`
+excludes the requested DMA-BUF|OPAQUE_FD combination `0x201`. Cached DMA-BUF imports work.
+Do not bypass these checks or force a renderer export flag. Mesa currently
+normalizes buffer/image declarations to its selected renderer handle type;
+any alternate mapping implementation must keep those declarations, allocation
+export/import types and explicit WSI DMA-BUF contracts consistent. QEMU's
+existing OPAQUE mapping fallback uses a Vulkan-mapped blob subregion; lack of
+fixed mapping support alone does not require a new QEMU mapper.
+
+The read-only syscall trace identifies `DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY`
+followed by PRIME export, successful DMA-BUF mmap and CPU-access ioctls. This
+points to the DRM/NVKMS exporter path, rather than establishing that the
+separate `nv_dma_buf_mmap` implementation ran. The matching 615.71.09 source
+exposes a concrete candidate: [RM user mapping](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.09/src/nvidia/src/kernel/rmapi/mapping_cpu.c#L482)
+allows discontiguous ranges; [osMapPciMemoryAreaUser](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.09/src/nvidia/arch/nvalloc/unix/src/os.c#L1179)
+retains those ranges in its mapping context but returns their first physical
+address; [NVKMS MapMemory(USER)](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.09/src/nvidia-modeset/kapi/src/nvkms-kapi.c#L2137)
+passes that address to the [DRM VRAM fault handler](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/615.71.09/kernel-open/nvidia-drm/nvidia-drm-gem-nvkms-memory.c#L113),
+which calculates base-PFN plus page offset.
+The latter's contiguity capability is based on `!device->coherentGpuMemory`.
+Source snapshots and hashes are archived with the syscall trace. This is a
+source-supported mapping-contract candidate, **not a runtime capture of its
+physical ranges or proof of Steel's Xid origin**. No host module was changed.
+
+Windows MCP status still times out. The prepared standalone bridged
+SDL/Wayland launcher and its immutable renderer-v3/QEMU packages were reviewed
+and their SHA256 manifests verify; it needs sudo authentication (`sudo -n true`
+reports a password required), and neither `virbr0` nor `heltap0` exists now.
+No alternate guest transport/network or host reset was used. Next work is to
+resolve the mapping contract, then repeat the bounded guest type4→type3 transfer
+and its sibling controls with freshly verified launch/loaded-driver identities.
+The mapping reproduction does not close either **OPEN** graphics defect and
+does not justify another blind Steel run.
+
+**Candidate12, September19: opaque CPU-mapping candidate; guest acceptance OPEN.**
+Source changes now pair Helios's ordinary NVIDIA buffer/linear-image declarations
+with an internal OPAQUE_FD memory export. The choice requires queried opaque
+export support and applies only to the Windows transport; explicit DMA-BUF WSI
+and native Win32 sharing retain their existing handle contracts. Ordinary
+allocations keep their application-visible export flags and WDDM ownership.
+Internal allocations retain whole-page backing for QEMU, including dedicated
+allocations with their original resource identity. No synchronization, memory-type
+admission, WDDM version or presentation policy changes.
+
+The paired renderer correction honors a nonzero explicit export request instead
+of adding DMA-BUF to OPAQUE_FD. The old addition produced `0x201`, which this
+driver's queried compatibility rejects. Implicit export selection and the
+unsupported-DMA-BUF import fallback remain available. The existing Vulkan
+allocator imports opaque memory using its original size/type and device UUID;
+QEMU already falls back from fixed mapping to a blob subregion for that fd type.
+
+Evidence is in `opaque-mapping-candidate12-ebfwn7gh/`; its immutable `.zip`
+archive has SHA256 `9BB999FDE7F63C446FB6200D8721B5E6ED9D282F77216690AC1783DCE8106AA2`.
+All 180 manifest-listed payload files and the archived manifest verify.
+Native Mesa and renderer
+builds pass; three Mesa CPU tests and four renderer CPU tests pass, including
+the new allocation-contract and actual renderer-dispatch regressions. The
+mapping probe can now link the **production** `vkr_allocator_resource_map`
+implementation (`--renderer-import`) so it exercises the separate Vulkan
+device used by that mapper. Three type4 and three type3 controls each pass
+12 MiB in both directions with synchronization validation and zero GPU
+submissions. On the same boot, the read-only DMA-BUF type4 control fails with
+2,867,200 wrong words while its native mapping self-check and cached type3
+control pass. No NVIDIA Xid is recorded before or after these controls.
+Three additional production-mapper controls also pass: dedicated type4,
+device-address type4, and dedicated/device-address type3. Each compares 12 MiB
+in both directions, submits zero GPU commands and logs no validation errors.
+The dedicated controls allocate 16 MiB for a 12 MiB buffer requirement, consistent
+with the [dedicated-allocation size contract](https://docs.vulkan.org/refpages/latest/refpages/source/VkMemoryDedicatedAllocateInfo.html).
+Mesa's internal export preserves the full allocation chain and pads to whole
+pages; the opaque mapper imports that same padded size and memory type.
+These results validate the host mapper control, not the guest mapping or Steel.
+
+`renderer-opaque-package-v1/` is immutable and hash-verified: library SHA256
+`412633B4341242F5D9AD71FE6F59C0D75903A8A663A7F0745D607606544BC2A7`, server
+`2BBF92D57E73C2FC80363D48CF5FA4EECF00263C8648DB795DB08B4360877E1A`.
+The owner booted with `launch-opaque-mapping-v1.sh` at 18:27 IST. Live process
+and mapped-library hashes verify the candidate renderer and existing QEMU
+package in the standalone bridged SDL/Wayland/NVIDIA environment. The disk is
+`/var/lib/libvirt/images/win11.qcow2`, RAM 32 GiB, 16 vCPUs, hostmem 8 GiB. Windows
+MCP status succeeds; Helios reports problem code 0, KMD 22.22.289.0
+(`F6604A27…`), DWM PID1820/session1 loads UMD `FCFF7F28…` and installed ICD
+`22199CA9…`. The old WinBoat environment is not the active launch. Host boot
+`61a268ee-72a8-42bb-8bf1-9040a1e9e534` has no Xid before this control.
+
+The local-C: Windows build completes at 18:35:31 after correcting PowerShell
+array enumeration and the detached SYSTEM task's Python/Meson PATH. Both
+failed script attempts are preserved. All 25 source hashes match before/after
+the successful build. Isolated ICD SHA256 is
+`A63A0790B079DFB89C4827BA2485F888EB7B93BF77A472119F5D2D3F804D366B`;
+probe SHA256 `F8DC83C43E8A9FEFC394B0464E72096DFE46887782BA4270933CBDD7811F59EA`.
+They are in `C:\ProgramData\Helios\display-order-20260918\opaque-mapping-candidate12-v3`.
+The build did not install them globally or replace DWM's loaded ICD.
+
+**18:37:31 fault and invalid candidate trial:** MCP's desktop task registration
+targets the stale `tibix` account. The agent registered the same wrapper through
+MCP for the verified active `DESKTOP-FLAPAES\Rupansh` user, but incorrectly kept
+`RunLevel Highest`. The Vulkan loader
+[ignores ICD override environment variables when elevated](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#exception-for-elevated-privileges).
+Thus the built candidate's on-disk hash is not proof it ran. The transfer-shaped
+producer context31 uses `external=0x200`, allocation `export_types=0x200` and
+`fd_type=0` (DMA-BUF), not candidate12's intended OPAQUE_FD mapping. Its complete
+trace ends at seq25209, below the record limit: two submissions and two
+successful own-fence waits, then destruction/freeing. Guest byte results,
+exit code and loaded-module receipt have not been retrieved. The installed
+baseline ICD is the expected loader selection, but that identity remains an
+inference until the guest receipt is available. This is **not candidate12
+runtime acceptance or a valid comparison of its mapping path**.
+
+The host records Xid31, CE0/HUBCLIENT_CE2 virtual-read REGION_VIOLATION at
+`0x0_16e00000`, attributed to DWM renderer PID138183 / `vkr-ring-5`.
+DWM context5 subsequently reports marker154/155 `VK_ERROR_DEVICE_LOST`.
+The Xid watcher immediately issues QMP `stop`; `query-status` verifies paused.
+No further GPU trial, host reset or reboot was performed. Temporal separation
+and the fault's DWM attribution do not establish independence from the transfer
+control. Host validation reports no VUID errors. No Steel run was attempted.
+
+Current evidence is `candidate12-guest-wn8ghpns/` and the owner's launch logs are
+`opaque-mapping-run-20260919-182713-Jb0Onn/`, under the existing outbox. The
+host-evidence archive is `candidate12-guest-wn8ghpns.zip`, SHA256
+`3DF179139057B22AEE58E626DB7C3F1A39ABDE5FEE122ECB71DBD87CF1D0AB03`;
+all 204 payloads and its inner manifest verify. It includes host traces, shader
+captures, MCP transcripts, code/build checks and prepared scripts; the actual
+C: guest files have not yet been pulled. At 18:50 IST QMP still reports paused,
+the boot ID is unchanged, and only the 18:37:31 Xid is recorded. The guest
+run directory is `C:\ProgramData\Helios\display-order-20260918\opaque-mapping-c12-direct`;
+retrieve it and the build/task receipts through MCP after recovery. The first
+post-fault MCP task query reported absent task/log while QEMU was paused; it
+does not establish that guest evidence is absent. QEMU remains paused and this
+host boot is now faulted; owner recovery must be independently verified before
+any additional graphics workload, even after a VM cold boot.
+
+The transfer probe now refuses elevated/session0 Windows execution, verifies
+the loaded ICD's full path and SHA256 **before VkDevice/allocation creation**,
+and provides `--init-only` (no VkDevice or submissions). Candidate12 also logs
+its internal mapping selection under `VN_DEBUG=init`. Native and Windows-cross
+probe builds pass with `-Wall -Wextra -Werror`; four malformed/unsupported
+identity-argument controls refuse before Vulkan initialization. Native Mesa
+build and the seven focused CPU tests pass. Windows execution of these new
+guards and the revised diagnostic ICD remains pending. Production selection,
+ownership, admission and synchronization policies are unchanged by this follow-up.
+
+Prepared v4 build/run/registration scripts and `guest-source-sha256-v5.json`
+are in `candidate12-guest-wn8ghpns/`. They select the verified active user with
+`RunLevel Limited`, reject elevation again in the payload and probe, and
+require a successful initialization-only identity/mapping-policy receipt before
+a transfer arm. Use them through MCP; do not reuse the older elevated task or
+old source manifest. The next sequence is recovered-host verification, MCP
+retrieval of the preserved guest evidence, v4 Windows build, initialization-only
+admission, then the bounded transfer controls with host export traces and an
+active Xid watcher. Both graphics defects remain **OPEN**; candidate12 is not
+an accepted fix.
+
+**Owner-directed continuation, September19, 19:05 IST:** the owner reports the
+GPU is OK and explicitly directs continued testing without a fresh host boot.
+This supersedes the preceding fresh-state prerequisite for the next bounded
+controls; it does not relabel this boot as fault-free. Boot ID remains
+`61a268ee-72a8-42bb-8bf1-9040a1e9e534`, with the earlier18:37:31 Xid and no newer
+Xid. `nvidia-smi` succeeds; QMP reports running after the owner relaunch.
+QEMU PID150642 and its mapped renderer library match the expected packages;
+new launch logs are `opaque-mapping-run-20260919-190325-Kl1b3u/`. MCP verifies
+Helios problem code0 and the same KMD/installed DWM UMD/ICD identities on the
+new Windows boot. New evidence is `candidate12-retry-x00uyw7o/`.
+The old guest stderr survives: context31 failed serial1 with182,844 wrong
+copied words, starting at word507904; guard gaps remain correct. Its stdout
+ends in a truncated failure result, with no state.json. Full archival and
+loaded-identity inspection precede the revised initialization-only control.
+
+The prior C: archive is now retrieved and verified through MCP:
+`candidate12-retry-x00uyw7o/candidate12-guest-evidence-v1.zip`, SHA256
+`FC0EC2890BDC6BEE350A67D4BD9BA56A8C3264775729A55ECD41E056B849BA2A`, all30
+inner payloads verified. It contains no loaded-module receipt for the elevated
+run; the saved task XML confirms HighestAvailable. The baseline-DLL inference
+therefore remains an inference, while its wrong bytes and DMA-BUF trace are
+observed facts.
+
+**Candidate12 bounded guest controls now pass:** the v4 Windows build completes
+at19:07:06 with source manifest `FD4409DF…`, ICD
+`4D07D730B4D2ACFFBE8BDA652E088FD5CEB3D74617CBF9E76D3BF2719494C402`
+and guarded probe `A6D34681A59AF2830C8AE4A9665CE37E5DC4B837614D1581F1BA1BCE2473CA15`.
+The init-only task runs non-elevated in session1, verifies the loaded path/hash
+and `opaque_fd=1`, and creates no VkDevice/submission. Mesa's Windows logger
+writes to captured stderr; `MESA_LOG_FILE` is POSIX-only, so the revised harness
+reads the actual stderr diagnostic. All five transfer arms then pass:
+direct type4→type3, host upload, write-combined readback, pooled batched copies,
+and pooled individual copies. Each checks four12MiB rounds including guard
+gaps, with zero timeouts, for240MiB total. Each verifies the same loaded ICD.
+Producer contexts31/33/35/37/39 each show four submissions, four successful
+own-fence waits and five OPAQUE exports (`export_types=0x1`, `fd_type=1`). No
+producer trace reaches its limit, no host VUID error appears, and no new Xid
+is recorded. This is guest transfer evidence, not yet Steel acceptance.
+
+Their archive is retrieved through verified MCP as
+`candidate12-retry-x00uyw7o/candidate12-v4-controls-evidence.zip`, SHA256
+`FFE6001D70ADBB9CF4EA3D99147ADB3829CE55BAE645CD9845DA8DDB5CBCC518`;
+all66 inner payloads verify.
+
+**Candidate12 Steel observations, September19, 19:17–19:35 IST:** the first
+stock-definition run uses a 180-second launcher-to-exit limit. About 98 seconds
+pass before the workload starts. It reaches the loading picture with the
+candidate ICD verified in PID6968, but the harness stops it at its bound.
+The resulting `.3dmark-result` has zero scores and no exported result XML;
+`boundedStop=true`, exit 1 is correctly incomplete, not acceptance. No new Xid
+appears; producer context41 reaches the 200,000-record cap. MCP archive
+`steel-candidate12-evidence-v1.zip`, SHA256
+`062EB0513750DA45E865EBBB2A35AE1C6FB648ABA81A481B677C851AD779E6DE`, has all 65
+inner payloads verified in `candidate12-retry-x00uyw7o/`.
+
+The second observation (`vulkan-candidate12b`) separates a 120-second launcher
+allowance from a 240-second workload allowance, with a 420-second total bound.
+It finishes normally at 19:26:05: elapsed 179.66 seconds, workload 82.46 seconds,
+CLI exit 0, no forced stop. Both result artifacts agree on **8124 / 81.25 FPS**;
+the inner result reports status 0/OK. PID8332/session1 loads ICD `4D07D730…`
+and UMD `FCFF7F28…`; the task is Interactive/Limited. Screenshots show different
+rendered scene views at frame 376/time 12.5 and frame 1645/time 54.9. The stock
+definition SHA256 is `D22394E04C0E526D8090167A5A4018903A6E8A19807365A413A747B8BB3767D8`.
+Async presentation/helper stay enabled. This is one completed benchmark with
+visible scene progression, not a performance comparison or closure of either
+defect. No new Xid or device-loss report appears.
+
+The run is **not validation-clean**: producer PID156387/context45 reaches the
+record cap at 19:24:58.372, so its later dispatch chronology is unavailable.
+At window shutdown the helper-copy wait returns `VK_ERROR_SURFACE_LOST_KHR`;
+WSI retains source resid575 instead of recycling an unproven read. The matching
+source image54, buffer55 and memory56/57 remain live at `vkDestroyDevice`, which
+reports `VUID-vkDestroyDevice-device-05137`. This links the four-object warning
+to the existing cancellation/retention path; it does not justify removing that
+guard or prove the original freeze's cause. Consumer completion and retained
+resource cleanup remain a lifecycle acceptance gap. Helper context47 ends
+below the cap at seq56946. The host also prints device-local budget-accounting
+warnings with `used=0`; source reserve skips accounting when the configured
+limit is zero, while release still subtracts. These warnings are distinct from
+the observed mapping mismatch and are not evidence of GPU memory corruption.
+
+MCP archive `steel-candidate12b-evidence-v1.zip`, SHA256
+`02C9A284F8811A6C91350C52E973459068FA57DE48F8528653EE364C8A59DC72`, has all 71
+inner payloads verified. `host-steel2-complete.log`, `kernel-after-steel2.log`
+and the extracted result/screenshots preserve the host/guest correlation in
+`candidate12-retry-x00uyw7o/`.
+
+The bounded repeat (`vulkan-candidate12c`) finishes at 19:34:36 with identical
+graphics settings: **8069 / 80.70 FPS**, elapsed 179.77 seconds, workload
+82.61 seconds, CLI exit 0, no forced stop. PID6404/session1 verifies the same
+ICD and UMD. Its result validator also requires positive score/FPS fields;
+the inner result has status 0 throughout. Screenshots show frame 371/time 12.4
+and frame 1639/time 54.7. No new Xid, device loss, host VUID or retained-source
+cancellation appears in this repeat. Producer context49 still reaches the
+record cap; helper context51 ends at seq56638. Thus teardown's warning is
+intermittent, not resolved by the passing repeat. MCP archive
+`steel-candidate12c-evidence-v1.zip`, SHA256
+`90DA128A81D9AE2E1C7E6FEA889400D7B79E1A49ACA5982BBD3B5AE3299722B9`, has all 72
+inner payloads verified. The build's 25 source hashes still match after testing.
+
+These two completed runs strengthen the mapping candidate's runtime evidence;
+they do not isolate every earlier freeze or establish cold-start/lifecycle
+acceptance. The next focused gap is helper-copy cancellation and deferred
+resource retirement at window/swapchain destruction, preserving exact consumer
+completion and retention guards. Candidate12 remains isolated to the test
+launcher. Native DX12 rollback has no new runtime evidence in this continuation.
+Both defects remain **OPEN**; candidate12 is not an accepted fix.
+
+The continuation evidence is sealed as `candidate12-retry-x00uyw7o.zip`,
+SHA256 `D7DA7DB254882BE9DC8012E2901CA541E93688E87F1242AF5E26984FBE46D827`;
+all 1,724 payloads and the archived manifest verify. It includes all five MCP
+guest archives, host log snapshots, shaders, source/build identities, screenshots,
+results and the dirty-state snapshots. At 19:40 IST the bounded Xid watcher
+finishes without a new fault; QMP reports running on the same owner-authorized
+boot. MCP reports Helios problem code 0 and no remaining benchmark/probe process.
+DWM PID1820 still loads installed ICD `22199CA9…` and UMD `FCFF7F28…`, while
+the tested `4D07D730…` ICD remains in its isolated C: candidate directory.
+
+**Teardown follow-up entry, September19, 19:52 IST:** before any new build or
+trial, MCP status succeeds but the host journal contains a new 19:49:58 Xid31:
+renderer PID163659/context67 (`vkr-ring-67`), GR_HOST0/HUBCLIENT_ESC0 PTE write
+fault at `0x0_0f4c0000`. The boot ID and running QEMU are unchanged. The agent
+issues QMP stop at 19:51:48 and verifies paused, preserving the current host
+log, shaders, kernel journal and dirty-state snapshots in
+`candidate13-teardown-zc5jbvvi/`. Context67's trace ends below the cap at
+seq108803; its initial ordinary mapped buffers use `external=0x200`, allocation
+`export_types=0x200`, `fd_type=0`. The guest workload and loaded ICD remain
+unverified; this must not be labelled a candidate12 recurrence from timing
+alone. The owner has been asked what ran and to report recovery from this new
+fault. CPU/source work continues; no new graphics workload or host reset occurs.
+
+**Candidate13, cancelled-copy retirement (source only):** the existing Win32
+wait loop checks surface/worker cancellation before checking its fixed helper
+target. This can abandon a read that subsequently completes, leaving the
+source image, staging buffer and two memories retained through device
+destruction, as observed in candidate12b. The new `wsi_copy_retirement.h`
+production loop separates presentation status from copy completion. On
+OUT_OF_DATE/SURFACE_LOST or async stop it keeps the same-thread helper target
+and COM device alive, waiting in the existing sleeping slices for up to five
+seconds. Successful copy completion clears `read_unproven`, permitting normal
+source destruction, while the presentation still fails and its image is not
+recycled. Window restoration cannot clear cancellation or restart the bound.
+Device failure before/after the wait or deadline expiry retains the source;
+neither is success. Ordinary presentation has no new deadline, flush or submit.
+The old unproven-read/lost-device lifetime gap remains open if this drain fails.
+This is a local teardown candidate, not proof of Steel's freeze cause.
+
+The real loop's CPU tests cover close/resize, simultaneous cancellation and
+completion, a restored window, zero/expired budgets, sub-microsecond remaining
+time, and device/wait failures. All six focused Mesa tests pass:
+`wsi-copy-retirement`, `wsi-buffer-allocation`, `wsi-image-ownership`,
+`venus-memory-export`, `venus-wsi-ownership`, `venus-device-features`.
+ASan/UBSan checks pass. MinGW cross-compilation of the CPU test and modified
+`tools/vk_vehicle_completion_probe.cpp` passes. These Linux checks do not
+compile `wsi_common_win32.cpp`; the full Windows ICD build is still pending.
+
+The probe adds `--teardown-close` and `--teardown-resize`. It warms the vehicle,
+proves a finite submitted frame is pending, cancels the window, then waits the
+application's own exact fence before destroying the swapchain. It refuses
+Session0/elevation and verifies its directly loaded ICD path. Its successful
+exit is only an input receipt: require same-PID vehicle LIVE, that delayed
+producer's pending/cancelled-copy retirement, verified ICD/UMD hashes, and
+matching host destruction without a VUID or Xid. There is no GPU-idle wait.
+
+Prepared under `candidate13-teardown-zc5jbvvi/` (not yet run or Windows-parser
+checked): `build-copy-retirement-candidate13-v1.ps1`,
+`run-copy-retirement-candidate13.ps1`, and
+`register-copy-retirement-candidate13.ps1`. The build verifies 28 source
+hashes before/after, uses the existing local C: Mesa build, and stages a separate
+candidate directory. The run harness selects the unchanged candidate12v4 ICD
+as baseline or the new candidate, verifies the loaded modules, and runs as
+the verified interactive user with Limited privilege. Its 90-second observation
+bound leaves a hung process intact for QMP pause/evidence preservation.
+After recovery from the new fault, first retrieve guest attribution through
+MCP, compile and run the initialization-only mapping check, then compare close
+and resize cases with host trace/Xid monitoring before another Steel run.
+No new GPU trial, Windows build, driver install, host reset or reboot has been
+performed in this follow-up. Both graphics defects remain **OPEN**.
+
+The follow-up evidence is sealed as `candidate13-teardown-zc5jbvvi.zip`, SHA256
+`75DD5AF99D2400031CAFC9645793E0D33280971A6812BB788DC5BEDEE1B4D399`;
+all 2,344 payloads and the archived manifest verify. It contains the host fault
+snapshot, context67 extraction, entry MCP receipt, 28 pinned source inputs,
+CPU checks, cross-compiled probes, prepared scripts and dirty-state snapshots.
+This is a host/source evidence archive; there is no candidate13 guest runtime
+result. At 20:15 IST QMP still reports paused on the same boot, and the journal
+has no Xid newer than 19:49:58. The prior dirty patches outside this follow-up's
+document/probe/WSI edits remain byte-identical in the compared root, Mesa,
+renderer, QEMU and DXVK trees. No commit, cleanup or memory update was made.
+
+**Candidate13 runtime follow-up, September19:** the owner identifies Steel as
+the workload at the 19:49 fault, reports the host GPU is up, and authorizes
+unpausing. At 20:36 the agent resumes QEMU with a new Xid watcher on boot
+`61a268ee-72a8-42bb-8bf1-9040a1e9e534`; `nvidia-smi` responds, driver615.71.09.
+QEMU and loaded renderer hashes remain `05872F39…` / `412633B4…`.
+Windows MCP status succeeds; KMD remains .289 / `F6604A27…`. This is
+owner-reported recovery on the existing boot, not a new host boot/reset.
+
+The retrieved Application Hang event321283 names `3DMarkSteelNomad.exe`, PID
+`0xb74` (2932); the ICD log ties that PID to producer context67 and helper69.
+Its UMD log selects the coherent loaded module
+`C:\ProgramData\HeliosVulkan\vulkan_virtio-22199ca9c8a4.dll`; the current file
+hash is `22199CA9C8A425026188F3541E78E85A6247DDF82974667E1C2FE6454E159FE1`.
+This establishes the baseline path used by the manually launched Steel process;
+there is no live module/hash snapshot from before its exit. The host trace's
+DMA-BUF ordinary allocations are consistent with that baseline. The event is
+an application hang closed by Windows, not a captured CPU exception/backtrace.
+MCP archive `steel-owner-1949-evidence-v1.zip`, SHA256
+`4885246BA0A46CC5A5480FB182E3D7CF1FAE37EFAE0FE00303B1D51138D7805A`, has all 17
+inner payloads verified. The idle 3DMark launcher was stopped after preservation.
+
+The first Windows build fails before compilation because the paused guest
+clock makes Meson inputs appear in the future. Synchronizing the guest clock
+to the host through MCP resolves that environment error; the failed v1 output
+is preserved. The v2 build compiles the actual Win32 WSI code, both probes and
+the CPU test on local C:, verifies all 28 source hashes, and passes the CPU test.
+ICD SHA256 is `9AE82DE762A52ABD8E2B8297EAE0C9CC787BC7EFF5C8A23AFC68723FBDB5452E`,
+staged in `C:\ProgramData\Helios\display-order-20260918\copy-retirement-candidate13-v2`.
+No globally registered driver is replaced. All task payloads parse on Windows;
+desktop tasks use the verified Rupansh interactive user with Limited privilege.
+Both initialization-only controls verify their actual ICD identity and opaque
+mapping policy with zero device creation/submission.
+
+The finite-work lifecycle comparison uses the same newly built probe in both
+arms, candidate12v4 (`4D07D730…`) as baseline and candidate13v2 (`9AE82DE7…`):
+
+| Arm/cancellation | PID / exact producer / source resid | Observed outcome |
+|---|---|---|
+| baseline close | 9432 / 515 / 969 | retained read; image7, buffer8, memories9/10 absent from destruction trace; four-object VUID05137 |
+| candidate close | 2124 / 513 / 1003 | copy completes after 357915us; SURFACE_LOST retained; image7, buffer8, memories9/10 destroyed |
+| baseline resize | 4868 / 527 / 1038 | retained read; image7, buffer8, memories9/10 absent from destruction trace; four-object VUID05137 |
+| candidate resize | 5360 / 557 / 1080 | copy completes after 329779us; OUT_OF_DATE retained; image12, buffer13, memories14/15 destroyed |
+
+All four controls prove same-PID vehicle LIVE and the delayed producer still
+pending before cancellation, with loaded ICD/UMD path/hash receipts. Both
+candidate cases have `completed=1 drain_expired=0 source_retained=0`, no host
+VUID and no new Xid. No producer/helper trace reaches its limit. This supports
+healthy close/resize retirement only; the lost-device/expired-drain path remains
+unaccepted. Existing renderer memory-accounting diagnostics occur in both arms:
+with its budget disabled, reserve returns without charging but release still
+checks usage. No renderer/accounting change is included in candidate13.
+
+All five candidate13 transfer controls then pass four 12MiB readbacks each,
+including gap checks: **240MiB total**, zero timeouts/validation errors, verified
+opaque mapping policy and actual ICD identity. Contexts91/93/95/97/99 remain
+below the trace cap, with no new Xid or host VUID. The Windows build, two init
+controls, four lifecycle controls, five transfers and task receipts are archived
+through MCP as `copy-retirement-c13-controls-evidence-v1.zip`, SHA256
+`132F9A5C78503DB33A2967C78ED174F6BD61986515CB861C08F107AAC534C4DB`; all 142 inner
+payloads verify. Local evidence, including source-object destruction correlation,
+is under `candidate13-runtime-syp4pnt1/`.
+
+Two bounded Steel Vulkan runs then complete with that same isolated candidate,
+stock definition and async/helper WSI. `vulkan-candidate13a` finishes at 20:55:22:
+**8126 / 81.27 FPS**, 179.95 seconds total, 80.79 seconds workload. PID6572's
+36 module snapshots verify the candidate ICD; 35 also capture UMD `FCFF7F28…`
+before it unloads during shutdown. Captures show frame310/time10.4 advancing to
+frame1577/time52.6. Surface loss cancels producer5035/resid1223, but its helper
+copy retires (`completed=1 drain_expired=0 source_retained=0`). No host VUID or
+new Xid occurs. Producer context101 reaches seq200000/TRACE_LIMIT_REACHED;
+helper103 ends below the cap at seq55648. The complete producer destruction
+history is therefore unavailable for this benchmark, unlike the focused controls.
+MCP archive `steel-candidate13a-evidence-v1.zip`, SHA256
+`26D3E79E89A3C29ABAFECD5601973986A16671427A54C0BAEF30EE7F54277D85`, verifies all 72
+inner payloads.
+
+The repeat `vulkan-candidate13b` finishes at 21:01:02: **8083 / 80.83 FPS**,
+179.36 seconds total, 82.20 seconds workload. PID9440 has 36 matching ICD module
+snapshots and 34 matching UMD snapshots; the other two bracket initialization
+and teardown. Captures advance from frame374/time12.5 to frame1638/time54.6.
+Producer5009/resid1341 also retires after surface loss without retaining the
+source. No host VUID or new Xid occurs. Producer105 reaches the trace cap;
+helper107 ends at seq55870. MCP archive `steel-candidate13b-evidence-v1.zip`,
+SHA256 `7A0A5BCAB69ED9E839E3C4F1CA157F799BFE2774B7C68E0656C897C817F802CD`, verifies
+all 72 inner payloads. Both runs exit 0 without a bounded/forced stop, and all
+five inner result status codes are 0; score/FPS and artifact hashes are verified.
+Diagnostic attribution is limited by invocation/end timestamps as well as PID:
+the global ICD log contains an older PID6572 context from another date.
+
+At 21:02:52 the guest health task reports Helios problem code 0, DWM1820/session1
+still loading the installed baseline `22199CA9…` plus UMD `FCFF7F28…`, and no
+remaining benchmark/probe process. The 30-minute host watcher completes without
+a new Xid. Candidate13 remains isolated; normal manual 3DMark launches still use
+the baseline ICD. These results support the healthy cancellation-retirement
+repair and the mapping candidate's bounded runs. They do not prove all earlier
+Steel freezes share that cause, resolve expired-drain/device-loss lifetime, or
+establish native DX12 frame order. Both graphics defects remain **OPEN**.
+At 21:08:57 QMP still reports running on the same boot; the kernel journal has
+exactly the two pre-existing Xids and no new one. The tested 28 source hashes
+still match. Only the three living documents changed in the tracked tree during
+this runtime continuation; other root and nested dirty patches are preserved.
+The complete runtime evidence is sealed as
+`tmp/display-order-20260918/candidate13-runtime-syp4pnt1.zip` (271327013 bytes),
+SHA256 `04347F6A1E2483ED508DCD60B93FF4C71B4A9D554F65ADB05095B3BDCA7E3646`.
+Its inner manifest and all 3682 payloads were verified after archiving; the
+sibling `.archive.json` records the receipt. This archive preserves the host
+trace, MCP archives, source/dirty-state snapshots, trial scripts and analyses.
+
+**Owner's manual Steel Vulkan run, September19 23:56; retrieved September20:**
+the owner reports a loading-screen freeze. The launcher log starts
+`SteelNomadGt1VK` at 23:56:23.829 and records `No result produced` at
+23:57:04.786. Its saved failed result has workload status10000 and zero scores;
+the four score-level status0 entries do not make the failed workload successful.
+The first MCP process snapshot at 00:02 finds no Steel workload, only the
+3DMark launcher and its children. No live Steel module/hash snapshot or loading
+screen capture was obtained before exit.
+
+Current-run ICD entries tie PID5732 to producer127/helper129. The matching UMD
+initialization block selects
+`C:\ProgramData\HeliosVulkan\vulkan_virtio-22199ca9c8a4.dll`; the registered file
+still hashes to `22199CA9C8A425026188F3541E78E85A6247DDF82974667E1C2FE6454E159FE1`.
+This is the baseline path, not candidate13. PID5732's append-only logs also
+contain older launches, so attribution uses the current epoch window and
+context129 initialization block, not the PID or first module-path match alone.
+Host producer allocations use DMA-BUF (`external=0x200`, `export_types=0x200`,
+`fd_type=0`). Its three WSI image binds report VUID-02728: the images request
+OPAQUE_FD while their memory exports DMA-BUF. This reproduces the previously
+documented baseline handle-contract violation, not a new candidate13 failure.
+
+On unchanged boot `61a268ee-72a8-42bb-8bf1-9040a1e9e534`, renderer PID219439 /
+context127 receives Xid31 at 23:56:41.313616 (CE4 unsupported-kind write), then
+Xid44 at 23:56:47.938583 (GRAPHICS PDE write). A DMAR DMA-read fault for GPU
+02:00.0 is recorded between them. The producer trace reaches seq200000 at
+23:56:41.015452, before the first Xid; its last decoded command is not evidence
+of the faulting GPU operation. Helper129 ends at seq4237. Neither the temporal
+association nor the separately reproduced CPU mapping defect proves the cause
+of these GPU faults.
+
+MCP archive `steel-owner-2356-evidence-v1.zip` is 3659401 bytes, SHA256
+`98652E6CC51DA58574EF52B3F7EE8A38919B14FCF221FFEF3DDC72162FF3DA96`; all 15 inner
+payloads verify and no copy failed. Local evidence is under
+`tmp/display-order-20260918/steel-live-freeze-_nljn6q5/`, including the 468236685-byte
+host-log snapshot, failed result, per-context extracts and 494 shader captures.
+QEMU remains PID150642 with hash `05872F39…`, its loaded renderer library
+`412633B4…`, and its render-server executable `2BBF92D5…`; these are distinct
+artifacts. After retrieval QEMU is paused at 00:05:04, pending recovery from the
+new faults. No graphics workload, host reset, guest reboot or driver deployment
+was performed in this collection. DWM and the launcher GPU process still load
+the installed baseline. Both defects remain **OPEN**.
+The complete collection is sealed as `steel-live-freeze-_nljn6q5.zip`
+(54147583 bytes), SHA256
+`9D752E73AD956DD2395B7F325D122799B21B866ABC5912027BF113F1580F3C3B`.
+Its manifest and all 571 payloads verify. The final host receipt still reports
+QEMU paused and four Xids this boot (the two earlier faults plus this pair).
+Only ROADMAP changed in the tracked tree during this collection; all other
+root and nested dirty patches remain byte-identical to entry.
+
+**Candidate13 default installation, September20 00:20–00:30 IST:** the owner
+confirms recovery from the 23:56 Xid pair and requests installation. QEMU is
+resumed at 00:20:31 on unchanged host boot
+`61a268ee-72a8-42bb-8bf1-9040a1e9e534`. The canonical
+`tools/install-helios-icd.ps1` runs through Windows MCP as SYSTEM, with the
+explicit previously tested DLL and `-NoRegistryCleanup -NoSmoke`; old DLLs are
+not pruned. SHA256
+`9AE82DE762A52ABD8E2B8297EAE0C9CC787BC7EFF5C8A23AFC68723FBDB5452E` is verified
+before and after installation. The registered manifest atomically selects
+`C:\ProgramData\HeliosVulkan\vulkan_virtio-9ae82de762a5.dll`, with API version
+1.4.352 from the tested candidate manifest (prior manifest: 1.3.0). The single
+enabled registry value is preserved; the baseline DLL `22199CA9…` is unchanged.
+
+Windows is restarted through MCP and boots at 00:24:19.500. DWM's new instance
+starts at 00:24:24.846 (PID1820 is reused) and loads candidate13 plus the unchanged
+UMD `FCFF7F28…`. KMD remains 22.22.289.0 / `F6604A27…`, with PnP problem code0.
+The non-elevated session1 smoke clears process-local ICD overrides and proves
+normal registry selection with the full loaded path/hash. Initialization
+creates no device/submissions; the direct-readback transfer checks four 12MiB
+blocks plus gaps, completing 48MiB with zero timeouts/readback errors. Its first
+wrapper aborted on normal native diagnostic stderr under PowerShell's Stop
+error policy; v1 evidence is preserved. The corrected v2 wrapper separately
+captures native stdout/stderr and checks actual exit codes. A retrieved desktop
+capture is inspected. No Steel workload is launched during deployment.
+
+Rollback is preserved on C: at
+`C:\ProgramData\Helios\display-order-20260918\candidate13-default-install-v1\rollback-baseline.ps1`;
+it verifies the old DLL and uses the same installer with the saved manifest API
+version. Restart Windows after rollback before checking loaded modules.
+The installation, registry/manifest backups, health, both smoke attempts,
+desktop capture and task receipts are archived through MCP as
+`candidate13-default-install-v1-evidence-v1.zip` (456571 bytes), SHA256
+`623982C9FF3EBF6FA476B6F9DFEB791C129CDAEFDFDB97A3888FA31E65D2D141`; all 35 inner
+payloads verify. Local evidence is in `candidate13-install-q34a3smz/` under
+`tmp/display-order-20260918/`. At 00:30:38 QEMU is running and the host still has
+only its four pre-existing Xids. The task-owned fault watcher is intentionally
+stopped after deployment checks. No host GPU reset/reboot occurs. Candidate13
+is now globally installed for testing, while both graphics defects and its
+lost-device/expired-drain lifetime gap remain **OPEN**.
+The complete local installation collection is sealed as
+`candidate13-install-q34a3smz.zip` (1776200 bytes), SHA256
+`5BD4A8457F2F5B0A8C5893F4332103D6AE9A23392EF98D4B4FA5CF3B187EBFA1`;
+the manifest and all 86 payloads verify. Apart from the three living-document
+updates, root and nested dirty patches remain byte-identical to entry.
+
+Earlier candidate1 on September18 also failed: at 20:46:15, Xid 31 PTE read
+faults were reported in DWM's renderer context 5
+(`vkr-ring-5`), followed by a failed queue marker (`VK_ERROR_DEVICE_LOST`). The
+watcher immediately paused QEMU, verified via QMP. No additional benchmark was
+attempted, and no host GPU reset was requested. The candidate does **not** close
+the freeze. Host evidence is preserved in `qemu-vulkan-candidate1.log` and
+`kernel-after-host-reboot.log`; guest evidence remains in
+`C:\ProgramData\Helios\display-order-20260918\vulkan-candidate1` and the cube
+directories. The owner cold-relaunched the original VM, restoring Code 0 and
+loaded baseline UMD / `89727553…` ICD. Guest logs were retrieved through MCP
+into `retrieved-20260918-1535.zip` (SHA256 `4330169E…`). The latest workload PID
+8752/context 53 created its producer semaphore but did not reach vehicle READY
+or source import before the DWM fault; the v3 correction is therefore not yet
+an explanation of this fault. The bridged launcher needs sudo on this host;
+`sudo -n` reports that a password is required. Do not bypass Windows MCP or
+substitute a different network environment to get around that access limit.
+
 ## Self-contained installer and WinBoat provisioning, 2026-09-17
 
 The C++ GUI installer was replaced by a Rust one: `HeliosSetup.exe` (crate

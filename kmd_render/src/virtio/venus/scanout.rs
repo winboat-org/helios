@@ -7,91 +7,88 @@
 use super::ring::*;
 use super::*;
 
+/// Initial setup objects are retained across ambiguous submit/wait failures.
+/// They are separate from Present buffers: image memory must never satisfy the
+/// same-device buffer-borrow registry by accident.
+pub(super) struct OwnedLinearImage {
+    pub(super) image_id: VkImageId,
+    pub(super) memory_id: VkDeviceMemoryId,
+    pub(super) access: helios_kmd_logic::external_memory::InitialImageAccess,
+    pub(super) resource_id: Option<u32>,
+    pub(super) initial_pool_id: Option<VkCommandPoolId>,
+    pub(super) initial_fence_id: Option<VkFenceId>,
+}
+
 impl VenusClient {
-    /// Put the persistent KMD LINEAR image into GENERAL layout and external
-    /// ownership exactly once. The setup submission is nonblocking and its
-    /// command objects remain alive for the Venus-client lifetime; all later
-    /// copies use the same ordered queue and therefore execute after setup.
-    pub(super) fn ensure_linear_copy_target_ready(
-        &mut self,
-        adapter: &AdapterContext,
-        target_image_id: VkImageId,
-    ) -> Result<(), VirtioError> {
-        if self.copy_target_image_id == Some(target_image_id) {
+    fn require_initialized_linear_image(&self, image_id: VkImageId) -> Result<(), VirtioError> {
+        if self.owned_linear_images.iter().any(|image| {
+            image.image_id == image_id && image.access.may_publish() && image.resource_id.is_some()
+        }) {
             return Ok(());
         }
-        // The old "target_image_id == 0" refusal (diag 0x0136 + FaultCounter
-        // CpTgtE) is GONE, not dropped: VkImageId is NonZeroU64, so a caller
-        // cannot reach here with a null target. The counter stays defined for
-        // any pre-existing service-key value; nothing increments it now.
-        if self.copy_target_image_id.is_some() {
-            // RETARGET, not a refusal. The old code failed here permanently, and
-            // the failure was reachable on any resolution change: on the fallback
-            // copy path production_linear_scanout mints a NEW LINEAR target
-            // whenever the cached extent stops matching, and
-            // submit_primary_scanout_copy explicitly handles a changed target by
-            // destroying the old PreparedImageCopy and preparing a new one. Both
-            // prepare entry points then hit this branch, so every subsequent
-            // SetVidPnSourceAddress returned STATUS_DEVICE_NOT_READY for the life
-            // of the VenusClient. Resize is item 1 of the stability charter.
-            //
-            // Drain first: the same fence sequence destroy_prepared_image_copy
-            // uses, so the host is provably done with the old pool before it is
-            // destroyed. This is a bounded wait on a real fence (5 s inside
-            // wait_fence), not a sleep - keep it.
-            let fence_id = self.create_fence(adapter)?;
-            self.queue_submit_fence_marker(adapter, fence_id)?;
-            self.wait_for_fence(adapter, fence_id)?;
-            self.destroy_fence(adapter, fence_id)?;
-            if let Some(pool_id) = self.copy_target_init_pool_id {
-                self.destroy_command_pool(adapter, pool_id)?;
-            }
-            // NOT the old target image: it is owned by dedicated_scanout_image /
-            // the adapter's cache, never by this client.
-            self.copy_target_image_id = None;
-            self.copy_target_init_pool_id = None;
-            // WRITE-ONLY, see T6/k-venus-17: destroying the pool already freed
-            // its command buffer, so this field has no reader. Cleared here for
-            // consistency rather than given an invented read.
-            crate::diag::record_named_bytes(b"CpTgtSw", target_image_id.get() as u32);
-            // Fall through to the normal first-time setup below.
-        }
+        crate::diag::record_named_bytes(b"SdgLIni", 0xE1);
+        Err(VirtioError::DeviceError)
+    }
 
-        let pool_id = self.create_command_pool(adapter)?;
-        let command_buffer_id = match self.allocate_command_buffer(adapter, pool_id) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.destroy_command_pool(adapter, pool_id);
-                return Err(e);
+    /// Allocation already completed UNDEFINED -> GENERAL -> EXTERNAL before
+    /// exposing the memory to CPU writers or other Vulkan devices. Never redo a
+    /// discard here: a KMD-created primary may already contain their pixels.
+    fn ensure_linear_copy_target_ready(
+        &mut self,
+        target_image_id: VkImageId,
+    ) -> Result<(), VirtioError> {
+        self.require_initialized_linear_image(target_image_id)?;
+        if self.copy_target_image_id != Some(target_image_id) {
+            if self.copy_target_image_id.is_some() {
+                crate::diag::record_named_bytes(b"CpTgtSw", target_image_id.get() as u32);
             }
-        };
-        let record_result = (|| {
-            self.begin_command_buffer(adapter, command_buffer_id)?;
-            self.cmd_initial_image_transition(
-                adapter,
-                command_buffer_id,
-                target_image_id,
-                IMAGE_LAYOUT_PREINITIALIZED,
-            )?;
-            self.cmd_release_image_to_external(
-                adapter,
-                command_buffer_id,
-                target_image_id,
-                TransferAccess::Write,
-            )?;
-            self.end_command_buffer(adapter, command_buffer_id)
-        })();
-        if let Err(e) = record_result {
-            let _ = self.destroy_command_pool(adapter, pool_id);
-            return Err(e);
+            // The old initialization pool is gone after its own fence, so
+            // retargeting has no setup work to drain. The caller still retires
+            // actual copies through destroy_prepared_image_copy.
+            self.copy_target_image_id = Some(target_image_id);
         }
+        Ok(())
+    }
 
-        // Publish lifetime before queue submit: if transport failure makes the
-        // submission result ambiguous, retaining the pool is always safe while
-        // destroying a possibly-pending command buffer is not.
-        self.copy_target_image_id = Some(target_image_id);
-        self.copy_target_init_pool_id = Some(pool_id);
-        self.queue_submit_command_buffer(adapter, command_buffer_id, None)
+    /// Initialize at allocation time, before creating/exporting a HOST3D blob.
+    /// A real fence for this single submission makes CPU writes after return
+    /// safe from a late UNDEFINED discard. This is not a per-frame wait.
+    fn initialize_linear_image(
+        &mut self,
+        adapter: &AdapterContext,
+        image_id: VkImageId,
+        memory_id: VkDeviceMemoryId,
+    ) -> Result<usize, VirtioError> {
+        let index = self.owned_linear_images.len();
+        // Capacity was reserved fallibly before any allocation. Record the
+        // backing before setup: every failure below retains it until context
+        // teardown, and none may expose it or reclaim possibly-pending work.
+        self.owned_linear_images.push(OwnedLinearImage {
+            image_id,
+            memory_id,
+            access: helios_kmd_logic::external_memory::InitialImageAccess::Pending,
+            resource_id: None,
+            initial_pool_id: None,
+            initial_fence_id: None,
+        });
+        let pool = self.create_command_pool(adapter)?;
+        self.owned_linear_images[index].initial_pool_id = Some(pool);
+        let command = self.allocate_command_buffer(adapter, pool)?;
+        self.begin_command_buffer(adapter, command)?;
+        self.cmd_initial_image_transition(adapter, command, image_id, IMAGE_LAYOUT_UNDEFINED)?;
+        self.cmd_release_image_to_external(adapter, command, image_id, TransferAccess::Write)?;
+        self.end_command_buffer(adapter, command)?;
+        let fence = self.create_fence(adapter)?;
+        self.owned_linear_images[index].initial_fence_id = Some(fence);
+        self.queue_submit_command_buffer(adapter, command, Some(fence))?;
+        self.wait_for_fence(adapter, fence)?;
+        self.owned_linear_images[index].access.fence_completed();
+        self.destroy_fence(adapter, fence)?;
+        self.owned_linear_images[index].initial_fence_id = None;
+        self.destroy_command_pool(adapter, pool)?;
+        self.owned_linear_images[index].initial_pool_id = None;
+        crate::diag::record_named_bytes(b"SdgLIni", image_id.get() as u32);
+        Ok(index)
     }
 
     /// Import an authoritative WDDM primary and record its reusable GPU copy to
@@ -217,7 +214,7 @@ impl VenusClient {
         }
 
         crate::diag::record_named_bytes(b"CpImpSt", 6);
-        if let Err(e) = self.ensure_linear_copy_target_ready(adapter, target_image_id) {
+        if let Err(e) = self.ensure_linear_copy_target_ready(target_image_id) {
             let _ = self.cleanup_imported_source_alias(
                 adapter,
                 source_resource_id,
@@ -360,7 +357,8 @@ impl VenusClient {
         let source_pixel_format =
             PresentPixelFormat::from_dxgi(source_dxgi_format).ok_or(VirtioError::DeviceError)?;
         let target_pixel_format = PresentPixelFormat::Bgra8Unorm;
-        self.ensure_linear_copy_target_ready(adapter, target_image_id)?;
+        self.require_initialized_linear_image(source_image_id)?;
+        self.ensure_linear_copy_target_ready(target_image_id)?;
         let mut conversion_image_id = None;
         let mut conversion_memory_id = None;
         let mut conversion_init_pool_id = None;
@@ -642,6 +640,12 @@ impl VenusClient {
         width: u32,
         height: u32,
     ) -> Result<ScanoutImageBlob, VirtioError> {
+        if self.owned_linear_images.len() >= crate::virtio::gpu::MAX_BLOBS {
+            return Err(VirtioError::OutOfMemory);
+        }
+        self.owned_linear_images
+            .try_reserve(1)
+            .map_err(|_| VirtioError::OutOfMemory)?;
         // Stage breadcrumb: `SdgLStg` holds the stage last ENTERED. On an early
         // `?` return it names the exact Venus call that rejected the CachyOS
         // shared-primary shape (mode 16 / real primary), turning the opaque
@@ -650,7 +654,7 @@ impl VenusClient {
         // `SdgLImg`/`SdgLMem` (raw VkResults), `SdgLPch`/`SdgLOff` (layout).
         //   1=create image  2=mem-req  3=choose host-visible type
         //   4=alloc export mem  5=bind  6=subresource layout
-        //   7=validate pitch/offset  8=create blob  0x10=done
+        //   7=validate pitch/offset  9=initialize/release  8=create blob  0x10=done
         crate::diag::record_named_bytes(b"SdgLStg", 1);
         let image_id = self.create_linear_scanout_image(adapter, width, height)?;
 
@@ -691,6 +695,11 @@ impl VenusClient {
             return Err(VirtioError::DeviceError);
         }
 
+        crate::diag::record_named_bytes(b"SdgLStg", 9);
+        let owned_index = self.initialize_linear_image(adapter, image_id, memory_id)?;
+        if !self.owned_linear_images[owned_index].access.may_publish() {
+            return Err(VirtioError::DeviceError);
+        }
         let blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
         crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
         crate::diag::record_named_bytes(b"SdgLStg", 8);
@@ -703,6 +712,7 @@ impl VenusClient {
             memory_id.get(),
             alloc_size,
         )?;
+        self.owned_linear_images[owned_index].resource_id = Some(res_id);
         let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, alloc_size));
         crate::diag::record_named_bytes(b"SdgLStg", 0x10);
         Ok(ScanoutImageBlob {

@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define CHECK_VK(expr)                                                         \
   do {                                                                         \
@@ -82,9 +83,22 @@ static void resize_client(HWND hwnd, uint32_t width, uint32_t height) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <vulkan ICD DLL>\n", argv[0]);
+  const bool internal_wsi = argc >= 3 && !strcmp(argv[2], "--internal-wsi");
+  const char *feature_chain = argc == 4 ? argv[3] : "legacy";
+  if (argc != 2 && !(internal_wsi && (argc == 3 || argc == 4))) {
+    fprintf(stderr, "usage: %s <vulkan ICD DLL> [--internal-wsi [legacy|promoted|extension]]\n", argv[0]);
     return 2;
+  }
+  if (internal_wsi && strcmp(feature_chain, "legacy") &&
+      strcmp(feature_chain, "promoted") && strcmp(feature_chain, "extension"))
+    return 2;
+  if (internal_wsi) {
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || !session)
+      return 87;
+    printf("INTERNAL WSI pid=%lu session=%lu feature_chain=%s ICD=%s\n",
+           GetCurrentProcessId(), session, feature_chain, argv[1]);
+    fflush(stdout);
   }
 
   HMODULE icd = LoadLibraryA(argv[1]);
@@ -148,7 +162,7 @@ int main(int argc, char **argv) {
   VkApplicationInfo app_info = {};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
   app_info.pApplicationName = "vk_zero_extent_probe";
-  app_info.apiVersion = VK_API_VERSION_1_1;
+  app_info.apiVersion = internal_wsi ? VK_API_VERSION_1_3 : VK_API_VERSION_1_1;
   VkInstanceCreateInfo instance_info = {};
   instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_info.pApplicationInfo = &app_info;
@@ -255,6 +269,17 @@ int main(int argc, char **argv) {
   device_info.pQueueCreateInfos = &queue_info;
   device_info.enabledExtensionCount = 1;
   device_info.ppEnabledExtensionNames = device_extensions;
+  VkPhysicalDeviceVulkan12Features v12 = {};
+  v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  VkPhysicalDeviceVulkan13Features v13 = {};
+  v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+  v13.pNext = &v12;
+  VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features = {};
+  timeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+  if (internal_wsi && !strcmp(feature_chain, "promoted"))
+    device_info.pNext = &v13;
+  if (internal_wsi && !strcmp(feature_chain, "extension"))
+    device_info.pNext = &timeline_features;
   VkDevice device = VK_NULL_HANDLE;
   CHECK_VK(vkCreateDevice(physical_device, &device_info, NULL, &device));
   PFN_vkGetDeviceProcAddr get_device_proc = vkGetDeviceProcAddr;
@@ -278,6 +303,72 @@ int main(int argc, char **argv) {
 
   VkQueue queue = VK_NULL_HANDLE;
   vkGetDeviceQueue(device, queue_family, 0, &queue);
+
+  if (internal_wsi) {
+    /* Exercise driver-internal WSI entrypoints via the exact ICD, not the
+     * loader's app contract: the app did NOT enable timeline/sync2. No frame
+     * image is submitted, imported by a helper, or presented in this mode.
+     * Disable the vehicle in the runner to isolate buffer allocation/dispatch.
+     */
+    LOAD_DEVICE_PROC(vkQueueSubmit2);
+    LOAD_DEVICE_PROC(vkCreateFence);
+    LOAD_DEVICE_PROC(vkDestroyFence);
+    LOAD_DEVICE_PROC(vkResetFences);
+    LOAD_DEVICE_PROC(vkWaitForFences);
+    resize_client(hwnd, 941, 1030);
+    CHECK_VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &capabilities));
+    VkSwapchainCreateInfoKHR ci = {};
+    ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    ci.surface = surface;
+    ci.minImageCount = capabilities.minImageCount;
+    ci.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    ci.imageExtent = capabilities.currentExtent;
+    expect_extent("WSI padding extent", ci.imageExtent, 941, 1030);
+    ci.imageArrayLayers = 1;
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ci.preTransform = capabilities.currentTransform;
+    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    ci.clipped = VK_TRUE;
+    VkSwapchainKHR chain = VK_NULL_HANDLE;
+    CHECK_VK(vkCreateSwapchainKHR(device, &ci, NULL, &chain));
+    printf("padded swapchain created 941x1030\n");
+    VkSemaphoreTypeCreateInfo type = {};
+    type.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo sem_ci = {};
+    sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    sem_ci.pNext = &type;
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    CHECK_VK(vkCreateSemaphore(device, &sem_ci, NULL, &timeline));
+    VkFenceCreateInfo fence_ci = {};
+    fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    CHECK_VK(vkCreateFence(device, &fence_ci, NULL, &fence));
+    CHECK_VK(vkQueueSubmit2(queue, 0, NULL, fence));
+    CHECK_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull));
+    CHECK_VK(vkResetFences(device, 1, &fence));
+    VkSubmitInfo2 empty = {};
+    empty.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    CHECK_VK(vkQueueSubmit2(queue, 1, &empty, fence));
+    CHECK_VK(vkWaitForFences(device, 1, &fence, VK_TRUE, 5000000000ull));
+    vkDestroyFence(device, fence, NULL);
+    vkDestroySemaphore(device, timeline, NULL);
+    vkDestroySwapchainKHR(device, chain, NULL);
+    vkDestroyDevice(device, NULL);
+    vkDestroySurfaceKHR(instance, surface, NULL);
+    vkDestroyInstance(instance, NULL);
+    free(formats);
+    DestroyWindow(hwnd);
+    if (v12.timelineSemaphore || v13.synchronization2 || timeline_features.timelineSemaphore) {
+      fprintf(stderr, "FAIL app feature chain mutated\n");
+      return 1;
+    }
+    puts("PASS internal WSI allocation/timeline/legacy submits (zero and one batch); app features unchanged");
+    return 0;
+  }
 
   VkSwapchainCreateInfoKHR swapchain_info = {};
   swapchain_info.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;

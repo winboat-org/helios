@@ -1,6 +1,6 @@
 // Native Windows D3D12 flip-discard presentation and full RGBA readback probe.
 // Build: tools/build-d3d12-present-probe.ps1 (x86, x64, or both).
-// Usage: d3d12-present.exe [seconds [width height [flags]]]
+// Usage: d3d12-present.exe [--queued] [seconds [width height [flags]]]
 // Defaults: 15 seconds, primary-screen dimensions, flags=1.
 // flags: bit 0 = borderless/topmost; bit 1 = swapchain UAV usage.
 // Run in the interactive desktop session, capturing stdout and the exit code.
@@ -9,6 +9,10 @@
 // The bottom 8 pixels encode the frame's low 16 bits in black/white cells
 // (least significant bit at the left), detecting stale readbacks and frames.
 // --self-test checks the pattern geometry and pixel grader without using a GPU.
+// --queued keeps a separate allocator/list/readback per backbuffer and only
+// waits when that slot is reused or during the final drain. Its per-frame QPC
+// records correlate the visible serial with Present and the exact app fence;
+// those fences do not prove DWM/scanout completion or visible frame ordering.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -156,6 +160,7 @@ struct Probe {
     static constexpr UINT buffer_count = 3;
     static constexpr DWORD wait_ms = 10000;
     int width, height, flags;
+    bool queued;
     HMODULE d3d12{}, dxgi{};
     HINSTANCE instance{};
     ATOM window_class{};
@@ -180,8 +185,24 @@ struct Probe {
     uint64_t frames{}, checked_pixels{};
     UINT buffers_seen{};
     bool in_flight{};
+    struct FrameSlot {
+        ID3D12Resource* readback{};
+        ID3D12CommandAllocator* allocator{};
+        ID3D12GraphicsCommandList* list{};
+        UINT64 completion{};
+        uint64_t serial{};
+    };
+    FrameSlot slots[buffer_count]{};
+    uint64_t checked_frames{};
+    UINT outstanding{}, max_outstanding{};
 
-    explicit Probe(int w, int h, int f) : width(w), height(h), flags(f) {}
+    explicit Probe(int w, int h, int f, bool q) : width(w), height(h), flags(f), queued(q) {}
+
+    static LONGLONG qpc() {
+        LARGE_INTEGER now{};
+        require(QueryPerformanceCounter(&now) != FALSE,"QueryPerformanceCounter");
+        return now.QuadPart;
+    }
 
     static HMODULE load_runtime(const wchar_t* name) {
         HMODULE module = LoadLibraryExW(name,nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -202,6 +223,13 @@ struct Probe {
         require(session != 0, "interactive session required (session 0 is not presentation evidence)");
         std::printf("START pid=%lu bits=%zu session=%lu size=%dx%d flags=%d\n",
             GetCurrentProcessId(),sizeof(void*)*8,session,width,height,flags);
+        LARGE_INTEGER frequency{};
+        require(QueryPerformanceFrequency(&frequency) != FALSE,"QueryPerformanceFrequency");
+        FILETIME utc{};
+        GetSystemTimePreciseAsFileTime(&utc);
+        const ULONGLONG filetime=(static_cast<ULONGLONG>(utc.dwHighDateTime)<<32)|utc.dwLowDateTime;
+        std::printf("CLOCK qpc=%lld frequency=%lld utc_filetime=%llu queued=%d\n",
+            qpc(),frequency.QuadPart,filetime,queued);
         d3d12 = load_runtime(L"d3d12.dll");
         dxgi = load_runtime(L"dxgi.dll");
         const auto create_device = reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(GetProcAddress(d3d12,"D3D12CreateDevice"));
@@ -288,27 +316,28 @@ struct Probe {
         D3D12_HEAP_PROPERTIES hp{}; hp.Type=D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC rd{}; rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width=total; rd.Height=1;
         rd.DepthOrArraySize=1; rd.MipLevels=1; rd.SampleDesc.Count=1; rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        CHECK(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,
-            nullptr,IID_PPV_ARGS(&readback)));
-        CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)));
-        CHECK(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator,nullptr,IID_PPV_ARGS(&list)));
-        CHECK(list->Close());
+        const UINT slot_count=queued ? buffer_count : 1;
+        for (UINT i=0; i<slot_count; ++i) {
+            auto& slot=slots[i];
+            CHECK(device->CreateCommittedResource(&hp,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,IID_PPV_ARGS(&slot.readback)));
+            CHECK(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&slot.allocator)));
+            CHECK(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,slot.allocator,nullptr,IID_PPV_ARGS(&slot.list)));
+            CHECK(slot.list->Close());
+        }
         CHECK(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence)));
         event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
         require(event != nullptr,"CreateEventW fence");
         CHECK(device->GetDeviceRemovedReason());
     }
 
-    void wait_gpu() {
-        // The final drain also queues a fence operation whose lifetime matters.
-        in_flight=true;
-        CHECK(queue->Signal(fence,++fence_value));
-        CHECK(fence->SetEventOnCompletion(fence_value,event));
+    void wait_value(UINT64 value) {
+        CHECK(fence->SetEventOnCompletion(value,event));
         const ULONGLONG deadline=GetTickCount64()+wait_ms;
         while (true) {
             const UINT64 completed=fence->GetCompletedValue();
             require(completed != UINT64_MAX,"fence reports device removal");
-            if (completed >= fence_value) break;
+            if (completed >= value) break;
             const ULONGLONG now=GetTickCount64();
             require(now < deadline,"GPU fence timed out after 10000 ms");
             const DWORD status=MsgWaitForMultipleObjectsEx(1,&event,static_cast<DWORD>(deadline-now),
@@ -317,13 +346,49 @@ struct Probe {
             else require(status == WAIT_OBJECT_0,"GPU fence wait (timeout/Win32 failure)");
         }
         CHECK(device->GetDeviceRemovedReason());
+    }
+
+    void wait_gpu() {
+        // The final drain also queues a fence operation whose lifetime matters.
+        in_flight=true;
+        CHECK(queue->Signal(fence,++fence_value));
+        wait_value(fence_value);
         in_flight=false;
     }
 
+    void retire_slot(UINT slot_index) {
+        auto& slot=slots[slot_index];
+        if (!slot.completion) return;
+        wait_value(slot.completion);
+        const D3D12_RANGE range{0,readback_size};
+        void* mapped=nullptr;
+        CHECK(slot.readback->Map(0,&range,&mapped));
+        if (!mapped) {
+            const D3D12_RANGE written{0,0}; slot.readback->Unmap(0,&written);
+            require(false,"readback Map returned data");
+        }
+        const auto* pixels=static_cast<const uint8_t*>(mapped)+static_cast<SIZE_T>(footprint.Offset);
+        const uint64_t bad=compare_pixels(pixels,footprint.Footprint.RowPitch,width,height,slot.serial,true);
+        const D3D12_RANGE written{0,0}; slot.readback->Unmap(0,&written);
+        require(bad == 0,"full-frame exact RGBA readback");
+        ++checked_frames; checked_pixels += static_cast<uint64_t>(width)*height;
+        require(outstanding != 0,"retired slot was outstanding");
+        --outstanding;
+        if (queued)
+            std::printf("RETIRE serial=%llu slot=%u fence=%llu qpc=%lld mismatches=0\n",
+                slot.serial,slot_index,slot.completion,qpc());
+        slot.completion=0;
+    }
+
     void frame() {
-        require(!in_flight,"allocator is retired before reuse");
         const UINT index=swapchain->GetCurrentBackBufferIndex();
         require(index < buffer_count,"current backbuffer index");
+        const UINT slot_index=queued ? index : 0;
+        retire_slot(slot_index);
+        auto& slot=slots[slot_index];
+        allocator=slot.allocator;
+        list=slot.list;
+        readback=slot.readback;
         CHECK(allocator->Reset());
         CHECK(list->Reset(allocator,nullptr));
         D3D12_RESOURCE_BARRIER barrier{}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -352,20 +417,22 @@ struct Probe {
         ID3D12CommandList* lists[]={list};
         in_flight=true;
         queue->ExecuteCommandLists(1,lists);
+        const LONGLONG present_begin=qpc();
         CHECK(swapchain->Present(1,0));
-        wait_gpu();
-        const D3D12_RANGE range{0,readback_size};
-        void* mapped=nullptr;
-        CHECK(readback->Map(0,&range,&mapped));
-        if (!mapped) {
-            const D3D12_RANGE written{0,0}; readback->Unmap(0,&written);
-            require(false,"readback Map returned data");
+        const LONGLONG present_end=qpc();
+        CHECK(queue->Signal(fence,++fence_value));
+        slot.completion=fence_value;
+        slot.serial=serial;
+        ++outstanding;
+        max_outstanding=std::max(max_outstanding,outstanding);
+        if (queued)
+            std::printf("PRESENT serial=%llu buffer=%u fence=%llu begin_qpc=%lld end_qpc=%lld outstanding=%u gpu_completed=%llu\n",
+                serial,index,fence_value,present_begin,present_end,outstanding,fence->GetCompletedValue());
+        else {
+            retire_slot(slot_index);
+            in_flight=false;
         }
-        const auto* pixels=static_cast<const uint8_t*>(mapped)+static_cast<SIZE_T>(footprint.Offset);
-        const uint64_t bad=compare_pixels(pixels,footprint.Footprint.RowPitch,width,height,serial,true);
-        const D3D12_RANGE written{0,0}; readback->Unmap(0,&written);
-        require(bad == 0,"full-frame exact RGBA readback");
-        ++frames; checked_pixels += static_cast<uint64_t>(width)*height;
+        ++frames;
         buffers_seen |= 1u << index;
         if (frames == 1 || frames % 60 == 0)
             std::printf("FRAME %llu buffer=%u checked_pixels=%llu mismatches=0 fence=%llu\n",
@@ -385,9 +452,14 @@ struct Probe {
             require(!close_requested,"window closed during presentation (cancelled)");
             require(IsWindowVisible(window) && !IsIconic(window),"probe window remains visible after frame");
         } while (GetTickCount64()-start < static_cast<ULONGLONG>(seconds)*1000);
+        // Keep every slot's readback and allocator alive through its own exact
+        // completion. A later producer signal is not a consumer-release token.
+        for (UINT i=0; i<buffer_count; ++i) retire_slot(i);
+        require(checked_frames == frames && outstanding == 0,"every submitted frame readback verified");
+        if (queued) require(max_outstanding > 1,"queued control exercised multiple outstanding frame records");
         require(buffers_seen == (1u << buffer_count)-1,"all swapchain backbuffers presented and verified");
-        std::printf("RENDER COMPLETE frames=%llu checked_pixels=%llu buffers=0x%x; beginning teardown\n",
-            frames,checked_pixels,buffers_seen);
+        std::printf("RENDER COMPLETE frames=%llu checked_pixels=%llu buffers=0x%x max_outstanding=%u; beginning teardown\n",
+            frames,checked_pixels,buffers_seen,max_outstanding);
     }
 
     bool shutdown() {
@@ -405,9 +477,13 @@ struct Probe {
             TerminateProcess(GetCurrentProcess(),2);
             std::abort();
         }
-        release(list,"command list");
-        release(allocator,"command allocator");
-        release(readback,"readback buffer");
+        // The current-frame pointers are borrowed aliases of the owning slots.
+        list=nullptr; allocator=nullptr; readback=nullptr;
+        for (auto& slot : slots) {
+            release(slot.list,"command list");
+            release(slot.allocator,"command allocator");
+            release(slot.readback,"readback buffer");
+        }
         for (auto& buffer : buffers) release(buffer,"swapchain buffer");
         release(heap,"RTV heap");
         release(swapchain,"swapchain");
@@ -449,15 +525,18 @@ int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 2 && !std::wcscmp(argv[1],L"--self-test")) return self_test();
         if (argc == 2 && !std::wcscmp(argv[1],L"--help")) {
-            std::printf("Usage: d3d12-present.exe [seconds [width height [flags]]]\n"
+            std::printf("Usage: d3d12-present.exe [--queued] [seconds [width height [flags]]]\n"
                 "seconds=1..600 (default 15), dimensions=16..4096 (default screen)\n"
                 "flags=0..3 (default 1): bit0 borderless/topmost, bit1 swapchain UAV usage\n"
+                "--queued: per-backbuffer slots, deferred readback, per-frame Present/QPC records; at most 60 seconds\n"
                 "--self-test: CPU-only geometry and grader checks\n"
                 "Capture stdout, exit status, and a desktop screenshot while running.\n");
             return 0;
         }
+        const bool queued=argc > 1 && !std::wcscmp(argv[1],L"--queued");
+        if (queued) { --argc; ++argv; }
         require(argc == 1 || argc == 2 || argc == 4 || argc == 5,"argument count (use --help)");
-        const int seconds=argc > 1 ? number(argv[1],1,600) : 15;
+        const int seconds=argc > 1 ? number(argv[1],1,queued ? 60 : 600) : 15;
         // A launcher/manifest can already have fixed the process awareness.
         // Set our window thread explicitly instead of failing with access denied.
         require(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != nullptr,
@@ -466,7 +545,7 @@ int wmain(int argc, wchar_t** argv) {
         const int height=argc > 3 ? number(argv[3],16,4096) : GetSystemMetrics(SM_CYSCREEN);
         const int flags=argc > 4 ? number(argv[4],0,3) : 1;
         require(width >= 16 && width <= 4096 && height >= 16 && height <= 4096,"screen dimensions fit probe bounds");
-        Probe probe(width,height,flags);
+        Probe probe(width,height,flags,queued);
         bool ok=false;
         try { probe.initialize(); probe.run(seconds); ok=true; }
         catch (const Failure&) {}

@@ -302,12 +302,10 @@ pub struct VenusClient {
     /// fence returns `Complete` immediately through `fence_wait_prepare`'s
     /// `!in_flight` arm.
     scanout_copy_last_fence: u64,
-    /// One-time PREINITIALIZED -> GENERAL -> EXTERNAL setup for the persistent
-    /// LINEAR scanout target. The pool/buffer remain live because setup is
-    /// intentionally submitted without a fence wait; queue order makes every
-    /// later copy execute after it.
+    /// The selected persistent LINEAR scanout target. Setup completed at
+    /// allocation time, before external publication, for sources and targets.
     copy_target_image_id: Option<VkImageId>,
-    copy_target_init_pool_id: Option<VkCommandPoolId>,
+    owned_linear_images: Vec<scanout::OwnedLinearImage>,
     /// App/DWM BLT imports and recorded copies. These caches grow fallibly at
     /// PASSIVE_LEVEL and retain explicit transport-derived ceilings. Every
     /// access is serialized by AdapterContext::with_venus_client, so
@@ -417,12 +415,29 @@ impl VenusClient {
         image_id: u64,
     ) -> Result<(), VirtioError> {
         let image_id = VkImageId::from_raw(image_id).ok_or(VirtioError::DeviceError)?;
+        let linear_index = self
+            .owned_linear_images
+            .iter()
+            .position(|image| image.image_id == image_id);
+        if let Some(index) = linear_index {
+            if !self.owned_linear_images[index].access.may_destroy_image() {
+                crate::diag::record_named_bytes(b"SdgLIni", 0xE2);
+                return Err(VirtioError::DeviceError);
+            }
+        }
         let mut w = Writer::new();
         w.header(CMD_DESTROY_IMAGE, 0);
         w.handle(self.device_id);
         w.handle(image_id);
         w.count(false);
-        self.submit_direct(adapter, w.as_slice()?)
+        self.submit_direct(adapter, w.as_slice()?)?;
+        if let Some(index) = linear_index {
+            self.owned_linear_images[index].access.image_destroyed();
+        }
+        if self.copy_target_image_id == Some(image_id) {
+            self.copy_target_image_id = None;
+        }
+        Ok(())
     }
 
     /// Enqueue a raw Venus `vkFreeMemory` command.
@@ -451,6 +466,16 @@ impl VenusClient {
         memory_id: u64,
     ) -> Result<(), VirtioError> {
         let memory_id = VkDeviceMemoryId::from_raw(memory_id).ok_or(VirtioError::DeviceError)?;
+        let linear_index = self
+            .owned_linear_images
+            .iter()
+            .position(|image| image.memory_id == memory_id);
+        if let Some(index) = linear_index {
+            if !self.owned_linear_images[index].access.may_free_memory() {
+                crate::diag::record_named_bytes(b"SdgLIni", 0xE3);
+                return Err(VirtioError::DeviceError);
+            }
+        }
         if self
             .present_buffers
             .iter()
@@ -474,6 +499,9 @@ impl VenusClient {
             }
         }
         self.free_memory_object(adapter, memory_id)?;
+        if let Some(index) = linear_index {
+            self.owned_linear_images.swap_remove(index);
+        }
         if let Some(index) = owned_index {
             self.owned_memory_blobs.swap_remove(index);
         }

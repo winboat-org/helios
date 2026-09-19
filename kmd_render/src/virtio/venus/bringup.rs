@@ -422,7 +422,7 @@ impl VenusInstance {
             memory_type_flags,
             memory_type_count,
             copy_target_image_id: None,
-            copy_target_init_pool_id: None,
+            owned_linear_images: Vec::new(),
             // Present caches grow fallibly at PASSIVE_LEVEL. Their semantic
             // ceilings are tied to transport resources, but an idle adapter
             // pays no large up-front nonpaged-pool allocation here.
