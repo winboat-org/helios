@@ -1733,18 +1733,24 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
   // R824: configuration delivered as a process-global side effect, whose
   // correctness used to be statement position -- these writes happened on EVERY
   // CreateDevice DDI, and one process (dwm) creates several D3D11 devices, so
-  // the block was rewritten while earlier DxvkInstances were live and
-  // _putenv_s is not safe against a concurrent getenv. The values are identical
-  // on every call, so doing it once is behaviour-preserving; what goes away is
-  // the repeat writes and the concurrent-write window.
-  //
-  // Static guarantee: none. std::call_once is a runtime construct and an
-  // `EnvConfigured` token would be ceremony around one call site. _putenv_s
-  // stays the mechanism because DXVK reads env; changing that is out of scope.
+  // the block was rewritten while earlier DxvkInstances were live. DXVK reads
+  // these values with GetEnvironmentVariableW, so use the matching Win32
+  // process-environment API rather than UCRT's _putenv_s. The latter fail-fast
+  // crashed every LogonUI and direct D3D11 probe during WinDock acceptance.
   static std::once_flag s_envOnce;
+  static bool s_envConfigured = false;
   std::call_once(s_envOnce, [] {
     // Force selection of the Helios venus device if other ICDs are present.
-    _putenv_s("DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus");
+    s_envConfigured = SetEnvironmentVariableA(
+        "DXVK_FILTER_DEVICE_NAME", "Virtio-GPU Venus") != FALSE;
+    if (!s_envConfigured) {
+      char msg[96];
+      std::snprintf(msg, sizeof(msg),
+          "SetEnvironmentVariableA(DXVK_FILTER_DEVICE_NAME) failed: %lu",
+          static_cast<unsigned long>(GetLastError()));
+      umd_log(msg);
+      return;
+    }
     // HELIOS_DXVK_KMT_SHARED is no longer forced here: the engine defaults it
     // ON (2026-08-05). Forcing it made a knob that could not be off in any
     // configuration this process ever produced, which hid the fact that the
@@ -1760,8 +1766,8 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
         RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "ShaderDumpPath",
                      RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, dumpPath, &size) == ERROR_SUCCESS &&
         dumpPath[0];
-    if (haveDump)
-      _putenv_s("DXVK_SHADER_DUMP_PATH", dumpPath);
+    if (haveDump && !SetEnvironmentVariableA("DXVK_SHADER_DUMP_PATH", dumpPath))
+      umd_log("SetEnvironmentVariableA(DXVK_SHADER_DUMP_PATH) failed");
 
     char msg[MAX_PATH + 128];
     std::snprintf(msg, sizeof(msg),
@@ -1770,6 +1776,9 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
       haveDump ? dumpPath : "(unset)");
     umd_log(msg);
   });
+
+  if (!s_envConfigured)
+    return nullptr;
 
   return bridge_guard<std::unique_ptr<HeliosDxvkDevice>>(
       "helios_dxvk_create_device", nullptr,
