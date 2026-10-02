@@ -449,7 +449,7 @@ the new v2 export distinguishes pending from failure and never flushes while
 waiting. WSI sleeps in bounded slices and permits source recycling only after
 confirmed copy completion. Surface cancellation and errors retain the read/image.
 The CS-error latch and before/after device-status checks prevent cleanup signals
-from becoming false success. See `HPS2_REFACTOR.md` for the complete contract.
+from becoming false success. See [PRESENT.md](dx12/PRESENT.md#fixed-copy-target-and-cancellation) for the current contract.
 
 The .268 package contains release UMD11
 `245D1BC36A61B7B92E83CE5D90F06786544419170B42BB0D534F1913F370D66A`,

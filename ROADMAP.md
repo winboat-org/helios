@@ -12,16 +12,77 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
-## Open: Steel Nomad Vulkan launch freeze and DX12 frame rollback, 2026-09-18
+## Graphics defects: Steel Vulkan resolved in tested configuration; DX12 rollback open
 
-Investigate the Vulkan freeze first. The owner reports that Steel Nomad Vulkan
-freezes the display while SSH remains responsive, process termination stalls,
-and a requested reboot eventually responds after about 90 seconds. Separately,
-Port Royal and Steel Nomad DX12 display an older whole frame between newer frames
-under SDL; VNC appears to skip frames. DX11 is not reported affected. Stable
-benchmark FPS is not presentation-order acceptance.
+**Current status, September20:** candidate13 completed two Steel Nomad Vulkan
+benchmarks without new GPU faults, and the owner reports that the installed
+Vulkan path works normally. Mark the loading freeze **resolved in the tested
+configuration**. Exact root-cause attribution and broader fault-recovery
+coverage remain follow-up work; incomplete traces alone do not keep the
+successfully corrected symptom open. Native DX12 frame rollback remains
+**OPEN** and is the next session's priority: Port Royal and Steel Nomad DX12
+display an older whole frame between newer frames under SDL, while VNC appears
+to skip frames. DX11 is not reported affected. Benchmark FPS does not prove
+visible frame order. The dated entries below retain their historical status.
 
-**Latest, September20, 00:30 IST:** after the owner confirms recovery and
+**Implementation records retired, September20:** native DGC and the HPS2
+replacement are complete as implementation work. Their full records are now
+archived as [NATIVE_DGC](docs/archive/NATIVE_DGC_2026-09-20.md) and
+[HPS2_REFACTOR](docs/archive/HPS2_REFACTOR_2026-09-20.md); the old paths are short
+redirects. Active contracts live in [PRESENT](docs/dx12/PRESENT.md#current-presentation-contract),
+[EXECUTION_SYNC](docs/dx12/EXECUTION_SYNC.md#allocation-bound-producer-completion)
+and [SUBSTRATE](docs/dx12/SUBSTRATE.md#native-dgc-contract), with host activation
+in [TOOLCHAIN](TOOLCHAIN.md#12-build-the-paired-virglrenderer-and-venus-protocol-forks).
+Host-loss/disconnect error propagation, cleanup after an unproven consumer read
+or device loss, general CS-failure teardown, and broader cross-API
+ownership/lifecycle coverage remain separate follow-up work. Preserve the
+allocator failure/stress limits in [ALLOCATOR_LIFETIME](docs/dx12/ALLOCATOR_LIFETIME.md).
+Document retirement does not close these items or native DX12 frame rollback.
+
+**September20 host deployment follow-up, verified after restart:** the owner
+reports recurring `VUID-VkExportMemoryAllocateInfo-handleTypes-09860` for
+buffers bound to allocations exported as OPAQUE_FD | DMA_BUF. MCP confirms
+registered ICD `9AE82DE7...`, running KMD .289 / `F6604A27...`, and Helios
+problem code 0. The affected standalone bridged QEMU started at 16:24:45 IST on
+host boot `2e38a883-735a-406d-bf03-a90988f0920e`. Its default launch directory
+supplied the old renderer: mapped library `06CE3964...` and server
+`AFED7176...`, including reported worker PID85249. The paired renderer used
+in the successful tests is `412633B4...` / `2BBF92D5...`; its allocation
+dispatch preserves explicit export handles instead of adding the incompatible
+DMA_BUF bit. The captured current QEMU log confirms the reported VUID.
+
+The immutable corrected package manifest verifies, its saved source matches
+the published renderer checkout, and the production allocation-dispatch CPU
+regression passes. Both previous default binaries are backed up, and the
+verified pair is installed into `target/linux/virglrenderer-install` using
+atomic file replacements, preserving the running processes' old mappings.
+A **full QEMU stop/start** was required to activate them; restarting Windows
+inside the existing QEMU process is insufficient. The bridged launcher needed
+owner sudo authentication (`sudo -n true` reported a password was required),
+so the running VM was left intact until the owner's restart. No new GPU trial
+or host reset occurs in this follow-up. Initial evidence and binary backups are under
+`tmp/display-order-20260918/export-vuid-20260920-jrxc0s1j/`.
+
+The owner relaunches with `launch-opaque-mapping-v1.sh` at 16:53:46 IST on the
+same host boot. QEMU PID104777 loads verified package `05872F39...` and mapped
+renderer library `412633B4...`; renderer parent PID104828 and its observed
+workers execute `2BBF92D5...`. Validation and fault tracing are enabled. MCP
+confirms DWM PID1816/session1 loads ICD `9AE82DE7...` and UMD `FCFF7F28...`,
+KMD remains .289, and Helios reports problem code 0 with no pending reboot.
+The fresh log snapshot through 16:56:46 contains 37 OPAQUE_FD-only exports,
+51 DMA_BUF-only exports and 30 allocations without export flags, with **zero
+combined OPAQUE_FD | DMA_BUF allocations, VUIDs or trace-limit markers**. The
+host kernel journal contains no Xid this boot. This verifies activation and
+resolves the reported stale-renderer validation issue in the observed desktop
+allocation path. No Steel benchmark or other new GPU probe is run for this
+verification; native DX12 rollback remains the next session's open defect.
+Receipts and log snapshots are in
+`tmp/display-order-20260918/export-vuid-postrestart-dzqtb9qk/`.
+The matching `.zip` archive has SHA256
+`C5C589B3CAA9E6ED09209D56D86EFE4E9BC970F7A51FBA0D108994DF6ECED6AD`;
+all eight payloads and the inner manifest verify.
+
+**Default ICD installation, September20, 00:30 IST:** after the owner confirms recovery and
 explicitly requests installation, candidate13 becomes the machine-default ICD
 (`9AE82DE7…`). QEMU resumes on the same host boot, and a Windows restart
 activates the candidate in DWM, verified by its loaded module hash. The
@@ -2361,7 +2422,7 @@ queue-marker fences; Mesa/KMD retire through authenticated wire receipts and
 the 0x14 feedback escape is retired. Keep WDDM2.1, native static UMD and async WSI.
 
 The full contract, capability matrix, provenance, build/activation commands and
-remaining limits are in [NATIVE_DGC.md](docs/dx12/NATIVE_DGC.md). Linux Venus on
+remaining limits are in [the native DGC archive](docs/archive/NATIVE_DGC_2026-09-20.md). Linux Venus on
 the actual NVIDIA GPU passes 2,404 indirect checks with no host validation
 diagnostics after repairing Mesa's dropped 64-bit buffer-usage chain. Protocol,
 renderer worker and 211 KMD logic tests pass. Windows engine/ICD/release UMD and
@@ -3261,7 +3322,7 @@ hotplug; this validation retains explicit `UmdD3D12=1` and does not repeat the
 absent/zero policy checks. The signed package has not been updated. The original
 validation preceded hosted CI. Existing performance/visual evidence below
 belongs to the earlier deployed artifacts; broader ownership and failure-path
-gaps in `docs/dx12/EXECUTION_SYNC.md` and `docs/HPS2_REFACTOR.md` remain open.
+gaps in `docs/dx12/EXECUTION_SYNC.md` and `docs/dx12/PRESENT.md` remain open.
 
 ## Current baseline and next work, 2026-09-06
 
@@ -3327,7 +3388,7 @@ the standard Vulkan benchmark pass: **93.228233 FPS / score 9322**, status 0,
 archive/export, 4814 successful helper Presents. .268's KMD executable sections
 and UMD12 were unchanged; .269 retains that UMD12 and adds capacity wakes below.
 Owner moving-scene acceptance and broader failure/inline
-WSI stress remain open; see HPS2_REFACTOR and the performance report.
+WSI stress remain open; see [the presentation contract](docs/dx12/PRESENT.md#current-presentation-contract) and the performance report.
 
 Guest capture/interactive observer tasks caused benchmark-isolation concerns;
 the owner did not interact with either workload. Captures now use host VNC;
@@ -3795,7 +3856,7 @@ charter first.
 ## Workstream 4 — D3D12  ← **PRIORITY 2 since 2026-08-05**
 
 **HPS2 removal investigation, 2026-09-05:**
-[`docs/HPS2_REFACTOR.md`](docs/HPS2_REFACTOR.md) inventories the live file users
+[The archived HPS2 investigation](docs/archive/HPS2_REFACTOR_2026-09-20.md) inventories the file users at that checkpoint
 and recommends allocation-bound KMD completion state, cached read-only status
 and event waits on WDDM 2.1, plus explicit WSI dependencies and a narrow DX12
 worker-queue hook. Approximately one implementation day is a planning target;
@@ -3826,7 +3887,7 @@ an approximately 10% performance regression and paused performance work for DX12
 correctness. The .266 shadow acceptance and next task above supersede that pause. Keep
 `HELIOS_WSI_ASYNC_PRESENT=1`; the inline path is outside this acceptance work.
 The required stimuli and pass evidence are in
-[`HPS2_REFACTOR.md`](docs/HPS2_REFACTOR.md#runtime-acceptance-packet--pending).
+[the archived HPS2 acceptance packet](docs/archive/HPS2_REFACTOR_2026-09-20.md#runtime-acceptance-packet--pending).
 The original hook did not close general DX12 ECL/fence/wait coverage. Its
 HE12 v2 successor is described below. Missing external queue-family ownership
 transfers remain an obstruction to general mixed-API runtime correctness.

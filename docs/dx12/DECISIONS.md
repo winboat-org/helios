@@ -9,7 +9,9 @@ Virglrenderer and Venus protocol are now paired root submodules, with native
 EXT DGC and NV mixed-sample extension forwarding through Mesa. Remove the private
 vkd3d indirect emulation and replace feedback-shadow retirement with the corrected
 ordinary-fence renderer path and authenticated wire completion. The architectural
-contract and current query/validation gaps are in [NATIVE_DGC.md](NATIVE_DGC.md).
+contract is in [SUBSTRATE](SUBSTRATE.md#native-dgc-contract) and
+[EXECUTION_SYNC](EXECUTION_SYNC.md); [DGC_QUERIES](DGC_QUERIES.md) and
+[ROADMAP](../../ROADMAP.md) track query results and current validation gaps.
 No QEMU redesign or WDDM version change follows from this authorization. The
 owner retains launcher restart ownership; guest reboots are authorized.
 

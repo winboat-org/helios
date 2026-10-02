@@ -3,7 +3,7 @@
 **2026-09-09:** the private 128-DWORD runtime ABI below remains, but the private
 indirect fallback and its 64/128-word maps have been removed. Native DGC selects
 raw-VA root CBVs up front. Push-UBO expanded roots still reach the engine's explicit
-refusal and require native runtime validation; see [NATIVE_DGC.md](NATIVE_DGC.md).
+refusal and require native runtime validation; see [SUBSTRATE](SUBSTRATE.md#native-dgc-contract).
 The fallback-specific implementation and acceptance paragraphs below are historical.
 
 Root signatures are an inherited obligation for FL12_0 and FL12_1. This

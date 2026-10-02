@@ -30,7 +30,7 @@ API shader-model values to the different WDK DDI encoding. See
 **Owner update, 2026-09-09:** the native static UMD/WDDM2.1 architecture is retained,
 with paired renderer/protocol forks now authorized. Native DGC replaces the private
 engine emulation; ordinary renderer fences and authenticated wire receipts replace
-the feedback shadow. See [NATIVE_DGC.md](NATIVE_DGC.md) for contracts and boundaries.
+the feedback shadow. See [SUBSTRATE](SUBSTRATE.md#native-dgc-contract) and [EXECUTION_SYNC](EXECUTION_SYNC.md) for contracts and boundaries.
 
 **What this is:** the mechanical guide to creating the D3D12 user-mode driver as a *second* DLL
 beside the shipping D3D11 one — which crates exist, what moves into a shared crate and what change

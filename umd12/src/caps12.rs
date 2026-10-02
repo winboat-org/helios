@@ -82,7 +82,7 @@
 //! Microsoft's FL12_2 driver-model minimum is 2.0, not proof of KMD completeness.
 //! Tiled resources are not the only missing inherited obligation. In particular,
 //! the paired renderer/Mesa fork now carries native DGC, but its query and
-//! expanded-root paths still need independent conformance evidence. See NATIVE_DGC.md.
+//! expanded-root paths still need independent conformance evidence. See docs/dx12/SUBSTRATE.md#native-dgc-contract.
 //!
 //! # ⭐ The per-format half, at the bottom of this file
 //!

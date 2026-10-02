@@ -3,7 +3,7 @@
 The owner withdrew this implementation on 2026-09-09 and authorized a
 virglrenderer fork. The private `indirect_emulation*` files, shader, PSO/root
 variants and CPU-assisted IA continuation hooks have been removed from vkd3d.
-The replacement contract is [NATIVE_DGC.md](NATIVE_DGC.md): native EXT DGC
+The replacement contract is [SUBSTRATE](SUBSTRATE.md#native-dgc-contract): native EXT DGC
 through paired Venus protocol, renderer and Mesa implementations. Missing
 native DGC refuses state-changing signatures; it does not select this fallback.
 

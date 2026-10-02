@@ -90,7 +90,7 @@ counted reporting estimate.
 
 Current evidence and full capability matrix: [FEATURE_LEVELS.md](FEATURE_LEVELS.md).
 DX12 has priority. Keep the native static UMD and WDDM2.1. The owner authorized
-the renderer/protocol fork on 2026-09-09; [NATIVE_DGC.md](NATIVE_DGC.md) supersedes
+the renderer/protocol fork on 2026-09-09; [the native DGC contract](SUBSTRATE.md#native-dgc-contract) supersedes
 the former stock-renderer and private-emulation policies. Its D3D12 compute-query discrepancy is repaired by DGC_QUERIES.md; the raw
 Vulkan counter observation remains. The paired guest is deployed.
 DXR/Port Royal and later FL12_2/Speed Way require separate acceptance.

@@ -58,8 +58,8 @@ continues to govern the native, statically linked UMD architecture.
 **2026-09-09 superseding deployed checkpoint:** the owner-authorized renderer
 fork now carries native DGC through the paired protocol and Mesa. The private
 engine fallback is removed, and queue retirement uses authenticated wire fences
-after the renderer's exportable-marker fix. [NATIVE_DGC.md](NATIVE_DGC.md) is the
-current cross-stack matrix for these changes. Its 2,404 indirect GPU checks pass;
+after the renderer's exportable-marker fix. [The native DGC archive](../archive/NATIVE_DGC_2026-09-20.md) records the
+cross-stack matrix at this checkpoint. Its 2,404 indirect GPU checks pass;
 the initial compute-query failure has now been repaired for D3D12 by
 [DGC_QUERIES.md](DGC_QUERIES.md), including native Windows readback. The paired .271/oem54 guest and local renderer are now activated. Native
 FL12_0/12_1 admission, root/IA DGC readback, root signatures, stream output
@@ -68,7 +68,7 @@ expected tier2 3D refusal. Full FL12_0/12_1 or DXR conformance is not claimed. O
 fallback and stock-renderer rows below are dated evidence of previous builds.
 Time Spy, Fire Strike and Steel Nomad Vulkan subsequently complete on this
 stack with archived results, matching render settings, verified loaded modules
-and changing host-VNC frames. [NATIVE_DGC.md](NATIVE_DGC.md#completed-regression-controls-on-the-deployed-stack)
+and changing host-VNC frames. [The archived native DGC controls](../archive/NATIVE_DGC_2026-09-20.md#completed-regression-controls-on-the-deployed-stack)
 records scores and the Windows-runtime attribution limit. Owner visual
 acceptance remains pending; these controls do not exercise native DXR.
 
@@ -83,7 +83,7 @@ D3D12 behavior. FL12_1 additionally requires ROV and conservative rasterization.
 [ExecuteIndirect tier1.0](https://microsoft.github.io/DirectX-Specs/d3d/IndirectDrawing.html#feature-tiers)
 is required even at FL11_0. Native DGC now supplies root-state and IA VBV/IBV
 changes in source. Previous fallback readback evidence does not validate this
-replacement; see [NATIVE_DGC.md](NATIVE_DGC.md).
+replacement; see [the native DGC contract](SUBSTRATE.md#native-dgc-contract).
 The current compatibility candidate admits FL12_1 with tiled2 after the
 no-output rasterization repair below. Native RT1.0/SM6.3 is now admitted with
 engine backing checks; admission and complete conformance remain separate requirements.

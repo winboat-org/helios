@@ -1,17 +1,90 @@
 # PRESENT.md — how a D3D12 frame reaches the Helios scanout
 
-**Current source amendment — bounded HPS2 replacement:**
-[`../HPS2_REFACTOR.md`](../HPS2_REFACTOR.md#implementation-and-runtime-acceptance)
-supersedes this document's historical HPS2 and zero-stream HEPR descriptions.
-UMD12 Present now commits an exact queue/resource producer operation on vkd3d's
-existing callback FIFO and stamps its registered stream/value into HEPR. WSI
-passes an unnamed NT semaphore/value through the versioned helper seam, while
-retaining copy-completion and recycling protection. Producer completion alone
-does not transfer external-memory ownership or release a consumer. This source
-cutover is built; mixed-API/WSI runtime acceptance remains pending. The
-[HE12 v2 execution repair](EXECUTION_SYNC.md) also admits Present callbacks
-through the exact runtime context, covering a preceding Queue::Wait without an
-ECL. That repair is built but not deployed. Performance work is paused.
+## Current presentation contract
+
+This contract supersedes the historical HPS2 and zero-stream HEPR descriptions
+below. The implementation migration is complete; its dated evidence is in the
+[HPS2 archive](../archive/HPS2_REFACTOR_2026-09-20.md). Current defects and loaded
+artifact receipts are in [ROADMAP](../../ROADMAP.md). Native DX12 frame rollback
+remains open; producer completion and benchmark FPS do not prove visible order.
+WDDM 2.1, the native static UMD and asynchronous WSI remain in use.
+
+### Exact producer dependency
+
+UMD12 Present commits the exact resource, allocation and queue through
+`helios_vkd3d_enqueue_producer` on vkd3d's existing callback FIFO. Its retained
+operation signals the registered stream after preceding work, including split
+submissions and queue waits; HEPR carries that context/cookie/value. Failed
+predecessor work is terminal, so an empty later signal cannot certify it.
+[EXECUTION_SYNC](EXECUTION_SYNC.md#allocation-bound-producer-completion) owns
+the allocation binding, completed-prefix and HE12 admission contracts.
+
+WSI passes an unnamed NT semaphore handle and the exact pre-present value
+through `helios_umd_set_present_source_v4`. WSI owns the original handle;
+the helper duplicates it, matches cached imports by kernel-object identity,
+and retains the imported dependency through the source read. Steady-state
+vehicle WSI can skip its own frame-fence wait only because this dependency is
+consumed by the helper. GDI fallback and rejected/dropped frames wait for their
+own producer before reading or recycling. Producer readiness does not release
+a consumer or grant external-memory ownership.
+
+### Source image and ownership
+
+The source `VkImageCreateInfo` is borrowed through same-thread Present and
+deep-copied before caching the dedicated import, including supported format-list
+and queue-family arrays. Preserve the actual usage, flags, format and geometry;
+unsupported chains, concurrent/protected images and unsupported formats fail
+explicitly. The source format remains separate from the flip-compatible
+destination format: compatible sRGB/UNORM transfers preserve encoded bytes
+without inventing SAMPLED usage. The v2/v3 exports retain their old ABI; new
+WSI requires v4 rather than silently inferring the new ownership contract.
+
+Source images, their dedicated allocations and resource-id helper aliases
+declare matching DMA_BUF handles. WSI finishes the producer-side fallback
+read, then releases the original image to EXTERNAL in GENERAL before signaling
+its exact producer value. The helper acquires, copies and releases in its
+execution command buffer, after that dependency. It must not promote the copy
+to an earlier initialization buffer or eagerly reacquire the source on the
+next command list. The application's transition out of PRESENT reacquires
+from EXTERNAL. Ordinary prime blits and FOREIGN scanout retain their contracts.
+`requiresHeliosOrderedAccess` keeps shared-image transitions and transfers on
+the execution buffer across backing rotation and aliases.
+
+The raw KMD Present-buffer allocator uses DMA_BUF for creation and its dedicated
+export. External LINEAR images start UNDEFINED and are initialized/released
+before their real submission fence permits CPU exposure. Failed or ambiguous
+initialization retains the image, memory and command objects. That initial
+fence does not retire subsequent copy or scanout consumers.
+
+### Fixed copy target and cancellation
+
+The explicit helper copy flush captures one DXVK submission ID and device
+identity. `helios_umd_wait_present_copy_v2` distinguishes completed, pending
+and failed; waiting never flushes or replaces the captured target. Device
+failure and CS-worker exceptions are errors, not completion notifications.
+Sleeping slices selected by `HELIOS_WSI_VEHICLE_WAIT_US` (1..32 ms) are polling
+intervals, not device-loss deadlines. Only proven completion clears
+`read_unproven` and permits normal source recycling.
+
+The production `wsi_copy_retirement.h` loop latches surface loss, resize or
+worker-stop errors while retaining the helper device and copy target. It
+continues sleeping waits for at most five seconds after cancellation. Real
+completion permits destruction but does not turn the cancelled presentation
+into success. Window restoration cannot restart the budget. Timeout or device
+failure retains the source; ordinary presentation has no new deadline or idle
+wait. The helper COM device survives until the async worker joins.
+`wait_cancel`, `source_retained`, `completed` and `drain_expired` distinguish
+presentation cancellation from retirement of the read.
+
+Host-loss error delivery, cleanup after an unproven read/device loss, general
+CS-failure teardown and broader cross-API ownership/lifecycle coverage remain
+separate follow-up work in ROADMAP. `tools/vk_vehicle_completion_probe.cpp`
+checks pending/reacquire and close/resize behavior; require same-process helper
+activity, exact completion and retention evidence, not just application PASS.
+The DX12 rollback investigation uses visible serials and
+`tools/d3d12_present_probe.cpp` to establish actual frame order.
+
+## Historical presentation investigation
 
 **What this is.** The presentation reference for `docs/dx12/`: the D3D11 present chain as it runs
 today hop by hop, the D3D12 `pfnPresent` DDI as the SDK header actually declares it, what the Helios

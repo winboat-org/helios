@@ -6,7 +6,7 @@ into a system-wide graphics/compute installation. It includes x86 Direct3D 11/12
 components for WoW64 applications alongside the native x64 stack.
 
 The 2026-09-09 native-DGC source requires the paired renderer/protocol fork
-described in [NATIVE_DGC.md](docs/dx12/NATIVE_DGC.md) for its state-changing
+described in [the native DGC contract](docs/dx12/SUBSTRATE.md#native-dgc-contract) for its state-changing
 indirect path. This Windows bundle does not install the Linux renderer. Mesa's
 generated driver headers must match that protocol; regenerate them with
 `tools/build-native-renderer.sh` before packaging source changes. Existing
@@ -116,7 +116,7 @@ DWORD `0` disables it, and the installer preserves that override. The D3D12
 smoke then expects device creation to fail. Deleting the value restores the
 enabled default. Resource ownership and failure-path limits remain documented
 in [EXECUTION_SYNC.md](docs/dx12/EXECUTION_SYNC.md) and
-[HPS2_REFACTOR.md](docs/HPS2_REFACTOR.md); the default change does not close them.
+[PRESENT.md](docs/dx12/PRESENT.md#current-presentation-contract); the default change does not close them.
 
 ## Hosted runner requirements
 

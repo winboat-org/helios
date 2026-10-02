@@ -1,17 +1,66 @@
 # SUBSTRATE.md — vkd3d-proton and the Vulkan substrate
 
-**Current source amendment — producer completion:**
-`libs/vkd3d/helios_producer.h`, included by `command.c`, adds the narrow
-`helios_vkd3d_enqueue_producer` bridge. It retains the exact resource, uses the
-existing queue callback and fence-worker lifetime machinery, and signals a
-registered timeline after preceding queue work. It performs no GPU-idle wait or
-sample-only ECL lookup. Handled predecessor failures are terminal so a later
-signal cannot certify dropped work. This does not add a generic Vulkan external
-ownership protocol. The subsequent [HE12 v2 execution repair](EXECUTION_SYNC.md)
-adds runtime admission and exact ECL completion using the same worker stream;
-its native acceptance and independent review remain pending. See
-[`../HPS2_REFACTOR.md`](../HPS2_REFACTOR.md#implementation-and-runtime-acceptance)
-for the source/build checks and remaining runtime acceptance.
+## Native DGC contract
+
+Native EXT device-generated commands are implemented through the paired root
+`venus-protocol`, `virglrenderer` and Mesa forks and vkd3d's native DGC path.
+This supersedes the stock-renderer assumptions in the historical investigation
+below. The completed migration and binary-bound test receipts are preserved
+in the [native DGC archive](../archive/NATIVE_DGC_2026-09-20.md). Current
+capability limits live in [FEATURE_LEVELS](FEATURE_LEVELS.md), compute-query
+behavior in [DGC_QUERIES](DGC_QUERIES.md), root restrictions in
+[ROOT_SIGNATURES](ROOT_SIGNATURES.md), and mixed-sample rasterization in
+[TIR](TIR.md). [ROADMAP](../../ROADMAP.md) owns current defects and deployment.
+
+Extension advertisement intersects protocol, renderer and actual host support.
+Wire commands remain append-only; the decoder validates token union selectors
+against their enclosing structures before reading payloads and leaves unused
+action-token unions untouched. Layout/execution-set objects have typed handles,
+ordered updates/destruction and device cleanup. Pipeline execution sets are
+supported; shader-object binding limits remain zero while shader objects are
+not exposed. Preserve 64-bit `VkBufferUsageFlags2CreateInfo` chains, including
+preprocess-buffer usage, through external-memory translation.
+
+`vkCmdPreprocessGeneratedCommandsEXT` captures another command buffer's current
+state. Mesa flushes that recorded prefix before encoding preprocessing and
+flushes preprocessing before later recording can change the source state.
+This orders command recording without an added GPU submission, CPU prefix
+wait, readback or device-idle wait.
+
+The private `indirect_emulation*` implementation, shaders and root/PSO variants
+are retired. Missing native DGC explicitly refuses state-changing signatures
+with E_NOTIMPL; ordinary action-only indirect paths remain. Native DGC selects
+GPU-address root CBVs when building the root layout and retains dynamic vertex
+stride on non-mesh pipelines. Instrumented roots needing push UBOs retain the
+native refusal until separately validated. No capability or renderer-name
+override substitutes for support, and the public 64-DWORD root contract remains.
+
+Renderer queue markers use ordinary, non-exported fences. Only real successful
+completion permits retirement callbacks; failed waits quarantine pending fences
+instead of resetting/reusing them. Guest external-fence APIs remain separate.
+The retired `HELIOS_RETIRE_FEEDBACK` shadow and STREAM_FEEDBACK escape 0x14 must
+not return. [EXECUTION_SYNC](EXECUTION_SYNC.md) owns authenticated wire receipts,
+HE12 and allocation-bound producer completion. Host loss/disconnection still
+needs explicit failure propagation; successful-callback suppression alone does
+not close that boundary.
+
+`helios_vkd3d_enqueue_producer` retains the exact resource and uses the existing
+queue callback/fence-worker lifetime machinery to signal after predecessor
+work. Handled predecessor failures are terminal. It provides neither a generic
+external queue-family ownership protocol nor consumer release; those are
+specified in [PRESENT](PRESENT.md#current-presentation-contract).
+
+Build and activate the paired host library/server using
+[TOOLCHAIN](../../TOOLCHAIN.md#12-build-the-paired-virglrenderer-and-venus-protocol-forks).
+Installing a guest ICD alone cannot update the renderer. For fault diagnosis,
+`VKR_DEBUG=validate,fault` records CPU dispatch/object/allocation identities with
+an explicit 200,000-record limit per context. `VKR_FAULT_TRACE_DIR` writes decoded
+shader modules to exclusive files with a 128 MiB per-context budget. Fault mode
+retains normally filtered external-memory VUIDs. Trace order is not GPU
+completion, trace exhaustion is not success, and neither diagnostic changes
+ownership, completion, retention or failure handling.
+
+## Historical substrate investigation
 
 **What this is:** everything a future session needs to build vkd3d-proton, point it at Helios, know
 exactly what the engine demands of the Vulkan layer, know exactly what Helios supplies, and know

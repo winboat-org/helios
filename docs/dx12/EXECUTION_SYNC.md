@@ -1,5 +1,55 @@
 # DX12 runtime admission and exact execution completion
 
+## Allocation-bound producer completion
+
+HPS2 removal and the HE12 execution cutover are implemented. This is the live
+producer contract; the [migration record](../archive/HPS2_REFACTOR_2026-09-20.md)
+retains dated implementation and validation history. [ROADMAP](../../ROADMAP.md)
+owns current defect status. [PRESENT](PRESENT.md#current-presentation-contract)
+owns external image ownership, consumer completion and source recycling.
+
+`kmd_logic/src/producer_completion.rs` supplies the production state machine
+used by `kmd_render/src/adapter/producer.rs`. Exact runtime allocation/open
+associations reach one generation-qualified producer state. Resolve each view
+with a paired WDDM2 AcquireHandleData/ReleaseHandleData on the same PASSIVE
+thread, releasing outside driver locks; never retain callback-private pointers
+or substitute a resource/Venus ID. Bindings retain driver-owned status, avoiding
+an allocation pin that would create a teardown cycle. Backing rotation carries
+the corresponding binding.
+
+`protocol/include/helios_producer.h` defines ABI v1 for stream registration,
+binding, publication, cached status, event waits, retain/release and abort.
+Resolve `helios_venus_producer_interface` from the ICD that owns the live
+device's Vulkan dispatch, not by module-name guessing. Layout assertions and
+`python3 tools/sync-producer-abi.py --check` protect its build mirrors.
+
+Publish only after committing a retained signal operation. Allocation epochs
+are independent of stream value namespaces and advance through a completed
+prefix, never the maximum of out-of-order retirements. The exact tagged Venus
+ring boundary and generation-qualified wire receipt prove completion. Handle
+retirement before publication under the same serialization. Abort, stream
+closure, allocation destruction and transport reset wake readers with failure;
+they never advance completed epochs. Capacity exhaustion and stale generations
+fail explicitly. Retirement/wakeup must not allocate at elevated IRQL.
+
+Cached status uses bounded read-only seqlock loads. Pending readers atomically
+check/register a referenced event, sleep in user mode, and recheck after waking;
+the KMD Escape never sleeps. Contention, cancellation and timeout grant no read
+permission. Status and dependencies outlive mappings and in-flight readers.
+Releasing a binding cancels only its own waits; its Vulkan device outlives it.
+
+DXVK captures and stamps the same generation/epoch for each staged refresh,
+including unchanged SRV bindings. Command lists retain imported dependencies;
+the submission worker waits before sparse, transfer or graphics reads with
+queue mutexes dropped, and teardown cancels waits before draining workers.
+UMD12 uses the retained vkd3d callback FIFO operation described in PRESENT;
+the HE12 contract below also covers preceding Queue::Wait without an ECL.
+WDDM 2.1, async WSI and independent consumer/scanout release remain mandatory.
+Host-loss error propagation and broader failure/lifecycle coverage stay open;
+see [ALLOCATOR_LIFETIME](ALLOCATOR_LIFETIME.md) for allocator-specific limits.
+
+## Execution implementation and dated validation
+
 **Allocator update, 2026-09-11:** the native frontend now rotates and recycles
 allocator generations when engine retirement references remain. This preserves
 pending backing without waiting for GPU idle or treating reference counts as
@@ -11,7 +61,8 @@ older pending-reset observations below describe the preceding implementation.
 
 **Current source policy:** the owner-authorized renderer fork replaces the
 feedback workaround with authenticated wire completion. See the current contract
-below and [NATIVE_DGC.md](NATIVE_DGC.md). Older deployment receipts remain historical.
+below and the [native DGC contract](SUBSTRATE.md#native-dgc-contract).
+Older deployment receipts remain historical.
 
 **Current native DXR deployment, 2026-09-11:** UMD12 `057934F9…` passes all four
 native ordering cases after the completed Port Royal run, each with 65,536 exact
@@ -32,7 +83,7 @@ guest package are active. All four native ordering/readback cases pass using
 authenticated wire retirement, including the cross-process signal case with
 both process module identities verified. Time Spy, Fire Strike and Steel Nomad
 Vulkan complete with exported results and changing frames; owner visual
-acceptance remains pending. [NATIVE_DGC.md](NATIVE_DGC.md) records exact hashes,
+acceptance remains pending. [The native DGC archive](../archive/NATIVE_DGC_2026-09-20.md) records exact hashes,
 updated system runtime versions and evidence. Pending allocator Reset diagnostics
 remain unresolved, as do the broader ownership and host-loss boundaries below.
 
@@ -363,10 +414,12 @@ publication and HE12 waits use this progress; consumer claims, scanout leases an
 backing recycling still require their own release conditions. Initially-zero,
 GPU-only stream registration and import/CPU-signal refusals remain.
 
-[NATIVE_DGC.md](NATIVE_DGC.md) records the implementation, tests, measured host
-marker times and owner-operated activation. The current guest has not loaded
-this candidate. Host device-loss/disconnect error delivery, cross-API external
-ownership and the pending allocator-reset/fence-worker issue remain open.
+The [native DGC archive](../archive/NATIVE_DGC_2026-09-20.md) records the
+implementation, tests and measured host marker times. Deployment progressed
+after that initial candidate; current loaded identities are in ROADMAP and
+activation rules are in [TOOLCHAIN](../../TOOLCHAIN.md#12-build-the-paired-virglrenderer-and-venus-protocol-forks).
+Host device-loss/disconnect error delivery and broader cross-API ownership
+remain separate from completed producer implementation and allocator repairs.
 
 ## Historical .265/.266 validation (superseded implementation)
 

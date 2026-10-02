@@ -66,8 +66,11 @@ that workflow. Preserve the architecture, synchronization invariants and evidenc
 **Owner update, 2026-09-09:** virglrenderer forks are authorized. The paired
 `virglrenderer` and `venus-protocol` submodules plus Mesa provide native DGC;
 the private vkd3d indirect emulation and `HELIOS_RETIRE_FEEDBACK` workaround are
-removed. See `docs/dx12/NATIVE_DGC.md` for the new wire-completion contract,
-host query discrepancy, local renderer build and owner-operated QEMU restart.
+removed. Live contracts are in `docs/dx12/SUBSTRATE.md` (native DGC),
+`docs/dx12/EXECUTION_SYNC.md` (producer/wire completion), and
+`docs/dx12/PRESENT.md` (ownership/copy retirement). `TOOLCHAIN.md` covers paired
+host build/activation; `ROADMAP.md` tracks open defects. The NATIVE_DGC and
+HPS2_REFACTOR implementation records are retired into `docs/archive/`.
 WDDM2.1, the native static UMD and async WSI remain. Guest reboots are already
 authorized. Do not update memory unless explicitly requested.
 

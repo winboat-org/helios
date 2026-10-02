@@ -60,9 +60,23 @@ uses Mako1.4.1, MarkupSafe3.0.3 and PyYAML6.0.3 in the recorded build.
 The owner selects `tools/qemu-with-native-renderer.sh` through the existing
 HELIOS_QEMU_BIN option at their next launcher restart. The wrapper sets the
 paired library/render-server paths after sudo has stripped loader variables.
-Read [NATIVE_DGC.md](docs/dx12/NATIVE_DGC.md) for exact activation, source/build
-versus loaded-artifact verification, and the unresolved host query discrepancy.
+The default wrapper selects both
+`target/linux/virglrenderer-install/lib/libvirglrenderer.so.1` and
+`target/linux/virglrenderer-install/libexec/virgl_render_server`. Building under
+`target/linux/virglrenderer-build` alone does not update this installed prefix.
+Preserve the previous paired artifacts when deploying replacements. A full
+QEMU stop/start activates host changes; a Windows reboot inside the same QEMU
+process does not reload them. Verify the actual QEMU command/environment,
+mapped renderer library and every live renderer executable against the intended
+hashes, then verify loaded guest ICD/UMD/KMD identities through Windows MCP.
+Check a fresh launch log for validation errors and the host journal for Xids.
+Do not infer loaded identity from a successful build or files merely on disk.
+
 Keep the native Windows guest artifacts paired with this protocol build.
+The live [native DGC contract](docs/dx12/SUBSTRATE.md#native-dgc-contract),
+[wire-completion contract](docs/dx12/EXECUTION_SYNC.md),
+[query results](docs/dx12/DGC_QUERIES.md) and [ROADMAP](ROADMAP.md) supersede
+the retired [migration record](docs/archive/NATIVE_DGC_2026-09-20.md).
 
 ### 1.3 Build the pinned QEMU fork
 

@@ -54,4 +54,4 @@ setup "$build/virglrenderer-build" virglrenderer \
 ninja -C "$build/virglrenderer-build" -j "$jobs"
 meson test -C "$build/virglrenderer-build" venus_queue_sync --print-errorlogs
 meson install -C "$build/virglrenderer-build"
-echo 'Local renderer installed. See docs/dx12/NATIVE_DGC.md for the owner-operated restart and paired guest deployment.'
+echo 'Local renderer installed. See TOOLCHAIN.md for full QEMU restart, loaded host hashes and paired guest verification.'

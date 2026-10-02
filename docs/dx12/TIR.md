@@ -4,7 +4,7 @@ This contract implements inherited FL11_1/FL12_0/FL12_1 forced sampling with
 color attachments. Native FL12_1 admission, full feature-level conformance and
 DXR/Port Royal remain separate requirements. WDDM2.1 and the native static UMD
 architecture are unchanged. The implementation uses the owner-authorized
-renderer/protocol pair in [NATIVE_DGC.md](NATIVE_DGC.md).
+renderer/protocol pair in [SUBSTRATE](SUBSTRATE.md#native-dgc-contract).
 
 ## Required behavior and implementation
 
