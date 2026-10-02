@@ -70,3 +70,10 @@ __pycache__/
 
 # Local build-slave (firstheberg2) usage notes
 /testenv-guide.md
+
+# Local standalone devenv state
+/.devenv/
+/.direnv/
+
+/result
+/result-*

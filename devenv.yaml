@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+  devenv-cli:
+    url: github:cachix/devenv/fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4
+  devenv:
+    url: github:cachix/devenv/fe20b5cba7ab5e93ae73f956a8d3efc50e1753f4?dir=src/modules
+
+# Commit the generated devenv.lock before treating this shell as reproducible.
+# Component source revisions live separately in nix/pins.nix.
