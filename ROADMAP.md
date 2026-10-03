@@ -12,6 +12,16 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## EGL/GBM cleanup
+
+QEMU now releases its EGL thread/display resources before destroying the GBM
+device. With pinned Mesa 26.2.2 and Intel Iris, the earlier order segfaulted in
+`util_vma_heap_free` through `iris_destroy_context` and `eglReleaseThread` during
+shutdown. A diskless EGL/QMP-quit reproduction reached the same stack; the
+corrected release build exits normally and passes 105 QEMU unit tests with the
+three documented skips. Windows container shutdown/recreation checks and exact
+artifact identities are recorded in the winboat-devenv Stage 3 evidence.
+
 ## Graphics defects: Steel Vulkan resolved in tested configuration; DX12 rollback open
 
 **Current status, September20:** candidate13 completed two Steel Nomad Vulkan
