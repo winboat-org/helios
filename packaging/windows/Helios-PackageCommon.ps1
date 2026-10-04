@@ -290,6 +290,100 @@ function Invoke-HeliosNative(
     }
 }
 
+function Get-HeliosSameInfReplacement($PreviousState, $DriverFiles, [string]$InstanceId, [string]$DriverInf) {
+    if (-not $PreviousState) { return $null }
+    $activeInf = Get-HeliosActiveInf $InstanceId
+    if ($activeInf -notmatch '^oem\d+\.inf$') { return $null }
+    $publishedInf = Join-Path $env:windir "INF\$activeInf"
+    if ((Get-HeliosSha256 $publishedInf) -ne (Get-HeliosSha256 $DriverInf)) { return $null }
+    if ($PreviousState.instanceId -ne $InstanceId -or $PreviousState.activeInf -ne $activeInf -or
+        $PreviousState.activeInfSha256 -ne (Get-HeliosSha256 $publishedInf)) {
+        throw 'Refusing replacement of a driver package that differs from the managed device/INF identity.'
+    }
+    $key = Get-Item -LiteralPath (Get-HeliosDisplayClassKey $InstanceId)
+    $paths = @($key.GetValue('UserModeDriverName', $null))
+    if ($paths.Count -ne 4) { throw 'Cannot identify the managed DriverStore package from its Direct3D registration.' }
+    $directory = [IO.Path]::GetFullPath((Split-Path -Parent ([string]$paths[0])))
+    $storeRoot = [IO.Path]::GetFullPath((Join-Path $env:windir 'System32\DriverStore\FileRepository')).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $directory.StartsWith($storeRoot, [StringComparison]::OrdinalIgnoreCase) -or
+        ((Get-Item -LiteralPath $directory).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+        (Get-HeliosSha256 (Join-Path $directory 'helios_kmd_render.inf')) -ne (Get-HeliosSha256 $publishedInf)) {
+        throw 'The active DriverStore directory does not match the managed published INF.'
+    }
+    $changed = $false
+    foreach ($file in $DriverFiles) {
+        if ($file.name -notin @('helios_kmd_render.sys','helios_umd.dll','helios_umd12.dll','helios_umd32.dll','helios_umd12_32.dll')) {
+            throw 'Unexpected driver image in the replacement request.'
+        }
+        if ((Get-HeliosSha256 (Join-Path $directory $file.name)) -ne $file.sha256) { $changed = $true }
+    }
+    if (-not $changed) { return $null }
+    return @{inf=$activeInf;infSha256=Get-HeliosSha256 $publishedInf;directory=$directory}
+}
+
+function Remove-HeliosSameInfPackage($PreviousState, $State, [string]$StatePath, [string]$StateRoot, [string]$DriverInf) {
+    $pending = if ($PreviousState -and $PreviousState.PSObject.Properties['pendingDriverReplacement']) {
+        $PreviousState.pendingDriverReplacement
+    } else { $null }
+    $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+    if (-not $pending) {
+        $replacement = Get-HeliosSameInfReplacement $PreviousState $State.driverFiles $State.instanceId $DriverInf
+        if (-not $replacement) { return $false }
+        $backup = Join-Path $StateRoot ('driver-backups\' + [Guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $backup -ErrorAction Stop | Out-Null
+        Invoke-HeliosNative 'pnputil.exe' @('/export-driver', $replacement.inf, $backup)
+        $files = @(Get-ChildItem -LiteralPath $backup -File -Recurse | ForEach-Object {
+            @{path=$_.FullName;sha256=Get-HeliosSha256 $_.FullName}
+        })
+        $exportedInf = @($files | Where-Object { [IO.Path]::GetFileName($_.path) -ieq 'helios_kmd_render.inf' })
+        if ($exportedInf.Count -ne 1 -or $exportedInf[0].sha256 -ne $replacement.infSha256) {
+            throw 'The old driver package export does not contain the exact active INF.'
+        }
+        foreach ($file in $State.driverFiles) {
+            $exported = @($files | Where-Object { [IO.Path]::GetFileName($_.path) -ieq $file.name })
+            if ($exported.Count -ne 1 -or $exported[0].sha256 -ne (Get-HeliosSha256 (Join-Path $replacement.directory $file.name))) {
+                throw "The driver backup differs from the active $($file.name)."
+            }
+        }
+        $pending = [pscustomobject]@{inf=$replacement.inf;infSha256=$replacement.infSha256;
+            files=$files;bootTime=$boot;phase='exported';journal=Join-Path $backup 'replacement.json'}
+    }
+    # Retain and verify the complete old package before every deletion attempt,
+    # including a resumed task whose previous native result was interrupted.
+    foreach ($file in $pending.files) {
+        if ((Get-HeliosSha256 $file.path) -ne $file.sha256) { throw 'Driver replacement backup has changed.' }
+    }
+    $publishedInf = Join-Path $env:windir ('INF\' + $pending.inf)
+    if ($pending.inf -notmatch '^oem\d+\.inf$') { throw 'Invalid replacement INF identity.' }
+    if ($pending.phase -eq 'exported') {
+        $State.pendingDriverReplacement = $pending
+        Write-HeliosJson $State $StatePath
+        Write-HeliosJson $pending $pending.journal
+        if (Test-Path -LiteralPath $publishedInf) {
+            if ((Get-HeliosActiveInf $State.instanceId) -ne $pending.inf -or
+                (Get-HeliosSha256 $publishedInf) -ne $pending.infSha256) {
+                throw 'Active driver identity changed before the retained package could be removed.'
+            }
+            Write-Host "Replacing the same-INF driver package $($pending.inf); the previous package is retained at $($pending.journal)."
+            Invoke-HeliosNative 'pnputil.exe' @('/delete-driver', $pending.inf, '/uninstall', '/force') -SuccessExitCodes @(0,3010)
+        }
+        $pending.phase = 'reboot-required'
+        Write-HeliosJson $pending $pending.journal
+        Write-HeliosJson $State $StatePath
+        return $true
+    }
+    if ($pending.phase -ne 'reboot-required') { throw 'Unknown driver replacement phase.' }
+    if ($boot -eq $pending.bootTime) {
+        $State.pendingDriverReplacement = $pending
+        return $true
+    }
+    if (Test-Path -LiteralPath $publishedInf) { throw 'The previous driver package is still staged after reboot.' }
+    $pending.phase = 'removed-after-reboot'
+    Write-HeliosJson $pending $pending.journal
+    $State.pendingDriverReplacement = $null
+    return $false
+}
+
 function Test-HeliosTestSigningEnabled {
     if (-not ("Helios.Package.CodeIntegrity" -as [type])) {
         Add-Type -TypeDefinition @'

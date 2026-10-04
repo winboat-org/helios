@@ -109,7 +109,8 @@ if (Test-Path -LiteralPath $statePath -PathType Leaf) {
     # ONLY when the bundle version matches. A different version is an update and
     # must go through the re-apply path, or shipping a newer OEM bundle would be
     # a silent no-op that just reports `finished`.
-    $isUpdate = $Repair -or ([string]$existingState.version -ne [string]$manifest.version)
+    $isUpdate = $Repair -or ([string]$existingState.version -ne [string]$manifest.version) -or
+        ($existingState.PSObject.Properties['pendingDriverReplacement'] -and $existingState.pendingDriverReplacement)
     if ($isUpdate) {
         $previousState = $existingState
         Write-Host "Re-applying $($manifest.version) over the existing installation ($($existingState.version))."
@@ -272,6 +273,7 @@ $state = [ordered]@{
     replacedViogpudo = $replacedViogpudoBefore
     runtimeFiles = @()
     driverFiles = @()
+    pendingDriverReplacement = Get-PreviousStateValue 'pendingDriverReplacement' $null
 }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot,$stateRoot | Out-Null
@@ -377,6 +379,15 @@ Write-HeliosJson $state $statePath
 
 Write-Host "Installing the Helios WDDM driver package..."
 Write-HeliosProgress 64 "Installing the Helios WDDM driver package"
+# Windows deduplicates an unchanged INF even when its rebuilt image bytes differ.
+# Preserve the managed package, remove only that exact published INF through PnP,
+# and cross a boot boundary before adding its replacement. Never edit DriverStore.
+if (Remove-HeliosSameInfPackage $previousState $state $statePath $stateRoot $driverInf) {
+    Write-HeliosJson $state $statePath
+    Write-HeliosProvisioningStatus 'driver-restart-required'
+    Write-Warning 'Reboot Windows to finish removing the previous same-INF package, then resume this installation.'
+    exit 3010
+}
 # pnputil returns ERROR_NO_MORE_ITEMS (259) when this exact package is already
 # staged/active. The active-INF checks below still reject an outranking driver.
 Invoke-HeliosNative "pnputil.exe" @("/add-driver", $driverInf, "/install") -SuccessExitCodes @(0, 259, 3010)

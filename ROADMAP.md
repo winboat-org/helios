@@ -12,6 +12,20 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Same-version package repair
+
+WinBoat Stage 4 exposed Windows retaining the previous DriverStore package when
+a rebuilt, re-signed package had an identical INF. All five driver-image hash
+checks correctly failed. Repair now verifies the managed device/INF identity,
+exports and verifies the complete previous package, journals it before PnP
+removal, and requires a changed boot before adding the replacement. It never
+edits DriverStore files. Original pre-Helios restore points remain preserved.
+The replacement fixtures pass on host PowerShell and native Windows PowerShell
+as SYSTEM, including deletion failure/resume, backup drift, ownership refusal
+and same-boot refusal. The 33 existing hotplug deployment cases also pass.
+Real package replacement and full graphics acceptance remain tracked in
+winboat-devenv Stage 4.
+
 ## EGL-headless Venus scanout context
 
 WinBoat's NVIDIA acceptance guest exposed an abort in libepoxy's
