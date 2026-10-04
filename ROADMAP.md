@@ -12,6 +12,20 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## EGL-headless Venus scanout context
+
+WinBoat's NVIDIA acceptance guest exposed an abort in libepoxy's
+`eglCreateImageKHR` resolver when native Vulkan readback rejected a modifier-less
+scanout allocation and the EGL fallback had no current display. The display
+callbacks now bind their own context, bind it again after the Vulkan attempt,
+and restore the caller's context on return. The native allocation-shape checks
+and refusal to reinterpret opaque memory as LINEAR remain enforced.
+The corrected development host build passes 105 QEMU unit tests with the three
+documented skips. An isolated Windows disk overlay booted with healthy Helios,
+DWM and Explorer in session 1, and shut down with zero QEMU/container exit.
+The exact host-artifact upgrade and full Windows graphics acceptance are tracked
+in winboat-devenv Stage 4; this diagnostic does not establish driver conformance.
+
 ## EGL/GBM cleanup
 
 QEMU now releases its EGL thread/display resources before destroying the GBM
