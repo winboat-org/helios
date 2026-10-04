@@ -15,6 +15,7 @@ if target == "development-package" then
     purpose = "build";
     architecture = "x64";
     crt = "mt";
+    symbolStorage = "component-artifacts";
     commands = [
       [
         "powershell.exe"
@@ -30,7 +31,7 @@ if target == "development-package" then
     outputs = [ "bundle/manifest.json" ];
     preserveDirectories = [ "bundle" ];
     requirements = [
-      "verified-native-component-manifests"
+      "verified-component-manifests"
       "baseline-test-signing-certificate"
     ];
   }

@@ -3,7 +3,7 @@
 `default.nix` accepts schemaVersion 1, `pkgs`, explicit `sources`,
 `dependencies`, `target`, `configuration` (release/debug) and `toolchain`.
 It returns a derivation for native/cross outputs or a devbox dispatch record
-for ABI constrained Windows targets. Dependencies are immutable Nix output
+for the primary Windows driver build. Dependencies are immutable Nix output
 paths. Sources are exported snapshots, including selected gitlink contents.
 Only locked toolchains are accepted (`toolchain = {}`); nonempty overrides
 are refused. No recipe downloads dependencies during compilation.
@@ -25,6 +25,11 @@ Windows dispatch uses `Build-Guest.ps1` and the exact offline closure from
 separately verified static engine artifacts. Fresh bindgen 0.72 output uses the
 provisioned LLVM 22.1.8 and retains layout assertions. Cached binding comparison
 warnings remain separate from the fresh native compilation.
+The environment now cross-compiles DXVK/vkd3d x64/x86 on Linux with the same
+MSVC ABI and static CRT, then imports the verified archives and generated headers
+into the Windows build directory. The primary driver retains Windows execution
+because the pinned wdk-build rejects Linux build hosts, while the UMD12 Linux
+build-script branch returns before bridge compilation and DLL linking.
 
 The KMD uses an owned local source copy with Cargo's ordinary target layout so
 the pinned wdk-build can discover its lockfile above OUT_DIR. Packaging checks
@@ -35,5 +40,9 @@ retains complete component manifests, symbols and native acceptance evidence.
 
 `Package-Guest.ps1` combines verified driver, both Mesa architectures and CLVK
 artifacts into a development install package with the four existing Windows
-installer scripts. It preserves licenses, PDBs, source identities and exact file
-hashes. This builds no installer executable and does not replace release CI.
+installer scripts. It preserves licenses, source identities and exact file
+hashes. PDBs remain in the original component artifacts, referenced by their
+manifest identities and file tables, and are excluded from the install bundle.
+The shared build wrapper verifies dependency trees and consumed bytes once;
+the composer does not repeat that verification or hash unused symbols.
+This builds no installer executable and does not replace release CI.

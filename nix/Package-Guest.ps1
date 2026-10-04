@@ -1,6 +1,7 @@
 param([Parameter(Mandatory)][string]$Specification)
 . (Join-Path $env:WINBOAT_CONTROL_ROOT 'Control.ps1')
 $spec=Read-ControlJson $Specification
+if($spec.symbolStorage -ne 'component-artifacts') {throw 'Package requires the shared component-artifact symbol policy'}
 $repository=Join-Path $spec.sourceRoot $spec.sources.helios.relativePath
 . (Join-Path $repository 'metadata\Read-HeliosMetadata.ps1')
 $metadata=Read-HeliosMetadata $repository
@@ -8,7 +9,8 @@ $bundle=Join-Path $spec.buildRoot 'bundle'
 New-Item -ItemType Directory -Path $bundle | Out-Null
 $artifacts=@{}
 foreach($artifact in $spec.componentDependencies) {
-    foreach($file in $artifact.files) {Assert-ControlFile (Join-Path $artifact.root $file.path) $file.sha256 $file.size}
+    # The shared GuestBuild wrapper verifies the dependency trees and bytes
+    # consumed here. Symbols remain in their already exported component builds.
     if($artifacts.ContainsKey($artifact.target)) {throw 'Duplicate component artifact'}
     $artifacts[$artifact.target]=$artifact
 }
@@ -41,15 +43,12 @@ Copy-BundleFile (Join-Path $opencl.root 'package\clvk.dll') 'payload\opencl\clvk
 foreach($name in @('vulkan-1.dll','OpenCL.dll','x86\vulkan-1.dll')) {
     Copy-BundleFile (Join-Path $opencl.root "package\$name") "payload\loaders\$name"
 }
-Get-ChildItem (Join-Path $opencl.root 'package\smoke') -Recurse -File | ForEach-Object {
+Get-ChildItem (Join-Path $opencl.root 'package\smoke') -Recurse -File -Filter '*.exe' | ForEach-Object {
     Copy-BundleFile $_.FullName ('payload\smoke\'+$_.FullName.Substring((Join-Path $opencl.root 'package\smoke').Length+1))
 }
 foreach($artifact in $spec.componentDependencies) {
     Get-ChildItem (Join-Path $artifact.root 'licenses') -Recurse -File | ForEach-Object {
         Copy-BundleFile $_.FullName ('licenses\'+$artifact.target+'\'+$_.FullName.Substring((Join-Path $artifact.root 'licenses').Length+1))
-    }
-    foreach($file in $artifact.files | Where-Object path -like '*.pdb') {
-        Copy-BundleFile (Join-Path $artifact.root $file.path) ('symbols\'+$artifact.target+'\'+$file.path)
     }
 }
 $certificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $bundle 'certificate\helios-dev-test.cer'))
@@ -64,7 +63,7 @@ $manifest=@{schemaVersion=1;productName=$metadata.HELIOS_PRODUCT;publisher=$meta
     components=@{driver=@{version=$metadata.HELIOS_KMD_VERSION;architectures=@('x64','x86')};
         mesa=@{vulkan='Venus';openGL='Zink WGL ICD';architectures=@('x64','x86');vulkanApiVersion='1.4.352'};
         openCl=@{implementation='CLVK';onlineCompiler=$true;architectures=@('x64')}};
-    artifacts=@($spec.componentDependencies);files=@()}
+    symbolStorage='component-artifacts';artifacts=@($spec.componentDependencies);files=@()}
 $manifest.files=@(Get-ChildItem $bundle -Recurse -File | Sort-Object FullName | ForEach-Object {
     @{path=$_.FullName.Substring($bundle.Length+1).Replace('\','/');sha256=(Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower();size=$_.Length}
 })
