@@ -12,6 +12,18 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Win32 WSI vehicle export ABI
+
+Stage 4's WoW64 Vulkan WSI probe exposed a Mesa present-worker access violation.
+The actual crash offset resolves to `wsi_win32_queue_present_vehicle` after its
+UMD source handoff. Mesa's function pointers used cdecl while the UMD exports
+are Rust `extern "system"`; Win32 therefore popped the argument stack twice.
+The three vehicle export pointer types now use WINAPI. With the same driver,
+loader and unmodified probe, the corrected Linux MSVC x86 Mesa build completed
+both live swapchains and destruction of the first under the second, exit 0.
+The previous timeout/access-violation receipts remain retained in WinBoat Stage
+4. Full clean pinned CLI/MCP graphics acceptance remains pending there.
+
 ## Same-version package repair
 
 WinBoat Stage 4 exposed Windows retaining the previous DriverStore package when
