@@ -9,16 +9,68 @@
 }:
 assert toolchain == { };
 assert schemaVersion == 1;
-if target == "guest-x64" || target == "guest-x86" then
+if target == "development-package" then
+  {
+    backend = "devbox";
+    purpose = "build";
+    architecture = "x64";
+    crt = "mt";
+    commands = [
+      [
+        "powershell.exe"
+        "-NoProfile"
+        "-ExecutionPolicy"
+        "Bypass"
+        "-File"
+        "@heliosSourceDirectory@/nix/Package-Guest.ps1"
+        "-Specification"
+        "@specification@"
+      ]
+    ];
+    outputs = [ "bundle/manifest.json" ];
+    preserveDirectories = [ "bundle" ];
+    requirements = [
+      "verified-native-component-manifests"
+      "baseline-test-signing-certificate"
+    ];
+  }
+else if target == "guest-x64" || target == "guest-x86" then
+  let
+    native = target == "guest-x64";
+  in
   {
     backend = "devbox";
     purpose = "build";
     crt = "mt";
     architecture = if target == "guest-x86" then "x86" else "x64";
-    payloads = [
-      "ci/windows/Build-Umd.ps1"
+    commands = [
+      [
+        "powershell.exe"
+        "-NoProfile"
+        "-ExecutionPolicy"
+        "Bypass"
+        "-File"
+        "@heliosSourceDirectory@/nix/Build-Guest.ps1"
+        "-Specification"
+        "@specification@"
+      ]
+    ];
+    outputs = [
+      "package/helios_umd32.dll"
+      "package/helios_umd12_32.dll"
     ]
-    ++ pkgs.lib.optional (target == "guest-x64") "ci/windows/Build-Driver.ps1";
+    ++ pkgs.lib.optionals native [
+      "package/helios_umd.dll"
+      "package/helios_umd12.dll"
+      "package/helios_kmd_render.sys"
+      "package/helios_kmd_render.inf"
+      "package/helios_kmd_render.cat"
+      "package/helios-dev-test.cer"
+    ];
+    outputArchitectures = {
+      "package/helios_umd32.dll" = "x86";
+      "package/helios_umd12_32.dll" = "x86";
+    };
     requirements = [
       "MSVC-v143"
       "SDK-and-WDK-10.0.26100.0"
