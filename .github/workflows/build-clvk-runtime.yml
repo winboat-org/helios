@@ -67,6 +67,8 @@ jobs:
           key: component-${{ runner.os }}-${{ inputs.root_revision }}-${{ inputs.component_revision }}-${{ hashFiles('workspace/devenv.lock', 'workspace/config/provision.lock.json', 'workspace/nix/pins.nix') }}-${{ matrix.target }}-${{ inputs.configuration }}
       - name: Fetch this component's pinned sources
         working-directory: workspace
+        env:
+          GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: |
           source_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix sources)
           "$source_tools/bin/wb-source-sync" --repo clvk-helios --json
