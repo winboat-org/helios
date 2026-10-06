@@ -1,0 +1,95 @@
+name: Build the ADL compatibility shim
+on:
+  workflow_dispatch:
+    inputs:
+      root_revision:
+        description: Committed winboat-devenv source and pins (40 hex characters)
+        required: true
+        type: string
+      component_revision:
+        description: Exact component commit; must equal this workflow SHA and root pin
+        required: true
+        type: string
+      configuration:
+        required: true
+        type: choice
+        options: [release, debug]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: component-${{ github.workflow }}-${{ github.sha }}-${{ inputs.root_revision }}-${{ inputs.configuration }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.repository == 'winboat-org/helios' && github.event_name == 'workflow_dispatch'
+    environment: component-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [helios-compatibility]
+    steps:
+      - name: Validate immutable dispatch identities before loading root code
+        env:
+          ROOT_REVISION: ${{ inputs.root_revision }}
+          COMPONENT_REVISION: ${{ inputs.component_revision }}
+        run: |
+          [[ "$ROOT_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$COMPONENT_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          test "$COMPONENT_REVISION" = "$GITHUB_SHA"
+      - name: Checkout the exact root operation and installer source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified 2026-10-06
+        with:
+          repository: winboat-org/winboat-devenv
+          ref: ${{ inputs.root_revision }}
+          path: workspace
+          persist-credentials: false
+          submodules: false
+          token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            max-jobs = 1
+            cores = 2
+      - name: Realize the component command
+        working-directory: workspace
+        run: |
+          component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
+          printf '%s/bin\n' "$component_tools" >> "$GITHUB_PATH"
+      - name: Restore immutable source-object cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, verified 2026-10-06
+        with:
+          path: workspace/.state/source-cache
+          key: component-${{ runner.os }}-${{ inputs.root_revision }}-${{ inputs.component_revision }}-${{ hashFiles('workspace/devenv.lock', 'workspace/config/provision.lock.json', 'workspace/nix/pins.nix') }}-${{ matrix.target }}-${{ inputs.configuration }}
+      - name: Build the repository-owned artifact through Nix operations
+        working-directory: workspace
+        env:
+          OWNER: 'helios'
+          TARGET: ${{ matrix.target }}
+          COMPONENT_REVISION: ${{ inputs.component_revision }}
+          ROOT_REVISION: ${{ inputs.root_revision }}
+          CONFIGURATION: ${{ inputs.configuration }}
+          GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+        run: >-
+          wb-component-build --owner "$OWNER" --target "$TARGET"
+          --source-revision "$COMPONENT_REVISION" --root-revision "$ROOT_REVISION"
+          --configuration "$CONFIGURATION"
+      - name: Upload this run's individual artifact
+        id: artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, verified 2026-10-06
+        with:
+          name: ${{ matrix.target }}-${{ inputs.configuration }}-${{ inputs.component_revision }}
+          path: workspace/out/ci-components/${{ matrix.target }}-${{ inputs.configuration }}/
+          include-hidden-files: true
+          compression-level: 1
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record exact hosted artifact identity
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.artifact-digest }}
+        run: printf '%s %s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST"

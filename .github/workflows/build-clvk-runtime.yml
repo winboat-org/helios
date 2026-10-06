@@ -1,4 +1,4 @@
-name: Exact Stage 6 component artifacts
+name: Build the CLVK runtime
 on:
   workflow_dispatch:
     inputs:
@@ -14,29 +14,22 @@ on:
         required: true
         type: choice
         options: [release, debug]
-      devbox:
-        description: Prepared Windows guest for Helios WDK and installer
-        type: string
-      engine_selection:
-        description: Four exact engine repository, artifactId, runId and runAttempt selectors as JSON
-        default: '[]'
-        type: string
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: stage06-${{ github.sha }}-${{ inputs.root_revision }}-${{ inputs.configuration }}
+  group: component-${{ github.workflow }}-${{ github.sha }}-${{ inputs.root_revision }}-${{ inputs.configuration }}
   cancel-in-progress: false
 jobs:
   build:
     if: github.repository == 'winboat-org/helios' && github.event_name == 'workflow_dispatch'
     environment: component-build
-    runs-on: [self-hosted, linux, x64, winboat-build]
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        target: [helios-guest-x64, helios-installer, helios-compatibility, clvk-helios]
+        target: [clvk-helios]
     steps:
       - name: Validate immutable dispatch identities before loading root code
         env:
@@ -55,14 +48,28 @@ jobs:
           persist-credentials: false
           submodules: false
           token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            max-jobs = 1
+            cores = 2
+      - name: Realize the component command
+        working-directory: workspace
+        run: |
+          component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
+          printf '%s/bin\n' "$component_tools" >> "$GITHUB_PATH"
       - name: Restore immutable source-object cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, verified 2026-10-06
         with:
           path: workspace/.state/source-cache
-          key: stage06-${{ runner.os }}-${{ inputs.root_revision }}-${{ inputs.component_revision }}-${{ hashFiles('workspace/devenv.lock', 'workspace/config/provision.lock.json', 'workspace/nix/pins.nix') }}-${{ matrix.target }}-${{ inputs.configuration }}
-      - name: Fetch only pinned sources
+          key: component-${{ runner.os }}-${{ inputs.root_revision }}-${{ inputs.component_revision }}-${{ hashFiles('workspace/devenv.lock', 'workspace/config/provision.lock.json', 'workspace/nix/pins.nix') }}-${{ matrix.target }}-${{ inputs.configuration }}
+      - name: Fetch this component's pinned sources
         working-directory: workspace
-        run: devenv shell -- wb repo sync --repo helios --repo clvk-helios --json
+        run: |
+          source_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix sources)
+          "$source_tools/bin/wb-source-sync" --repo clvk-helios --json
       - name: Build the repository-owned artifact through Nix operations
         working-directory: workspace
         env:
@@ -71,13 +78,11 @@ jobs:
           COMPONENT_REVISION: ${{ inputs.component_revision }}
           ROOT_REVISION: ${{ inputs.root_revision }}
           CONFIGURATION: ${{ inputs.configuration }}
-          DEVBOX: ${{ inputs.devbox }}
-          ENGINE_SELECTION: ${{ inputs.engine_selection }}
           GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: >-
-          devenv shell -- wb-ci-component --owner "$OWNER" --target "$TARGET"
+          wb-component-build --owner "$OWNER" --target "$TARGET"
           --source-revision "$COMPONENT_REVISION" --root-revision "$ROOT_REVISION"
-          --configuration "$CONFIGURATION" --name "$DEVBOX" --engine-selection "$ENGINE_SELECTION"
+          --configuration "$CONFIGURATION"
       - name: Upload this run's individual artifact
         id: artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, verified 2026-10-06
@@ -85,6 +90,7 @@ jobs:
           name: ${{ matrix.target }}-${{ inputs.configuration }}-${{ inputs.component_revision }}
           path: workspace/out/ci-components/${{ matrix.target }}-${{ inputs.configuration }}/
           include-hidden-files: true
+          compression-level: 1
           if-no-files-found: error
           retention-days: 30
       - name: Record exact hosted artifact identity
