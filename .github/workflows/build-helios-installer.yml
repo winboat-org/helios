@@ -14,10 +14,6 @@ on:
         required: true
         type: choice
         options: [release, debug]
-      devbox:
-        description: Prepared Windows build guest with the locked toolchain
-        required: true
-        type: string
 permissions:
   contents: read
   actions: read
@@ -28,7 +24,9 @@ jobs:
   build:
     if: github.repository == 'winboat-org/helios' && github.event_name == 'workflow_dispatch'
     environment: component-build
-    runs-on: [self-hosted, linux, x64, winboat-build]
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -52,10 +50,17 @@ jobs:
           persist-credentials: false
           submodules: false
           token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            max-jobs = 1
+            cores = 2
       - name: Realize the component command
         working-directory: workspace
         run: |
-          component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix windowsComponent)
+          component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
           printf '%s/bin\n' "$component_tools" >> "$GITHUB_PATH"
       - name: Restore immutable source-object cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, verified 2026-10-06
@@ -70,12 +75,11 @@ jobs:
           COMPONENT_REVISION: ${{ inputs.component_revision }}
           ROOT_REVISION: ${{ inputs.root_revision }}
           CONFIGURATION: ${{ inputs.configuration }}
-          DEVBOX: ${{ inputs.devbox }}
           GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: >-
-          wb-windows-component-build --owner "$OWNER" --target "$TARGET"
+          wb-component-build --owner "$OWNER" --target "$TARGET"
           --source-revision "$COMPONENT_REVISION" --root-revision "$ROOT_REVISION"
-          --configuration "$CONFIGURATION" --name "$DEVBOX"
+          --configuration "$CONFIGURATION"
       - name: Upload this run's individual artifact
         id: artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, verified 2026-10-06
@@ -91,3 +95,25 @@ jobs:
           ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.artifact.outputs.artifact-digest }}
         run: printf '%s %s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
+  verify-interface:
+    name: Verify the prebuilt installer interface
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the exact interface probe
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: winboat-org/winboat-devenv
+          ref: ${{ inputs.root_revision }}
+          persist-credentials: false
+          token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+      - name: Download this build's exact installer artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: out/installer
+          merge-multiple: true
+      - name: Probe the hashed prebuilt installer
+        shell: pwsh
+        run: ./nix/windows/VerifyInstaller.ps1 -Directory out/installer
