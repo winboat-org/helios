@@ -16,14 +16,14 @@ $env:CARGO_HOME = Join-Path $spec.buildRoot 'cargo-home'
 $env:CARGO_NET_OFFLINE = 'true'
 New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
 $env:HELIOS_DXVK_SRC = Join-Path $spec.sourceRoot $spec.sources.dxvk.relativePath
-$env:HELIOS_CLANG_CL = 'C:\WinBoatDev\tools\LLVM\bin\clang-cl.exe'
-$env:HELIOS_MSVC_LIB = 'C:\WinBoatDev\tools\LLVM\bin\llvm-lib.exe'
-$env:HELIOS_WDK_INCLUDE = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0'
+$env:HELIOS_CLANG_CL = Join-Path $env:LIBCLANG_PATH 'clang-cl.exe'
+$env:HELIOS_MSVC_LIB = Join-Path $env:LIBCLANG_PATH 'llvm-lib.exe'
+$env:HELIOS_WDK_INCLUDE = Join-Path $env:WindowsSdkDir 'Include\10.0.26100.0'
 $profile = if ($spec.configuration -eq 'debug') {'dev'} else {'release'}
 $profileDirectory = if ($profile -eq 'dev') {'debug'} else {$profile}
 $package = Join-Path $spec.buildRoot 'package'
 New-Item -ItemType Directory -Path $package -Force | Out-Null
-$kitRoot = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0'
+$kitRoot = Join-Path $env:WindowsSdkDir 'bin\10.0.26100.0'
 $kit = Join-Path $kitRoot 'x64'
 # The matched WDK supplies Inf2Cat as an x86 host utility even for amd64
 # packages. Check every packaging tool before starting the expensive build.
@@ -92,8 +92,8 @@ if ($spec.architecture -eq 'x64') {
     $metadata = Read-HeliosMetadata $repo
     & (Join-Path $kit 'stampinf.exe') -f (Join-Path $package 'helios_kmd_render.inf') -d '*' -a amd64 -c helios_kmd_render.cat -v $metadata.HELIOS_KMD_VERSION
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
-    $inventory = Read-ControlJson 'C:\ProgramData\WinBoatDev\provisioning.json'
-    $certificate = Get-Item ('Cert:\LocalMachine\My\' + $inventory.certificateThumbprint)
+    $thumbprint = if ($spec.PSObject.Properties['hostedToolchain']) {$spec.certificateThumbprint} else {(Read-ControlJson 'C:\ProgramData\WinBoatDev\provisioning.json').certificateThumbprint}
+    $certificate = Get-Item ('Cert:\LocalMachine\My\' + $thumbprint)
     Export-Certificate -Cert $certificate -FilePath (Join-Path $package 'helios-dev-test.cer') | Out-Null
     & (Join-Path $kit 'signtool.exe') sign /fd SHA256 /sm /sha1 $certificate.Thumbprint (Join-Path $package 'helios_kmd_render.sys')
     if ($LASTEXITCODE) { exit $LASTEXITCODE }

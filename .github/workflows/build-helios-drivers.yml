@@ -14,10 +14,6 @@ on:
         required: true
         type: choice
         options: [release, debug]
-      devbox:
-        description: Prepared Windows build guest with the locked toolchain
-        required: true
-        type: string
       engine_selection:
         description: Four exact DXVK and vkd3d artifact selectors as JSON
         required: true
@@ -29,10 +25,15 @@ concurrency:
   group: component-${{ github.workflow }}-${{ github.sha }}-${{ inputs.root_revision }}-${{ inputs.configuration }}
   cancel-in-progress: false
 jobs:
-  build:
+  prepare-inputs:
     if: github.repository == 'winboat-org/helios' && github.event_name == 'workflow_dispatch'
     environment: component-build
-    runs-on: [self-hosted, linux, x64, winboat-build]
+    runs-on: ubuntu-24.04
+    outputs:
+      prepared-id: ${{ steps.artifact.outputs.artifact-id }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 360
     strategy:
       fail-fast: false
@@ -56,10 +57,17 @@ jobs:
           persist-credentials: false
           submodules: false
           token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          enable_kvm: false
+          extra_nix_config: |
+            max-jobs = 1
+            cores = 2
       - name: Realize the component command
         working-directory: workspace
         run: |
-          component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix windowsComponent)
+          component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
           printf '%s/bin\n' "$component_tools" >> "$GITHUB_PATH"
       - name: Restore immutable source-object cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, verified 2026-10-06
@@ -81,19 +89,20 @@ jobs:
           COMPONENT_REVISION: ${{ inputs.component_revision }}
           ROOT_REVISION: ${{ inputs.root_revision }}
           CONFIGURATION: ${{ inputs.configuration }}
-          DEVBOX: ${{ inputs.devbox }}
           ENGINE_SELECTION: ${{ inputs.engine_selection }}
           GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: >-
-          wb-windows-component-build --owner "$OWNER" --target "$TARGET"
+          wb-component-build --owner "$OWNER" --target "$TARGET"
           --source-revision "$COMPONENT_REVISION" --root-revision "$ROOT_REVISION"
-          --configuration "$CONFIGURATION" --name "$DEVBOX" --engine-selection "$ENGINE_SELECTION"
+          --configuration "$CONFIGURATION" --phase prepare --engine-selection "$ENGINE_SELECTION"
       - name: Upload this run's individual artifact
         id: artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, verified 2026-10-06
         with:
-          name: ${{ matrix.target }}-${{ inputs.configuration }}-${{ inputs.component_revision }}
-          path: workspace/out/ci-components/${{ matrix.target }}-${{ inputs.configuration }}/
+          name: driver-inputs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            workspace/out/ci-driver-inputs/driver-inputs.zip
+            workspace/out/ci-driver-inputs/driver-request.json
           include-hidden-files: true
           compression-level: 1
           if-no-files-found: error
@@ -103,3 +112,86 @@ jobs:
           ARTIFACT_ID: ${{ steps.artifact.outputs.artifact-id }}
           ARTIFACT_DIGEST: ${{ steps.artifact.outputs.artifact-digest }}
         run: printf '%s %s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
+  compile-driver:
+    name: Compile and sign the driver
+    needs: prepare-inputs
+    runs-on: windows-2025
+    timeout-minutes: 180
+    outputs:
+      compiled-id: ${{ steps.compiled.outputs.artifact-id }}
+    steps:
+      - name: Checkout the exact shared Windows build operation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: winboat-org/winboat-devenv
+          ref: ${{ inputs.root_revision }}
+          persist-credentials: false
+          token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+      - name: Download this run's exact verified inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.prepare-inputs.outputs.prepared-id }}
+          path: out/prepared
+          merge-multiple: true
+      - name: Build with the verified portable toolchain
+        shell: pwsh
+        run: ./nix/windows/HostedDriver.ps1 -PreparedDirectory out/prepared -OutputDirectory out/compiled
+      - name: Retain the compiler output and receipt
+        id: compiled
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: compiled-driver-${{ github.run_id }}-${{ github.run_attempt }}
+          path: out/compiled/
+          compression-level: 1
+          if-no-files-found: error
+          retention-days: 3
+  verify-artifact:
+    name: Verify and publish the driver artifact
+    needs: [prepare-inputs, compile-driver]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the exact verification operation
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: winboat-org/winboat-devenv
+          ref: ${{ inputs.root_revision }}
+          path: workspace
+          persist-credentials: false
+          token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
+      - name: Download the exact preparation receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.prepare-inputs.outputs.prepared-id }}
+          path: workspace/out/prepared
+          merge-multiple: true
+      - name: Download the exact compiler output
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.compile-driver.outputs.compiled-id }}
+          path: workspace/out/compiled
+          merge-multiple: true
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        with:
+          enable_kvm: false
+      - name: Verify and normalize the already compiled artifact
+        working-directory: workspace
+        env:
+          ROOT_REVISION: ${{ inputs.root_revision }}
+          COMPONENT_REVISION: ${{ inputs.component_revision }}
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
+          "$component_tools/bin/wb-component-build" --owner helios --target helios-guest-x64 --phase seal \
+            --root-revision "$ROOT_REVISION" --source-revision "$COMPONENT_REVISION" --configuration "$CONFIGURATION" \
+            --prepared-dir out/prepared --compiled-dir out/compiled
+      - name: Upload the individual verified driver artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: helios-guest-x64-${{ inputs.configuration }}-${{ inputs.component_revision }}
+          path: workspace/out/ci-components/helios-guest-x64-${{ inputs.configuration }}/
+          include-hidden-files: true
+          compression-level: 1
+          if-no-files-found: error
+          retention-days: 30
