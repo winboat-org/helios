@@ -71,7 +71,7 @@ jobs:
           GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: |
           source_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix sources)
-          "$source_tools/bin/wb-source-sync" --repo clvk-helios --json
+          "$source_tools/bin/wb-source-sync" --repo clvk-helios --repo helios --json
       - name: Build the repository-owned artifact through Nix operations
         working-directory: workspace
         env:
