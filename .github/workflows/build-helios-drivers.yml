@@ -205,6 +205,7 @@ jobs:
           ROOT_REVISION: ${{ needs.prepare-inputs.outputs.root_revision }}
           COMPONENT_REVISION: ${{ needs.prepare-inputs.outputs.component_revision }}
           CONFIGURATION: ${{ needs.prepare-inputs.outputs.configuration }}
+          GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: |
           component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
           "$component_tools/bin/wb-component-build" --owner helios --target helios-guest-x64 --phase seal \
