@@ -1,4 +1,5 @@
 param(
+  [string]$PackagingRoot = $env:WB_PACKAGING_ROOT,
   # Artifact paths have no fallback: native paths are always required; x86
   # paths are also required when the INF declares UserModeDriverNameWoW.
   #
@@ -45,7 +46,7 @@ param(
 )
 
 . "$PSScriptRoot\helios-deploy-common.ps1"
-. (Join-Path (Split-Path -Parent $PSScriptRoot) "packaging\windows\Helios-PackageCommon.ps1")
+. (Join-Path $PackagingRoot "Helios-PackageCommon.ps1")
 
 # No implicit fallback: name the artifacts or get a refusal, never a default.
 foreach ($req in @(@("PackageDir", $PackageDir), @("UmdDll", $UmdDll), @("Umd12Dll", $Umd12Dll))) {

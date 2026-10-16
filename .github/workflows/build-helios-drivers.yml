@@ -1,5 +1,7 @@
 name: Build Helios drivers
 on:
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       root_revision:
@@ -7,7 +9,7 @@ on:
         required: true
         type: string
       component_revision:
-        description: Exact component commit; must equal this workflow SHA and root pin
+        description: Exact component commit; must equal this workflow SHA
         required: true
         type: string
       configuration:
@@ -22,14 +24,17 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: component-${{ github.workflow }}-${{ github.sha }}-${{ inputs.root_revision }}-${{ inputs.configuration }}
+  group: component-${{ github.workflow }}-${{ github.sha }}-${{ inputs.root_revision }}-${{ inputs.configuration || 'release' }}
   cancel-in-progress: false
 jobs:
   prepare-inputs:
-    if: github.repository == 'winboat-org/helios' && github.event_name == 'workflow_dispatch'
+    if: github.repository == 'winboat-org/helios'
     environment: component-build
     runs-on: ubuntu-24.04
     outputs:
+      root_revision: ${{ steps.identity.outputs.root_revision }}
+      component_revision: ${{ steps.identity.outputs.component_revision }}
+      configuration: ${{ steps.identity.outputs.configuration }}
       prepared-id: ${{ steps.artifact.outputs.artifact-id }}
     defaults:
       run:
@@ -40,25 +45,38 @@ jobs:
       matrix:
         target: [helios-guest-x64]
     steps:
-      - name: Validate immutable dispatch identities before loading root code
+      - name: Resolve and record immutable build identities
+        id: identity
         env:
-          ROOT_REVISION: ${{ inputs.root_revision }}
-          COMPONENT_REVISION: ${{ inputs.component_revision }}
+          SELECTED_ROOT: ${{ inputs.root_revision }}
+          SELECTED_COMPONENT: ${{ inputs.component_revision }}
+          SELECTED_CONFIGURATION: ${{ inputs.configuration }}
+          GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: |
-          [[ "$ROOT_REVISION" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$COMPONENT_REVISION" =~ ^[0-9a-f]{40}$ ]]
-          test "$COMPONENT_REVISION" = "$GITHUB_SHA"
+          root_revision="$SELECTED_ROOT"
+          if [[ -z "$root_revision" ]]; then
+            root_branch=$(gh api repos/winboat-org/winboat-devenv --jq .default_branch)
+            root_revision=$(gh api "repos/winboat-org/winboat-devenv/commits/$root_branch" --jq .sha)
+          fi
+          component_revision="${SELECTED_COMPONENT:-$GITHUB_SHA}"
+          configuration="${SELECTED_CONFIGURATION:-release}"
+          [[ "$root_revision" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$component_revision" =~ ^[0-9a-f]{40}$ ]]
+          test "$component_revision" = "$GITHUB_SHA"
+          [[ "$configuration" = release || "$configuration" = debug ]]
+          printf 'root_revision=%s\ncomponent_revision=%s\nconfiguration=%s\n' "$root_revision" "$component_revision" "$configuration" >> "$GITHUB_OUTPUT"
+          printf 'Root: %s\nComponent: %s\nConfiguration: %s\n' "$root_revision" "$component_revision" "$configuration" >> "$GITHUB_STEP_SUMMARY"
       - name: Checkout the exact root operation and installer source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified 2026-10-06
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
         with:
           repository: winboat-org/winboat-devenv
-          ref: ${{ inputs.root_revision }}
+          ref: ${{ steps.identity.outputs.root_revision }}
           path: workspace
           persist-credentials: false
           submodules: false
           token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2, composite
         with:
           enable_kvm: false
           extra_nix_config: |
@@ -70,25 +88,31 @@ jobs:
           component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
           printf '%s/bin\n' "$component_tools" >> "$GITHUB_PATH"
       - name: Restore immutable source-object cache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4, verified 2026-10-06
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0, node24
         with:
           path: workspace/.state/source-cache
-          key: component-${{ runner.os }}-${{ inputs.root_revision }}-${{ inputs.component_revision }}-${{ hashFiles('workspace/devenv.lock', 'workspace/config/provision.lock.json', 'workspace/nix/pins.nix') }}-${{ matrix.target }}-${{ inputs.configuration }}
-      - name: Fetch this component's pinned sources
+          key: component-${{ runner.os }}-${{ steps.identity.outputs.root_revision }}-${{ steps.identity.outputs.component_revision }}-${{ hashFiles('workspace/devenv.lock', 'workspace/config/provision.lock.json', 'workspace/nix/pins.nix') }}-${{ matrix.target }}-${{ steps.identity.outputs.configuration }}
+      - name: Fetch this component and its canonical pinned dependencies
         working-directory: workspace
         env:
+          OWNER: 'helios'
+          TARGET: ${{ matrix.target }}
+          COMPONENT_REVISION: ${{ steps.identity.outputs.component_revision }}
+          ROOT_REVISION: ${{ steps.identity.outputs.root_revision }}
+          CONFIGURATION: ${{ steps.identity.outputs.configuration }}
           GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
-        run: |
-          source_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix sources)
-          "$source_tools/bin/wb-source-sync" --repo helios --json
+        run: >-
+          wb-component-build --phase sync --owner "$OWNER" --target "$TARGET"
+          --source-revision "$COMPONENT_REVISION" --root-revision "$ROOT_REVISION"
+          --configuration "$CONFIGURATION"
       - name: Build the repository-owned artifact through Nix operations
         working-directory: workspace
         env:
           OWNER: 'helios'
           TARGET: ${{ matrix.target }}
-          COMPONENT_REVISION: ${{ inputs.component_revision }}
-          ROOT_REVISION: ${{ inputs.root_revision }}
-          CONFIGURATION: ${{ inputs.configuration }}
+          COMPONENT_REVISION: ${{ steps.identity.outputs.component_revision }}
+          ROOT_REVISION: ${{ steps.identity.outputs.root_revision }}
+          CONFIGURATION: ${{ steps.identity.outputs.configuration }}
           ENGINE_SELECTION: ${{ inputs.engine_selection }}
           GH_TOKEN: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
         run: >-
@@ -97,7 +121,7 @@ jobs:
           --configuration "$CONFIGURATION" --phase prepare --engine-selection "$ENGINE_SELECTION"
       - name: Upload this run's individual artifact
         id: artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4, verified 2026-10-06
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, node24
         with:
           name: driver-inputs-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
@@ -121,14 +145,14 @@ jobs:
       compiled-id: ${{ steps.compiled.outputs.artifact-id }}
     steps:
       - name: Checkout the exact shared Windows build operation
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
         with:
           repository: winboat-org/winboat-devenv
-          ref: ${{ inputs.root_revision }}
+          ref: ${{ needs.prepare-inputs.outputs.root_revision }}
           persist-credentials: false
           token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
       - name: Download this run's exact verified inputs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, node24
         with:
           artifact-ids: ${{ needs.prepare-inputs.outputs.prepared-id }}
           path: out/prepared
@@ -138,7 +162,7 @@ jobs:
         run: ./nix/windows/HostedDriver.ps1 -PreparedDirectory out/prepared -OutputDirectory out/compiled
       - name: Retain the compiler output and receipt
         id: compiled
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, node24
         with:
           name: compiled-driver-${{ github.run_id }}-${{ github.run_attempt }}
           path: out/compiled/
@@ -152,45 +176,45 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout the exact verification operation
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, node24
         with:
           repository: winboat-org/winboat-devenv
-          ref: ${{ inputs.root_revision }}
+          ref: ${{ needs.prepare-inputs.outputs.root_revision }}
           path: workspace
           persist-credentials: false
           token: ${{ secrets.COMPONENT_INPUTS_TOKEN || github.token }}
       - name: Download the exact preparation receipt
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, node24
         with:
           artifact-ids: ${{ needs.prepare-inputs.outputs.prepared-id }}
           path: workspace/out/prepared
           merge-multiple: true
       - name: Download the exact compiler output
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2, node24
         with:
           artifact-ids: ${{ needs.compile-driver.outputs.compiled-id }}
           path: workspace/out/compiled
           merge-multiple: true
       - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2, composite
         with:
           enable_kvm: false
       - name: Verify and normalize the already compiled artifact
         working-directory: workspace
         env:
-          ROOT_REVISION: ${{ inputs.root_revision }}
-          COMPONENT_REVISION: ${{ inputs.component_revision }}
-          CONFIGURATION: ${{ inputs.configuration }}
+          ROOT_REVISION: ${{ needs.prepare-inputs.outputs.root_revision }}
+          COMPONENT_REVISION: ${{ needs.prepare-inputs.outputs.component_revision }}
+          CONFIGURATION: ${{ needs.prepare-inputs.outputs.configuration }}
         run: |
           component_tools=$(nix build --no-link --print-out-paths --file nix/ci.nix component)
           "$component_tools/bin/wb-component-build" --owner helios --target helios-guest-x64 --phase seal \
             --root-revision "$ROOT_REVISION" --source-revision "$COMPONENT_REVISION" --configuration "$CONFIGURATION" \
             --prepared-dir out/prepared --compiled-dir out/compiled
       - name: Upload the individual verified driver artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, node24
         with:
-          name: helios-guest-x64-${{ inputs.configuration }}-${{ inputs.component_revision }}
-          path: workspace/out/ci-components/helios-guest-x64-${{ inputs.configuration }}/
+          name: helios-guest-x64-${{ needs.prepare-inputs.outputs.configuration }}-${{ needs.prepare-inputs.outputs.component_revision }}
+          path: workspace/out/ci-components/helios-guest-x64-${{ needs.prepare-inputs.outputs.configuration }}/
           include-hidden-files: true
           compression-level: 1
           if-no-files-found: error

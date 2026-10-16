@@ -1,4 +1,5 @@
 param(
+  [string]$PackagingRoot = $env:WB_PACKAGING_ROOT,
   # RELEASE by default, matching install-helios-kmd.ps1. Pass
   # -UmdDll ...\target\debug\helios_umd.dll for a deliberate debug deploy.
   [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\release\helios_umd.dll",
@@ -19,7 +20,7 @@ param(
 )
 
 . "$PSScriptRoot\helios-deploy-common.ps1"
-. "$PSScriptRoot\..\packaging\windows\Helios-PackageCommon.ps1"
+. (Join-Path $PackagingRoot "Helios-PackageCommon.ps1")
 
 function Stop-UmdUsers([string]$DllPath) {
   $paths = @()

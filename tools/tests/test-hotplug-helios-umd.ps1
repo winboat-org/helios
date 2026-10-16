@@ -1,7 +1,7 @@
 # Runs the real hotplug entry point with a replacement deployment-common module.
 # No registry, service, process, device, ACL or destination file is modified.
 # Run on Windows PowerShell 5.1 or pwsh: & tools/tests/test-hotplug-helios-umd.ps1
-param([string]$RepoRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent))
+param([string]$PackagingRoot = $env:WB_PACKAGING_ROOT, [string]$RepoRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent))
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('helios-hotplug-test-' + [guid]::NewGuid())
@@ -11,7 +11,7 @@ $fixtureTools = Join-Path $fixture 'tools'
 $fixturePackage = Join-Path $fixture 'packaging/windows'
 New-Item -ItemType Directory -Path $fixtureTools, $fixturePackage -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'tools/hotplug-helios-umd.ps1') -Destination $fixtureTools
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'packaging/windows/Helios-PackageCommon.ps1') -Destination $fixturePackage
+Copy-Item -LiteralPath (Join-Path $PackagingRoot 'Helios-PackageCommon.ps1') -Destination $fixturePackage
 @'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -146,7 +146,7 @@ function New-Fixture {
 }
 function Invoke-Fixture($Parameters, [string]$ExpectedFailure = '') {
   $caught = ''
-  try { & (Join-Path $fixtureTools 'hotplug-helios-umd.ps1') @Parameters | Out-Null }
+  try { & (Join-Path $fixtureTools 'hotplug-helios-umd.ps1') -PackagingRoot $fixturePackage @Parameters | Out-Null }
   catch { $caught = $_.Exception.Message }
   if ($ExpectedFailure) {
     Assert ($caught -like "*$ExpectedFailure*") "Expected '$ExpectedFailure', got '$caught'"

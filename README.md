@@ -30,3 +30,16 @@
 - **Q:** I wanna contribute code, can I?
 - **A:** Since so much changes every day during our development, you'd likely be wasting your time. Contributions will be welcome once Helios is released and stable.
 ---
+
+### Build ownership
+
+This repository builds the Helios KMD and native/WoW64 UMD11/UMD12.
+`build-helios-drivers.yml` runs on pushes to `master` and accepts exact manual
+selections. Dependency pins and build operations come from
+[winboat-devenv](https://github.com/winboat-org/winboat-devenv). Driver jobs consume
+verified prebuilt DXVK/vkd3d engines and DXVK bridge headers; they do not build
+those components. Packaging, installer sources, loaders, probes and the complete
+guest installer live in winboat-devenv. Managed component checkouts are independent;
+Helios no longer carries their gitlinks. Retained developer probe/deployment
+scripts take `-PackagingRoot <winboat-devenv/packaging/windows>` (or
+`WB_PACKAGING_ROOT`) for the shared package functions.

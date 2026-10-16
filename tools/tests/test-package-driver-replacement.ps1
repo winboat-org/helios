@@ -1,6 +1,7 @@
+param([string]$PackagingRoot = $env:WB_PACKAGING_ROOT)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-. (Join-Path $PSScriptRoot '../../packaging/windows/Helios-PackageCommon.ps1')
+. (Join-Path $PackagingRoot 'Helios-PackageCommon.ps1')
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('helios-driver-replacement-' + [Guid]::NewGuid().ToString('N'))
 $originalWindows = $env:windir
 New-Item -ItemType Directory -Path $fixture | Out-Null

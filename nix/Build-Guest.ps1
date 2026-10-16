@@ -15,7 +15,6 @@ foreach ($crate in @('kmd_render','umd','umd12')) {
 $env:CARGO_HOME = Join-Path $spec.buildRoot 'cargo-home'
 $env:CARGO_NET_OFFLINE = 'true'
 New-Item -ItemType Directory -Path $env:CARGO_HOME -Force | Out-Null
-$env:HELIOS_DXVK_SRC = Join-Path $spec.sourceRoot $spec.sources.dxvk.relativePath
 $env:HELIOS_CLANG_CL = Join-Path $env:LIBCLANG_PATH 'clang-cl.exe'
 $env:HELIOS_MSVC_LIB = Join-Path $env:LIBCLANG_PATH 'llvm-lib.exe'
 $env:HELIOS_WDK_INCLUDE = Join-Path $env:WindowsSdkDir 'Include\10.0.26100.0'
@@ -66,6 +65,7 @@ foreach ($architecture in $architectures) {
     foreach ($target in @('dxvk','vkd3d')) {
         $engine = @($spec.componentDependencies | Where-Object target -eq "$target-engine-$architecture")
         if ($engine.Count -ne 1) { throw "Missing exact $target $architecture engine" }
+        if ($target -eq 'dxvk') { $env:HELIOS_DXVK_SRC = Join-Path $engine[0].root 'source-headers' }
         foreach ($file in $engine[0].files) { Assert-ControlFile (Join-Path $engine[0].root $file.path) $file.sha256 $file.size }
         [Environment]::SetEnvironmentVariable($(if ($target -eq 'dxvk') {'HELIOS_DXVK_BUILD'} else {'HELIOS_VKD3D_BUILD'}),$engine[0].root,'Process')
     }

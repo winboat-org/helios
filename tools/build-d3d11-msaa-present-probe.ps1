@@ -1,4 +1,5 @@
 param(
+  [string]$PackagingRoot = $env:WB_PACKAGING_ROOT,
     [Parameter(Mandatory)][string]$RepoRoot,
     [Parameter(Mandatory)][string]$OutputRoot,
     [ValidateSet("x86", "x64", "all")][string]$Architecture = "all"
@@ -7,7 +8,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $RepoRoot "ci\windows\Initialize-HeliosBuild.ps1")
-. (Join-Path $RepoRoot "packaging\windows\Helios-PackageCommon.ps1")
+. (Join-Path $PackagingRoot "Helios-PackageCommon.ps1")
 $source = Join-Path $RepoRoot "tools\d3d11_msaa_present_probe.cpp"
 if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing probe input: $source" }
 New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null

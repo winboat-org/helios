@@ -1,4 +1,5 @@
 param(
+  [string]$PackagingRoot = $env:WB_PACKAGING_ROOT,
     [Parameter(Mandatory)][string]$RepoRoot,
     [Parameter(Mandatory)][string]$OutputRoot,
     [Parameter(Mandatory)][string]$Dxc
@@ -7,7 +8,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $RepoRoot "ci\windows\Initialize-HeliosBuild.ps1")
-. (Join-Path $RepoRoot "packaging\windows\Helios-PackageCommon.ps1")
+. (Join-Path $PackagingRoot "Helios-PackageCommon.ps1")
 foreach ($path in @($Dxc, (Join-Path $RepoRoot "tools\d3d12_bridge_probe.hlsl"))) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing probe input: $path" }
 }

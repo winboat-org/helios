@@ -1,3 +1,0 @@
-#include <windows.h>
-101 ICON "assets\\helios.ico"
-1 RT_MANIFEST "src\\installer.manifest"

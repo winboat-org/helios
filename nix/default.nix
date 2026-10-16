@@ -9,33 +9,7 @@
 }:
 assert toolchain == { };
 assert schemaVersion == 1;
-if target == "development-package" then
-  {
-    backend = "devbox";
-    purpose = "build";
-    architecture = "x64";
-    crt = "mt";
-    symbolStorage = "component-artifacts";
-    commands = [
-      [
-        "powershell.exe"
-        "-NoProfile"
-        "-ExecutionPolicy"
-        "Bypass"
-        "-File"
-        "@heliosSourceDirectory@/nix/Package-Guest.ps1"
-        "-Specification"
-        "@specification@"
-      ]
-    ];
-    outputs = [ "bundle/manifest.json" ];
-    preserveDirectories = [ "bundle" ];
-    requirements = [
-      "verified-component-manifests"
-      "baseline-test-signing-certificate"
-    ];
-  }
-else if target == "guest-x64" || target == "guest-x86" then
+if target == "guest-x64" || target == "guest-x86" then
   let
     native = target == "guest-x64";
   in
