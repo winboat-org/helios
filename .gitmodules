@@ -1,21 +1,3 @@
-[submodule "icd/mesa"]
-	path = icd/mesa
-	url = https://github.com/winboat-org/mesa-helios.git
 [submodule "LookingGlass"]
 	path = LookingGlass
 	url = https://github.com/winboat-org/LookingGlass.git
-[submodule "dxvk-helios"]
-	path = dxvk-helios
-	url = https://github.com/winboat-org/dxvk.git
-[submodule "vkd3d-proton-helios"]
-	path = vkd3d-proton-helios
-	url = https://github.com/winboat-org/vkd3d-proton.git
-[submodule "qemu-helios"]
-	path = qemu-helios
-	url = https://github.com/winboat-org/qemu-helios.git
-[submodule "virglrenderer"]
-	path = virglrenderer
-	url = https://github.com/winboat-org/virglrenderer.git
-[submodule "venus-protocol"]
-	path = venus-protocol
-	url = https://github.com/winboat-org/venus-protocol.git
